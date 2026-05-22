@@ -69,6 +69,14 @@ final class BridgePeer: @unchecked Sendable {
     private var session: macrdp_session_t?
     let sinks: Sinks
 
+    /// Serializes every `macrdp_session_send_clip_*` call. FreeRDP's
+    /// server-side cliprdr send path (`cliprdr_server_packet_send`)
+    /// calls `WTSVirtualChannelWrite` without locking, so concurrent
+    /// writes from two Swift threads can interleave bytes on the wire
+    /// — observed as receive-side PDU desync when Finder fetches
+    /// multiple FileProvider items in parallel.
+    private let cliprdrSendLock = NSLock()
+
     /// `Unmanaged.passUnretained(self).toOpaque()` is stable for the
     /// lifetime of the object, so recomputing is fine and avoids the
     /// "self before init" hazard.
@@ -243,6 +251,8 @@ final class BridgePeer: @unchecked Sendable {
                 cFormats[i].name = nil
             }
         }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         cFormats.withUnsafeBufferPointer { buf in
             _ = macrdp_session_send_clip_format_list(
                 s, buf.baseAddress, Int32(cFormats.count))
@@ -251,6 +261,8 @@ final class BridgePeer: @unchecked Sendable {
 
     func sendClipDataResponse(formatID: UInt32, data: Data) {
         guard let s = session else { return }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         if data.isEmpty {
             _ = macrdp_session_send_clip_data_response(s, formatID, nil, 0)
             return
@@ -263,6 +275,8 @@ final class BridgePeer: @unchecked Sendable {
 
     func sendClipDataRequest(formatID: UInt32) {
         guard let s = session else { return }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         _ = macrdp_session_send_clip_data_request(s, formatID)
     }
 
@@ -270,6 +284,8 @@ final class BridgePeer: @unchecked Sendable {
     /// an explicit FAIL if `success == false`).
     func sendClipFileContentsResponse(streamID: UInt32, success: Bool, data: Data) {
         guard let s = session else { return }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         if data.isEmpty {
             _ = macrdp_session_send_clip_file_contents_response(
                 s, streamID, success ? 1 : 0, nil, 0)
@@ -290,6 +306,8 @@ final class BridgePeer: @unchecked Sendable {
                                      wantSize: Bool, offset: UInt64, length: UInt32,
                                      clipDataID: UInt32? = nil) {
         guard let s = session else { return }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         if let cid = clipDataID {
             _ = macrdp_session_send_clip_file_contents_request_with_clipdata(
                 s, streamID, listIndex, wantSize ? 1 : 0, offset, length, 1, cid)
@@ -304,12 +322,16 @@ final class BridgePeer: @unchecked Sendable {
     /// after a new clipboard event replaces the active FGDW.
     func sendClipLock(clipDataID: UInt32) {
         guard let s = session else { return }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         _ = macrdp_session_send_clip_lock(s, clipDataID)
     }
 
     /// Release the snapshot — client can free its preserved FGDW.
     func sendClipUnlock(clipDataID: UInt32) {
         guard let s = session else { return }
+        cliprdrSendLock.lock()
+        defer { cliprdrSendLock.unlock() }
         _ = macrdp_session_send_clip_unlock(s, clipDataID)
     }
 
