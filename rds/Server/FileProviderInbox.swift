@@ -172,6 +172,13 @@ final class FileProviderInbox {
 
         Log.clip.info("Inbox published: domain=\(self.domainIdentifier.rawValue, privacy: .public) items=\(items.count, privacy: .public)")
 
+        // Push the JSON to the extension's in-memory cache via
+        // NSFileProviderService. The extension can't read the App Group
+        // file directly (TCC denies cross-bundle app-data access for
+        // sandboxed FP extensions), so this XPC push is the canonical
+        // path.
+        await pushManifestToExtension(manifestData)
+
         // Wake the extension so it re-enumerates. Signal BOTH the
         // root container (user-facing tree) AND the working set
         // (framework-level item index). The working set is what
@@ -180,6 +187,95 @@ final class FileProviderInbox {
         // lookup returns nil.
         await signal(.rootContainer)
         await signal(.workingSet)
+    }
+
+    /// Open (or reuse) the NSFileProviderService XPC connection to our
+    /// extension and call `pushManifest` on it. Best-effort: if the
+    /// extension isn't up yet (or the framework can't reach it), we
+    /// log and continue — the next publish will retry.
+    private func pushManifestToExtension(_ data: Data) async {
+        do {
+            let proxy = try await ensureExtensionProxy()
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                proxy.pushManifest(domainSubdir: self.subdir, data: data) { ok in
+                    if !ok {
+                        Log.clip.notice("pushManifest returned !ok")
+                    }
+                    cont.resume()
+                }
+            }
+            Log.clip.info("Pushed manifest to extension via NSFileProviderService (\(data.count, privacy: .public)B)")
+        } catch {
+            Log.clip.error("pushManifest failed: \(String(describing: error), privacy: .public)")
+            // Drop a possibly-broken connection so the next attempt
+            // re-opens.
+            self.extensionConnection?.invalidate()
+            self.extensionConnection = nil
+        }
+    }
+
+    /// Ensure we have an open XPC connection to the extension's service
+    /// source, returning its `HostToExtensionProtocol` remote proxy.
+    /// Sets up `exportedObject` so the extension can call back into us
+    /// for byte fetches (`fetchBytes`).
+    private func ensureExtensionProxy() async throws -> HostToExtensionProtocol {
+        if let existing = extensionConnection,
+           let proxy = existing.remoteObjectProxy as? HostToExtensionProtocol {
+            return proxy
+        }
+        guard let manager else {
+            throw NSError(domain: "MacRDP.inbox", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Manager not initialized — register() not awaited?"])
+        }
+        let service: NSFileProviderService = try await withCheckedThrowingContinuation { cont in
+            manager.getService(named: MacRDPFileProviderServiceName,
+                                for: .rootContainer) { svc, err in
+                if let err {
+                    cont.resume(throwing: err)
+                } else if let svc {
+                    cont.resume(returning: svc)
+                } else {
+                    cont.resume(throwing: NSError(
+                        domain: "MacRDP.inbox", code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "getService returned nil"]))
+                }
+            }
+        }
+        let conn: NSXPCConnection = try await withCheckedThrowingContinuation { cont in
+            service.getFileProviderConnection { c, err in
+                if let err {
+                    cont.resume(throwing: err)
+                } else if let c {
+                    cont.resume(returning: c)
+                } else {
+                    cont.resume(throwing: NSError(
+                        domain: "MacRDP.inbox", code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "fileProviderConnection nil"]))
+                }
+            }
+        }
+        conn.remoteObjectInterface = NSXPCInterface(with: HostToExtensionProtocol.self)
+        conn.exportedInterface = NSXPCInterface(with: ExtensionToHostProtocol.self)
+        conn.exportedObject = exporter
+        conn.invalidationHandler = { [weak self] in
+            Log.clip.notice("Extension XPC connection invalidated")
+            Task { @MainActor in self?.extensionConnection = nil }
+        }
+        conn.interruptionHandler = { [weak self] in
+            Log.clip.notice("Extension XPC connection interrupted")
+            Task { @MainActor in
+                self?.extensionConnection?.invalidate()
+                self?.extensionConnection = nil
+            }
+        }
+        conn.resume()
+        self.extensionConnection = conn
+        guard let proxy = conn.remoteObjectProxy as? HostToExtensionProtocol else {
+            throw NSError(domain: "MacRDP.inbox", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "remoteObjectProxy doesn't conform to HostToExtensionProtocol"])
+        }
+        Log.clip.info("Extension XPC connection opened (NSFileProviderService)")
+        return proxy
     }
 
     private func signal(_ container: NSFileProviderItemIdentifier) async {

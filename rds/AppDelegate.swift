@@ -132,13 +132,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func beginServing(config: Config) {
         Task { @MainActor in
             await self.preWarmScreenCapture()
-            // Bring up the XPC listener BEFORE registering the
-            // FileProvider domain so the extension can connect on its
-            // very first probe.
-            FileProviderXPCService.shared.start()
             // Register the FileProvider clipboard domain so the
             // extension can serve "MacRDP Clipboard" through Finder.
             // Failure is non-fatal — clipboard text/image still work.
+            // Note: the host-side XPC channel is the
+            // NSFileProviderService connection opened on first publish;
+            // no Mach service listener to start up front.
             await AppDelegate.sharedClipboardInbox.register()
             // DEV: publish a synthetic 1 MiB test file so we can
             // verify the FP + XPC pipeline end-to-end before bringing
