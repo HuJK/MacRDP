@@ -15,7 +15,7 @@ import os
 
 private let log = Logger(subsystem: "com.macrdp.server", category: "fileprovider")
 
-final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
+final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, NSFileProviderServicing {
 
     let domain: NSFileProviderDomain
     let domainSubdir: String

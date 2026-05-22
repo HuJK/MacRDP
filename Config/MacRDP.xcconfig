@@ -1,0 +1,75 @@
+//
+//  MacRDP.xcconfig
+//
+//  Project-wide build settings. Inherited by all targets via the
+//  project's Info → Configurations setting, BUT each FreeRDP-related
+//  knob is gated on `$(TARGET_NAME)` so the sandboxed file-provider
+//  extension doesn't try to link Homebrew's libssl (which would
+//  fail in a sandbox because the libs have a different Team ID).
+//
+//  Pattern used below:
+//      SETTING = $(inherited) $(_SETTING_TARGET_$(TARGET_NAME))
+//      _SETTING_TARGET_rds = <real value here>
+//
+//  When TARGET_NAME is "rds" the real value flows through. For other
+//  targets (e.g. "fileprovider"), $(_SETTING_TARGET_fileprovider) is
+//  undefined and expands to empty — keeping extensions free of any
+//  FreeRDP coupling.
+//
+
+// ---- FreeRDP base paths (used only inside _xxx_rds settings) -------
+
+FREERDP_INSTALL_DIR = $(SRCROOT)/ThirdParty/FreeRDP-install
+OPENSSL_PREFIX      = /opt/homebrew/opt/openssl@3
+
+// ---- Header / library search paths (rds only) ----------------------
+
+HEADER_SEARCH_PATHS = $(inherited) $(_FREERDP_HEADERS_$(TARGET_NAME))
+_FREERDP_HEADERS_rds = $(FREERDP_INSTALL_DIR)/include/freerdp3 $(FREERDP_INSTALL_DIR)/include/winpr3 $(OPENSSL_PREFIX)/include
+
+LIBRARY_SEARCH_PATHS = $(inherited) $(_FREERDP_LIBS_$(TARGET_NAME))
+_FREERDP_LIBS_rds = $(FREERDP_INSTALL_DIR)/lib $(FREERDP_INSTALL_DIR)/lib/freerdp3 $(OPENSSL_PREFIX)/lib
+
+OTHER_LDFLAGS = $(inherited) $(_FREERDP_LDFLAGS_$(TARGET_NAME))
+_FREERDP_LDFLAGS_rds = -lfreerdp-server3 -lfreerdp3 -lwinpr3 -lwinpr-tools3 -lssl -lcrypto -lz -framework CoreFoundation -framework Security
+
+// FreeRDP uses some symbols below our deployment target; tolerate.
+GCC_WARN_DEPRECATED_DECLARATIONS = NO
+
+// Our bundle-dylibs.sh build phase reads from /opt/homebrew + the
+// SRCROOT scripts dir, so the Xcode user-script sandbox (default YES
+// in Xcode 14+) rejects it. We don't need that hardening here — the
+// script is local to our repo.
+ENABLE_USER_SCRIPT_SANDBOXING = NO
+
+// ---- Active Swift conditions (rds only — extension stays clean) ----
+
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) $(_SWIFT_CONDS_$(TARGET_NAME))
+_SWIFT_CONDS_rds = MACRDP_BRIDGE_AVAILABLE
+
+// ---- Bridging header (rds only) ------------------------------------
+
+SWIFT_OBJC_BRIDGING_HEADER = $(_BRIDGING_HEADER_$(TARGET_NAME))
+_BRIDGING_HEADER_rds = rds/Bridge/CFreeRDPBridge.h
+
+// ---- Info.plist (rds only — extension has its own auto-generated) --
+
+GENERATE_INFOPLIST_FILE = $(_GEN_INFOPLIST_$(TARGET_NAME):default=YES)
+_GEN_INFOPLIST_rds = NO
+
+INFOPLIST_FILE = $(_INFOPLIST_FILE_$(TARGET_NAME))
+_INFOPLIST_FILE_rds = rds/Resources/Info.plist
+
+// ---- Product identity (rds only — target name is "rds", product is
+//      shipped as "MacRDP" + the mac-rdp.com reverse-DNS bundle id) --
+
+PRODUCT_NAME = $(_PRODUCT_NAME_$(TARGET_NAME):default=$(TARGET_NAME))
+_PRODUCT_NAME_rds = MacRDP
+
+MARKETING_VERSION = 0.1
+CURRENT_PROJECT_VERSION = 1
+
+// ---- Runtime dylib lookup (rds only — Homebrew OpenSSL path) -------
+
+LD_RUNPATH_SEARCH_PATHS = $(inherited) $(_RPATH_$(TARGET_NAME))
+_RPATH_rds = @executable_path/../Frameworks /opt/homebrew/opt/openssl@3/lib
