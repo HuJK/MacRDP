@@ -1,0 +1,4 @@
+[submodule "ThirdParty/FreeRDP"]
+	path = ThirdParty/FreeRDP
+	url = https://github.com/FreeRDP/FreeRDP.git
+	branch = master
