@@ -61,6 +61,9 @@ final class BridgePeer: @unchecked Sendable {
         var onAudioInFrame: (_ pcm: Data, _ sampleRate: Int, _ channels: Int) -> Void = { _,_,_ in }
         var onAudioFormatSelected: (_ format: AudioFormat) -> Void = { _ in }
         var onSuppressOutput: (_ allow: Bool) -> Void = { _ in }
+        var onRdpdrDeviceAdded: (_ deviceID: UInt32, _ deviceType: UInt32,
+                                 _ dosName: String) -> Void = { _,_,_ in }
+        var onRdpdrDeviceRemoved: (_ deviceID: UInt32) -> Void = { _ in }
     }
 
     private var session: macrdp_session_t?
@@ -94,6 +97,8 @@ final class BridgePeer: @unchecked Sendable {
         cbs.on_audio_in_frame            = Self.cbAudioInFrame
         cbs.on_audio_format_selected     = Self.cbAudioFormatSelected
         cbs.on_suppress_output           = Self.cbSuppressOutput
+        cbs.on_rdpdr_device_added        = Self.cbRdpdrDeviceAdded
+        cbs.on_rdpdr_device_removed      = Self.cbRdpdrDeviceRemoved
 
         var cfg = macrdp_session_config()
         cfg.require_nla              = config.auth.requireNLA ? 1 : 0
@@ -108,6 +113,7 @@ final class BridgePeer: @unchecked Sendable {
         cfg.enable_clipboard         = (config.clipboard.text || config.clipboard.image
                                         || config.clipboard.files) ? 1 : 0
         cfg.enable_disp              = (config.display.resizeHook != nil) ? 1 : 0
+        cfg.enable_rdpdr             = config.rdpdr.enabled ? 1 : 0
 
         // TLS paths. Pin the bytes for the duration of the C call —
         // freerdp_key_new_from_file_enc reads the file immediately so we
@@ -276,12 +282,35 @@ final class BridgePeer: @unchecked Sendable {
         }
     }
 
-    /// Win→Mac: ask the client for a chunk of a file.
+    /// Win→Mac: ask the client for a chunk of a file. `clipDataID`
+    /// is the lock-pinned snapshot id (0 / nil = no clipDataID — uses
+    /// the client's current FGDW, which is unsafe when concurrent
+    /// paste sessions are in flight).
     func sendClipFileContentsRequest(streamID: UInt32, listIndex: UInt32,
-                                     wantSize: Bool, offset: UInt64, length: UInt32) {
+                                     wantSize: Bool, offset: UInt64, length: UInt32,
+                                     clipDataID: UInt32? = nil) {
         guard let s = session else { return }
-        _ = macrdp_session_send_clip_file_contents_request(
-            s, streamID, listIndex, wantSize ? 1 : 0, offset, length)
+        if let cid = clipDataID {
+            _ = macrdp_session_send_clip_file_contents_request_with_clipdata(
+                s, streamID, listIndex, wantSize ? 1 : 0, offset, length, 1, cid)
+        } else {
+            _ = macrdp_session_send_clip_file_contents_request(
+                s, streamID, listIndex, wantSize ? 1 : 0, offset, length)
+        }
+    }
+
+    /// Tell the client to preserve its current clipboard snapshot
+    /// under `clipDataID` so future paste fetches for it succeed even
+    /// after a new clipboard event replaces the active FGDW.
+    func sendClipLock(clipDataID: UInt32) {
+        guard let s = session else { return }
+        _ = macrdp_session_send_clip_lock(s, clipDataID)
+    }
+
+    /// Release the snapshot — client can free its preserved FGDW.
+    func sendClipUnlock(clipDataID: UInt32) {
+        guard let s = session else { return }
+        _ = macrdp_session_send_clip_unlock(s, clipDataID)
     }
 
     // MARK: - C trampolines
@@ -386,6 +415,13 @@ final class BridgePeer: @unchecked Sendable {
     }
     private static let cbSuppressOutput: macrdp_on_suppress_output_fn = { ctx, allow in
         unmanagedSelf(ctx)?.sinks.onSuppressOutput(allow != 0)
+    }
+    private static let cbRdpdrDeviceAdded: macrdp_on_rdpdr_device_added_fn = { ctx, id, type, dos in
+        let name = dos.map { String(cString: $0) } ?? ""
+        unmanagedSelf(ctx)?.sinks.onRdpdrDeviceAdded(id, type, name)
+    }
+    private static let cbRdpdrDeviceRemoved: macrdp_on_rdpdr_device_removed_fn = { ctx, id in
+        unmanagedSelf(ctx)?.sinks.onRdpdrDeviceRemoved(id)
     }
 }
 

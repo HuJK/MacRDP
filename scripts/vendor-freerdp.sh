@@ -43,7 +43,8 @@ FORK_URL_PLACEHOLDER="git@github.com:CHANGE-ME/FreeRDP-macrdp.git"
 FREERDP_BRANCH="master"
 # Specific tag we check out inside the submodule for reproducible builds.
 # Bump this when we want a newer release.
-FREERDP_TAG="3.26.0"
+# Temporarily on master HEAD while we re-test LOCK_CLIPDATA behaviour.
+FREERDP_TAG="origin/master"
 
 BUILD_DIR="$REPO_ROOT/ThirdParty/FreeRDP-build"
 INSTALL_DIR="$REPO_ROOT/ThirdParty/FreeRDP-install"
@@ -132,7 +133,8 @@ cmd_build() {
     -DWITH_INTERNAL_RC4=ON \
     -DWITH_INTERNAL_MD4=ON \
     -DWITH_INTERNAL_MD5=ON \
-    -DCHANNEL_RDPDR=OFF \
+    -DCHANNEL_RDPDR=ON \
+    -DCHANNEL_RDPDR_SERVER=ON \
     -DCHANNEL_DRIVE=OFF \
     -DCHANNEL_PARALLEL=OFF \
     -DCHANNEL_SERIAL=OFF \

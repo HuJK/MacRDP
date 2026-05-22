@@ -245,6 +245,29 @@ final class InputInjector: @unchecked Sendable {
 
     // MARK: - Keyboard
 
+    /// Modifier-key bookkeeping. Driven entirely by the RDP scancode
+    /// stream — `nil` source CGEvents would otherwise inherit whatever
+    /// macOS *thinks* is held, and a dropped key-up (e.g. client window
+    /// loses focus mid-Cmd) leaves Cmd permanently sticky, so the next
+    /// `e` becomes Cmd+E and lights up the Edit menu instead of typing.
+    private struct ModifierState {
+        var lShift = false, rShift = false
+        var lCtrl  = false, rCtrl  = false
+        var lAlt   = false, rAlt   = false
+        var lCmd   = false, rCmd   = false
+        var capsLock = false
+        var flags: CGEventFlags {
+            var f = CGEventFlags()
+            if lShift || rShift { f.insert(.maskShift) }
+            if lCtrl  || rCtrl  { f.insert(.maskControl) }
+            if lAlt   || rAlt   { f.insert(.maskAlternate) }
+            if lCmd   || rCmd   { f.insert(.maskCommand) }
+            if capsLock         { f.insert(.maskAlphaShift) }
+            return f
+        }
+    }
+    private var mods = ModifierState()
+
     /// PS/2 set 1 scancode (with optional E0/E1 extended bits encoded into `flags`)
     /// -> macOS virtual keycode + post.
     func keyboardEvent(flags: UInt16, scancode: UInt16) {
@@ -252,6 +275,12 @@ final class InputInjector: @unchecked Sendable {
         let down = flags & KBDFLAGS.RELEASE == 0
 
         let combined = extended ? (UInt32(0xE0) << 8) | UInt32(scancode) : UInt32(scancode)
+
+        // Update our modifier bookkeeping BEFORE we compose flags so
+        // the press itself carries the new state (matches macOS's
+        // own convention).
+        updateModifierState(combined: combined, down: down)
+
         guard let mac = Self.scancodeToVirtualKey[combined] ?? Self.scancodeToVirtualKey[UInt32(scancode)] else {
             Log.input.debug("unmapped scancode \(scancode, format: .hex, privacy: .public) extended=\(extended, privacy: .public)")
             return
@@ -259,17 +288,61 @@ final class InputInjector: @unchecked Sendable {
         guard let e = CGEvent(keyboardEventSource: nil,
                               virtualKey: mac,
                               keyDown: down) else { return }
+        e.flags = mods.flags
         e.post(tap: .cghidEventTap)
     }
 
     /// Inject a single UTF-16 code unit as a synthesized keypress.
+    /// Unicode events from the client don't carry modifier scancodes,
+    /// but we still apply our tracked flags so a held Shift from a
+    /// prior scancode press is honored.
     func unicodeKeyboardEvent(flags: UInt16, code: UInt16) {
         let down = flags & KBDFLAGS.RELEASE == 0
         guard let e = CGEvent(keyboardEventSource: nil,
                               virtualKey: 0, keyDown: down) else { return }
         var c = code
         e.keyboardSetUnicodeString(stringLength: 1, unicodeString: &c)
+        e.flags = mods.flags
         e.post(tap: .cghidEventTap)
+    }
+
+    private func updateModifierState(combined: UInt32, down: Bool) {
+        switch combined {
+        case 0x2A:           mods.lShift = down
+        case 0x36:           mods.rShift = down
+        case 0x1D:           mods.lCtrl  = down
+        case 0xE000 | 0x1D:  mods.rCtrl  = down
+        case 0x38:           mods.lAlt   = down   // also LeftCmd on some Mac clients
+        case 0xE000 | 0x38:  mods.rAlt   = down
+        case 0xE000 | 0x5B:  mods.lCmd   = down
+        case 0xE000 | 0x5C:  mods.rCmd   = down
+        case 0x3A:
+            // Caps lock toggles only on key-down; ignore key-up.
+            if down { mods.capsLock.toggle() }
+        default:
+            break
+        }
+    }
+
+    /// Called when a peer disconnects (or we suspect the wire dropped
+    /// a key-up). Posts synthetic releases for every modifier we think
+    /// is currently held, then zeroes our bookkeeping. Without this
+    /// the next session inherits sticky modifiers.
+    func releaseAllModifiers() {
+        let pairs: [(KeyPath<ModifierState, Bool>, CGKeyCode)] = [
+            (\.lShift, 56), (\.rShift, 60),
+            (\.lCtrl,  59), (\.rCtrl,  62),
+            (\.lAlt,   58), (\.rAlt,   61),
+            (\.lCmd,   55), (\.rCmd,   54),
+        ]
+        for (kp, vk) in pairs where mods[keyPath: kp] {
+            if let e = CGEvent(keyboardEventSource: nil, virtualKey: vk, keyDown: false) {
+                e.flags = []
+                e.post(tap: .cghidEventTap)
+            }
+        }
+        mods = ModifierState()
+        Log.input.notice("Released all sticky modifiers")
     }
 
     /// PS/2 set 1 scan-code to macOS virtual-keycode mapping.

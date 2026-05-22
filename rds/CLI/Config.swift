@@ -19,6 +19,7 @@ struct Config: Codable, Sendable {
     var audioOut: AudioOutConfig
     var audioIn: AudioInConfig
     var clipboard: ClipboardConfig
+    var rdpdr: RDPDRConfig
 
     struct ListenConfig: Codable, Sendable {
         var host: String
@@ -193,6 +194,13 @@ struct Config: Codable, Sendable {
         var pollIntervalMs: Int
     }
 
+    /// Device redirection (MS-RDPEFS / RDPDR). Phase 1 of this feature
+    /// only logs incoming drive announces — later phases will publish
+    /// each redirected drive as its own FileProvider domain.
+    struct RDPDRConfig: Codable, Sendable {
+        var enabled: Bool
+    }
+
     static var `default`: Config {
         Config(
             listen: .init(host: "0.0.0.0", port: 3389),
@@ -225,7 +233,8 @@ struct Config: Codable, Sendable {
                             muteLocalOutput: "always"),
             audioIn: .init(enabled: true, outputDeviceUID: nil),
             clipboard: .init(text: true, image: true, files: true,
-                             maxFileSizeMiB: 4096, pollIntervalMs: 200)
+                             maxFileSizeMiB: 4096, pollIntervalMs: 200),
+            rdpdr: .init(enabled: true)
         )
     }
 }

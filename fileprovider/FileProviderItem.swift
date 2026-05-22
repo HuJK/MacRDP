@@ -57,6 +57,20 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
             : [.allowsReading]
     }
 
+    /// Surface the item to Finder as a normal user-readable AND
+    /// user-writable file. Without `.userWritable`, the FP framework
+    /// derives mode 0400 (r--------) from capabilities alone, and
+    /// Finder's paste *preserves* that into the destination → the
+    /// pasted file lands with permission 400 and refuses overwrites
+    /// / re-saves. Marking the source as writable makes the destination
+    /// inherit umask defaults (typically 0644 / rw-r--r--).
+    var fileSystemFlags: NSFileProviderFileSystemFlags {
+        if entry.isDirectory {
+            return [.userReadable, .userWritable, .userExecutable]
+        }
+        return [.userReadable, .userWritable]
+    }
+
     /// Tying both contentVersion and metadataVersion to the manifest's
     /// sessionID means: any time we publish a new manifest, Finder sees
     /// the items as "changed" and re-fetches.
@@ -78,6 +92,9 @@ final class RootFileProviderItem: NSObject, NSFileProviderItem {
     var contentType: UTType { .folder }
     var capabilities: NSFileProviderItemCapabilities {
         [.allowsReading, .allowsContentEnumerating]
+    }
+    var fileSystemFlags: NSFileProviderFileSystemFlags {
+        [.userReadable, .userWritable, .userExecutable]
     }
     var itemVersion: NSFileProviderItemVersion {
         NSFileProviderItemVersion(contentVersion: Data([1]),

@@ -143,8 +143,27 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     // MARK: - File outbound callbacks (set by RDPSession after construction)
 
     var sendFileContentsResponse: (@Sendable (_ streamID: UInt32, _ success: Bool, _ data: Data) -> Void)?
+    /// `clipDataID == nil` ⇒ legacy mode (no lock cap). Concurrent
+    /// pastes need the per-session id stamped onto every request so
+    /// mstsc routes against the right preserved FGDW.
     var sendFileContentsRequest:  (@Sendable (_ streamID: UInt32, _ listIndex: UInt32,
-                                              _ wantSize: Bool, _ offset: UInt64, _ length: UInt32) -> Void)?
+                                              _ wantSize: Bool, _ offset: UInt64, _ length: UInt32,
+                                              _ clipDataID: UInt32?) -> Void)?
+    var sendClipLock:   (@Sendable (_ clipDataID: UInt32) -> Void)?
+    var sendClipUnlock: (@Sendable (_ clipDataID: UInt32) -> Void)?
+
+    /// Bridge-global counter for clipDataID. Allocated per session
+    /// when we call `sendClipLock`. UINT32 on the wire; rolls over
+    /// (skipping 0) once we exhaust 2^32 sessions — never going to
+    /// happen in practice.
+    private var nextClipDataID: UInt32 = 1
+    @MainActor
+    func allocClipDataID() -> UInt32 {
+        let id = nextClipDataID
+        nextClipDataID = nextClipDataID &+ 1
+        if nextClipDataID == 0 { nextClipDataID = 1 }
+        return id
+    }
 
     init(config: Config) {
         self.config = config
@@ -500,21 +519,27 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             self.claimedTypeMap = [:]
             self.pendingLock.unlock()
 
-            // Stable UUIDs + parent links — same as before.
+            // Stable UUIDs + parent links. Building parentID via a
+            // path→id dictionary instead of an O(N²) inner scan —
+            // 40k-file folder copies (a typical SDK / source tree)
+            // were spending minutes inside this loop, long enough for
+            // Finder's right-click "Paste" to never even appear.
             var ids = [String](repeating: "", count: entries.count)
-            for i in 0..<entries.count { ids[i] = UUID().uuidString }
+            var pathToID: [String: String] = [:]
+            pathToID.reserveCapacity(entries.count)
+            for i in 0..<entries.count {
+                ids[i] = UUID().uuidString
+                pathToID[entries[i].relativePath] = ids[i]
+            }
             func parentID(of i: Int) -> String? {
                 let path = entries[i].relativePath
                 guard let lastSlash = path.lastIndex(of: "/") else { return nil }
-                let parentPath = String(path[..<lastSlash])
-                for j in 0..<entries.count where j != i {
-                    if entries[j].relativePath == parentPath { return ids[j] }
-                }
-                return nil
+                return pathToID[String(path[..<lastSlash])]
             }
             // Map id → listIndex so the XPC fetcher can route to the
             // right CLIPRDR slot when the extension asks for bytes.
             var idToListIndex: [String: Int] = [:]
+            idToListIndex.reserveCapacity(entries.count)
             var items: [FileProviderInbox.PublishItem] = []
             items.reserveCapacity(entries.count)
             for (idx, e) in entries.enumerated() {
@@ -529,56 +554,149 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             }
             Log.clip.info("Publishing metadata for \(items.count, privacy: .public) item(s) — bytes lazy via XPC")
 
+            // Allocate the session id and wrap this copy in a session
+            // FOLDER so multiple concurrent sessions are visible /
+            // distinguishable in Finder. Layout becomes:
+            //   MacRDP-MacRDPClipboard/
+            //     ├── "Copy 19:55:54"/        ← session folder
+            //     │   └── <original top-level items>
+            //     └── "Copy 19:56:00"/
+            //         └── <original top-level items>
+            // Session folder name = the session UUID. Uniform across
+            // every case (1 file, 1 folder, multi, mixed) so the layout
+            // is predictable to look at and trivial to reason about.
+            let sessionID = UUID().uuidString
+            let sessionRootItem = FileProviderInbox.PublishItem(
+                id: sessionID,
+                filename: sessionID,
+                parentID: nil,
+                isDirectory: true,
+                size: 0,
+                modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+
+            // Rewrite every original top-level item to point at the
+            // session folder as its parent.
+            let rewrittenItems: [FileProviderInbox.PublishItem] = items.map {
+                guard $0.parentID == nil else { return $0 }
+                return FileProviderInbox.PublishItem(
+                    id: $0.id,
+                    filename: $0.filename,
+                    parentID: sessionID,
+                    isDirectory: $0.isDirectory,
+                    size: $0.size,
+                    modificationMs: $0.modificationMs)
+            }
+
+            // Authoritative tree includes the synthetic session folder
+            // plus every (re-parented) original item.
+            let allManifestItems: [ManifestItem] =
+                ([sessionRootItem] + rewrittenItems).map {
+                    ManifestItem(id: $0.id,
+                                  filename: $0.filename,
+                                  size: $0.size,
+                                  parentID: $0.parentID,
+                                  isDirectory: $0.isDirectory,
+                                  modificationMs: $0.modificationMs)
+                }
+            // Eagerly push to the extension: session folder + its
+            // immediate children (= the originals' new top-level).
+            // Deeper subtrees are still lazy via enumerateChildren.
+            let publishedItems: [FileProviderInbox.PublishItem] =
+                [sessionRootItem] +
+                rewrittenItems.filter { $0.parentID == sessionID }
+
             // Hop to MainActor: publish manifest, register XPC fetcher,
             // resolve URLs for the pasteboard.
             await MainActor.run {
-                // Register a per-domain fetcher that handles "give me
-                // bytes for item X, offset Y, length L" by routing
-                // through the existing awaitFileContents / CLIPRDR path.
-                FileProviderXPCService.shared.registerFetcher(
-                    domainSubdir: inbox.subdir
-                ) { [weak self] itemID, offset, length in
+                // LOCK_CLIPDATA enabled on FreeRDP master HEAD.
+                // Allocate a clipDataID, send CB_LOCK_CLIPDATA, stamp
+                // every FILECONTENTS_REQUEST so mstsc routes against
+                // the pinned FGDW snapshot for this session.
+                let clipDataIDValue = self.allocClipDataID()
+                self.sendClipLock?(clipDataIDValue)
+                let clipDataID: UInt32? = clipDataIDValue
+                // Register items with the copy-progress UI BEFORE the
+                // fetcher closure can fire. Tracker drives the Win-style
+                // multi-session progress dialog once chunks start landing.
+                CopyProgressTracker.shared.registerItems(
+                    sessionID: sessionID,
+                    title: sessionID,
+                    entries: items.map {
+                        (id: $0.id, name: $0.filename,
+                         size: $0.size, isDirectory: $0.isDirectory)
+                    })
+                // Per-session fetcher. The closure captures the
+                // session's listIndex map by value — when a *new*
+                // clipboard event happens, this closure still serves
+                // bytes for the OLD session because Windows preserves
+                // the old FGDW while a paste is using it.
+                let perSessionIdToListIndex = idToListIndex
+                let unlockCb = self.sendClipUnlock
+                FileProviderXPCService.shared.registerSession(
+                    domainSubdir: inbox.subdir,
+                    sessionID: sessionID,
+                    items: allManifestItems,
+                    fetcher: { [weak self] itemID, offset, length in
                     guard let self else {
                         return (nil, NSError(domain: "MacRDP.clip", code: 99,
-                            userInfo: [NSLocalizedDescriptionKey: "session gone"]))
+                            userInfo: [NSLocalizedDescriptionKey: "bridge gone"]))
                     }
-                    guard let listIndex = idToListIndex[itemID] else {
+                    guard let listIndex = perSessionIdToListIndex[itemID] else {
                         return (nil, NSError(domain: "MacRDP.clip", code: 404,
-                            userInfo: [NSLocalizedDescriptionKey: "unknown item id"]))
+                            userInfo: [NSLocalizedDescriptionKey: "unknown item id \(itemID)"]))
                     }
                     let data = self.awaitFileContents(
                         listIndex: UInt32(listIndex),
                         offset: UInt64(offset),
                         length: UInt32(length),
-                        timeoutMs: 30_000)
+                        timeoutMs: 30_000,
+                        clipDataID: clipDataID)
                     if data.isEmpty {
                         return (nil, NSError(domain: "MacRDP.clip", code: 504,
-                            userInfo: [NSLocalizedDescriptionKey: "RDP fetch timed out"]))
+                            userInfo: [NSLocalizedDescriptionKey: "RDP fetch timed out / FAIL"]))
                     }
                     return (data, nil)
-                }
+                },
+                onCleanup: {
+                    // No-op: LOCK is disabled so nothing to unlock.
+                    if let cid = clipDataID {
+                        unlockCb?(cid)
+                    }
+                })
 
                 Task { @MainActor in
                     do {
-                        try await inbox.publish(items)
+                        // Push session folder + its immediate children
+                        // so the framework can index them up front;
+                        // deeper levels stay lazy via enumerateChildren.
+                        try await inbox.publish(publishedItems)
                     } catch {
                         Log.clip.error("FileProvider publish failed: \(String(describing: error), privacy: .public)")
                         return
                     }
-                    await self.resolveAndWriteFileURLs(inbox: inbox, items: items)
+                    // Pasteboard URLs point to the original items
+                    // (now under the session folder). Finder strips the
+                    // parent path when pasting, so the user lands with
+                    // just the file/folder — no session-folder prefix.
+                    let pasteboardItems = rewrittenItems.filter {
+                        $0.parentID == sessionID
+                    }
+                    await self.resolveAndWriteFileURLs(inbox: inbox, items: pasteboardItems)
                 }
             }
         }
     }
 
+
     @MainActor
     private func resolveAndWriteFileURLs(inbox: FileProviderInbox,
                                           items: [FileProviderInbox.PublishItem]) async {
-        // Only top-level items (parentID == nil) go on the pasteboard.
-        // The FP framework gives us URLs inside the domain mount;
-        // Finder/Mail/etc. read through the extension when pasting.
+        // Caller filters which items go on the pasteboard (we used
+        // to hard-code parentID == nil, but with session-folder
+        // nesting the "top-level for pasteboard" is the items inside
+        // the session folder, not the session folder itself).
         var urls: [URL] = []
-        for it in items where it.parentID == nil {
+        for it in items {
             if let url = await inbox.userVisibleURL(itemID: it.id, filename: it.filename) {
                 urls.append(url)
             } else {
@@ -870,11 +988,15 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     }
 
     /// Block (with timeout) waiting for the client's bytes for a
-    /// FILECONTENTS_REQUEST we sent. Runs on the file-promise queue.
+    /// FILECONTENTS_REQUEST we sent. `clipDataID` (when non-nil)
+    /// stamps the PDU so the client routes the fetch against the
+    /// specific lock-pinned FGDW snapshot for the session — required
+    /// for byte-correct concurrent paste sessions.
     nonisolated private func awaitFileContents(listIndex: UInt32,
                                                 offset: UInt64,
                                                 length: UInt32,
-                                                timeoutMs: Int) -> Data {
+                                                timeoutMs: Int,
+                                                clipDataID: UInt32? = nil) -> Data {
         pendingLock.lock()
         let sid = nextInStreamID
         nextInStreamID = nextInStreamID &+ 1
@@ -883,7 +1005,11 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         inPendingFiles[sid] = fetch
         pendingLock.unlock()
 
-        sendFileContentsRequest?(sid, listIndex, false, offset, length)
+        // Per-request trace so we can correlate the last good
+        // request with FreeRDP's channel-death log when chasing
+        // wire-level bugs.
+        Log.clip.info("→ FILECONTENTS_REQUEST sid=\(sid, privacy: .public) listIndex=\(listIndex, privacy: .public) off=\(offset, privacy: .public) len=\(length, privacy: .public) clipDataID=\(clipDataID ?? 0, privacy: .public)")
+        sendFileContentsRequest?(sid, listIndex, false, offset, length, clipDataID)
 
         let deadline = DispatchTime.now() + .milliseconds(timeoutMs)
         _ = fetch.semaphore.wait(timeout: deadline)
@@ -898,6 +1024,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     /// Bridge thread delivers FILECONTENTS_RESPONSE bytes. Routes to
     /// the pending fetch by streamId. No MainActor hop.
     nonisolated func handleClientFileContentsResponse(streamID: UInt32, data: Data) {
+        Log.clip.info("← FILECONTENTS_RESPONSE sid=\(streamID, privacy: .public) bytes=\(data.count, privacy: .public)")
         pendingLock.lock()
         let fetch = inPendingFiles[streamID]
         fetch?.data = data

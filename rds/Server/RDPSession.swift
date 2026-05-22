@@ -103,6 +103,11 @@ final class RDPSession {
     }
 
     func shutdown() {
+        // Release any modifiers we believe the peer was still holding;
+        // without this a dropped Cmd-up at disconnect time leaves
+        // macOS thinking Cmd is held, and the next typed letter on the
+        // *console* gets interpreted as a Cmd-shortcut.
+        inputBox.value?.releaseAllModifiers()
         displayPipeline?.stop()
         audioOut?.stop()
         audioIn?.stop()
@@ -220,6 +225,24 @@ final class RDPSession {
         }
         sinks.onClipFileContentsResponse = { [weak self] sid, data in
             self?.clipboard?.handleClientFileContentsResponse(streamID: sid, data: data)
+        }
+        // RDPDR Phase 1: just log device announces. Later phases will
+        // register a per-drive FileProvider domain and stream reads
+        // back through the same XPC pipeline the clipboard uses.
+        sinks.onRdpdrDeviceAdded = { id, type, dos in
+            let kind: String
+            switch type {
+            case 0x01: kind = "SERIAL"
+            case 0x02: kind = "PARALLEL"
+            case 0x04: kind = "PRINT"
+            case 0x08: kind = "FILESYSTEM"
+            case 0x20: kind = "SMARTCARD"
+            default:   kind = String(format: "0x%X", type)
+            }
+            Log.session.notice("RDPDR device announced: id=\(id, privacy: .public) type=\(kind, privacy: .public) name='\(dos, privacy: .public)'")
+        }
+        sinks.onRdpdrDeviceRemoved = { id in
+            Log.session.notice("RDPDR device removed: id=\(id, privacy: .public)")
         }
 
         let cfgWithPaths = withTLSPaths(certPath: certPath, keyPath: keyPath)
@@ -405,11 +428,14 @@ final class RDPSession {
             clip.sendFileContentsResponse = { sid, ok, data in
                 bridge.sendClipFileContentsResponse(streamID: sid, success: ok, data: data)
             }
-            clip.sendFileContentsRequest = { sid, idx, wantSize, off, len in
+            clip.sendFileContentsRequest = { sid, idx, wantSize, off, len, clipDataID in
                 bridge.sendClipFileContentsRequest(
                     streamID: sid, listIndex: idx,
-                    wantSize: wantSize, offset: off, length: len)
+                    wantSize: wantSize, offset: off, length: len,
+                    clipDataID: clipDataID)
             }
+            clip.sendClipLock   = { cid in bridge.sendClipLock(clipDataID: cid) }
+            clip.sendClipUnlock = { cid in bridge.sendClipUnlock(clipDataID: cid) }
             do {
                 try clip.start()
                 self.clipboard = clip

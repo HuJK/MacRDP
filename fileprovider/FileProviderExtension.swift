@@ -76,12 +76,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                        version requestedVersion: NSFileProviderItemVersion?,
                        request: NSFileProviderRequest,
                        completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void) -> Progress {
+        log.info("fetchContents START id=\(itemIdentifier.rawValue, privacy: .public)")
         guard let manifest = ManifestCache.shared.manifest(domainSubdir: domainSubdir),
               let entry = manifest.items.first(where: { $0.id == itemIdentifier.rawValue }) else {
+            log.error("fetchContents noSuchItem id=\(itemIdentifier.rawValue, privacy: .public)")
             completionHandler(nil, nil, NSError(domain: NSFileProviderErrorDomain,
                                                  code: NSFileProviderError.noSuchItem.rawValue))
             return Progress()
         }
+        log.info("fetchContents resolved '\(entry.filename, privacy: .public)' size=\(entry.size, privacy: .public)")
         if entry.isDirectory {
             completionHandler(nil, nil, NSError(domain: NSFileProviderErrorDomain,
                                                  code: NSFileProviderError.noSuchItem.rawValue))
@@ -99,7 +102,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             return Progress()
         }
 
+        // The File Provider framework observes the Progress object we
+        // RETURN from this method directly (KVO on completedUnitCount /
+        // totalUnitCount). That is the only channel Finder reads from for
+        // a materialization, so we drive byte-level units here.
+        //
+        // Do NOT set kind = .file / fileTotalCount / fileCompletedCount:
+        // those make NSProgress report "files completed" instead of bytes,
+        // so a single-file fetch shows 0-of-1 ("Preparing…") for the whole
+        // transfer and jumps to done at the end — no bar in between.
+        //
+        // Do NOT call publish()/set fileURL: that registers with the
+        // separate addSubscriber(forFileURL:) system, which the FP
+        // framework does not use.
         let progress = Progress(totalUnitCount: max(entry.size, 1))
+        progress.isCancellable = true
+        progress.isPausable = false
         let domainSubdir = self.domainSubdir
         let sessionID = manifest.sessionID
         let source = self.serviceSource
@@ -107,16 +125,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         // Lazy fetch: stream bytes from the host over the
         // NSFileProviderService XPC connection (extension → host
         // direction). Chunked so a multi-GB file doesn't balloon memory.
+        let itemID = entry.id
+        let totalSize = entry.size
         Task.detached {
             defer { try? handle.close() }
+            let startMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
             do {
                 try await HostByteFetcher.fetchInto(
                     handle: handle,
                     source: source,
                     domainSubdir: domainSubdir,
-                    itemID: entry.id,
-                    totalSize: entry.size,
+                    itemID: itemID,
+                    totalSize: totalSize,
                     progress: progress)
+                let endMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+                log.info("fetchContents DONE id=\(itemID, privacy: .public) bytes=\(totalSize, privacy: .public) took=\(endMs - startMs, privacy: .public)ms")
+                progress.completedUnitCount = progress.totalUnitCount
                 completionHandler(tempURL,
                                   FileProviderItem(entry, manifestSessionID: sessionID),
                                   nil)
@@ -184,7 +208,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             return existing
         }
         let e = FileProviderEnumerator(domainSubdir: domainSubdir,
-                                       containerID: containerItemIdentifier)
+                                       containerID: containerItemIdentifier,
+                                       serviceSource: serviceSource)
         enumerators[containerItemIdentifier] = e
         return e
     }

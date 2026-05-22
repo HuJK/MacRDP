@@ -15,6 +15,52 @@ import os
 
 private let log = Logger(subsystem: "com.macrdp.server", category: "fileprovider-xpc")
 
+enum HostChildEnumerator {
+
+    /// Synchronously ask the host for one container's immediate
+    /// children. Returns nil on transport error / timeout — caller
+    /// should fall back to local cache or empty enumeration.
+    /// Blocking-by-design: FileProvider enumerator paths are
+    /// synchronous-ish, so we use a semaphore.
+    static func fetchChildrenSync(source: ClipboardServiceSource,
+                                  domainSubdir: String,
+                                  containerID: String,
+                                  timeout: TimeInterval = 30) -> [ManifestItem]? {
+        let sem = DispatchSemaphore(value: 0)
+        var result: Data?
+        var errored = false
+        let proxy = source.hostProxy { err in
+            log.error("enumerateChildren proxy error: \(String(describing: err), privacy: .public)")
+            errored = true
+            sem.signal()
+        }
+        guard let proxy else {
+            log.error("enumerateChildren: no host connection")
+            return nil
+        }
+        proxy.enumerateChildren(domainSubdir: domainSubdir,
+                                 containerID: containerID) { data, err in
+            if let err {
+                log.error("enumerateChildren reply error: \(String(describing: err), privacy: .public)")
+            }
+            result = data
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            log.notice("enumerateChildren timed out (\(timeout, privacy: .public)s) cid=\(containerID, privacy: .public)")
+            return nil
+        }
+        if errored { return nil }
+        guard let data = result else { return nil }
+        do {
+            return try JSONDecoder().decode([ManifestItem].self, from: data)
+        } catch {
+            log.error("enumerateChildren decode failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+}
+
 enum HostByteFetcher {
 
     /// Tunables. mstsc / RDP transfer is the bottleneck; 1 MiB chunks
@@ -30,7 +76,10 @@ enum HostByteFetcher {
                           totalSize: Int64,
                           progress: Progress) async throws {
         if totalSize == 0 { return }
+        log.info("HostByteFetcher start id=\(itemID, privacy: .public) total=\(totalSize, privacy: .public)")
         var offset: Int64 = 0
+        var lastLogMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        var lastLogOffset: Int64 = 0
         while offset < totalSize {
             try Task.checkCancellation()
             let want = min(chunkSize, totalSize - offset)
@@ -46,7 +95,22 @@ enum HostByteFetcher {
             }
             try handle.write(contentsOf: data)
             offset += Int64(data.count)
+            // willChangeValue/didChangeValue isn't needed — Progress
+            // emits KVO automatically on completedUnitCount assignment.
+            // We DO update throughput so Finder's ETA stabilises.
             progress.completedUnitCount = offset
+            progress.setUserInfoObject(NSNumber(value: Int(data.count)),
+                                        forKey: .throughputKey)
+            // Throughput log every ~1s of wall time.
+            let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+            if nowMs - lastLogMs >= 1000 {
+                let deltaB = offset - lastLogOffset
+                let mbps = Double(deltaB) / Double(nowMs - lastLogMs) / 1024.0 * 1000.0 / 1024.0
+                let pct = totalSize > 0 ? (Double(offset) / Double(totalSize) * 100.0) : 0
+                log.info("HostByteFetcher \(itemID, privacy: .public): \(offset, privacy: .public)/\(totalSize, privacy: .public)B (\(pct, format: .fixed(precision: 1), privacy: .public)%) ~\(mbps, format: .fixed(precision: 2), privacy: .public) MiB/s")
+                lastLogMs = nowMs
+                lastLogOffset = offset
+            }
         }
     }
 

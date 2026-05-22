@@ -51,6 +51,9 @@ static uint64_t now_ms(void) {
 #  include <freerdp/channels/audin.h>
 #  include <freerdp/channels/disp.h>
 #  include <freerdp/channels/cliprdr.h>
+#  include <freerdp/server/rdpdr.h>
+#  include <freerdp/channels/rdpdr.h>
+#  include <freerdp/utils/rdpdr_utils.h>
 #  include <freerdp/codec/audio.h>
 #  include <freerdp/settings.h>
 #  include <freerdp/crypto/certificate.h>
@@ -143,6 +146,11 @@ struct macrdp_session {
     /* CLIPRDR — bidirectional clipboard sync (CB_FORMAT_LIST etc.). */
     CliprdrServerContext  *cliprdr;
     bool                   cliprdr_open;
+    /* RDPDR — device redirection (drives, printers, smartcards).
+     * Phase 1 just logs device announces; later phases mount drives
+     * as FileProvider domains. */
+    RdpdrServerContext    *rdpdr;
+    bool                   rdpdr_open;
     /* Set after the server↔client capability + monitor-ready handshake
      * completes; before that we must not send FormatList PDUs. */
     atomic_bool            cliprdr_ready;
@@ -761,7 +769,8 @@ static void try_open_cliprdr(struct macrdp_session *s) {
     ctx->useLongFormatNames     = TRUE;
     ctx->streamFileClipEnabled  = TRUE;     /* Phase 7: enable file payloads */
     ctx->fileClipNoFilePaths    = TRUE;     /* paths aren't shared, only contents */
-    ctx->canLockClipData        = FALSE;
+    /* Testing again on FreeRDP master HEAD with LOCK_CLIPDATA on. */
+    ctx->canLockClipData        = TRUE;
     ctx->hasHugeFileSupport     = TRUE;     /* 64-bit FILECONTENTS_REQUEST offsets */
     ctx->autoInitializationSequence = TRUE;  /* sends caps + monitor-ready
                                                  automatically on Start */
@@ -801,6 +810,72 @@ static void try_open_cliprdr(struct macrdp_session *s) {
         s->cbs.on_clip_ready(s->swift_ctx);
     }
     os_log(bridge_log(), "CLIPRDR channel opened (static VC)");
+}
+
+/* -------- RDPDR (device / drive redirection) ---------------------- */
+
+static UINT rdpdr_on_drive_create_cb(RdpdrServerContext *ctx,
+                                     const RdpdrDevice *device) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (!s || !device) return CHANNEL_RC_OK;
+    /* PreferredDosName is fixed 8 bytes, not necessarily NUL-terminated. */
+    char dos[9];
+    memcpy(dos, device->PreferredDosName, 8);
+    dos[8] = '\0';
+    os_log(bridge_log(),
+           "RDPDR drive announce: id=%u type=0x%X dos='%s'",
+           device->DeviceId, device->DeviceType, dos);
+    if (s->cbs.on_rdpdr_device_added) {
+        s->cbs.on_rdpdr_device_added(s->swift_ctx,
+                                     device->DeviceId,
+                                     device->DeviceType,
+                                     dos);
+    }
+    return CHANNEL_RC_OK;
+}
+
+static UINT rdpdr_on_drive_delete_cb(RdpdrServerContext *ctx,
+                                     UINT32 deviceId) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (!s) return CHANNEL_RC_OK;
+    os_log(bridge_log(), "RDPDR drive removed: id=%u", deviceId);
+    if (s->cbs.on_rdpdr_device_removed) {
+        s->cbs.on_rdpdr_device_removed(s->swift_ctx, deviceId);
+    }
+    return CHANNEL_RC_OK;
+}
+
+static void try_open_rdpdr(struct macrdp_session *s) {
+    if (s->rdpdr_open || !s->cfg.enable_rdpdr) return;
+    if (!atomic_load(&s->activated)) return;
+    HANDLE vcm = vcm_from_session(s);
+    if (!vcm) return;
+    /* RDPDR is a static virtual channel; client joins it when we
+     * advertise via FreeRDP_RedirectDrives etc. */
+    if (!WTSVirtualChannelManagerIsChannelJoined(vcm, RDPDR_SVC_CHANNEL_NAME))
+        return;
+
+    RdpdrServerContext *ctx = rdpdr_server_context_new(vcm);
+    if (!ctx) {
+        os_log(bridge_log(), "rdpdr_server_context_new failed");
+        return;
+    }
+    ctx->rdpcontext = s->peer->context;
+    ctx->data       = s;     /* RdpdrServerContext uses `data` (not `custom`) */
+    /* Phase 1: drives only. Phase 4+: also advertise printers / smart cards. */
+    ctx->supported  = RDPDR_DTYP_FILESYSTEM;
+    ctx->OnDriveCreate = rdpdr_on_drive_create_cb;
+    ctx->OnDriveDelete = rdpdr_on_drive_delete_cb;
+
+    UINT rc = ctx->Start(ctx);
+    if (rc != CHANNEL_RC_OK) {
+        os_log(bridge_log(), "rdpdr Start failed: %u", rc);
+        rdpdr_server_context_free(ctx);
+        return;
+    }
+    s->rdpdr = ctx;
+    s->rdpdr_open = true;
+    os_log(bridge_log(), "RDPDR channel opened (static VC)");
 }
 
 /* Attempt to open the GFX channel once DRDYNVC reports READY. */
@@ -1006,6 +1081,9 @@ static BOOL configure_settings(rdpSettings *s,
     /* CLIPRDR — bidirectional clipboard sync. Static VC; the client
      * joins automatically when RedirectClipboard is set. */
     if (!freerdp_settings_set_bool(s, FreeRDP_RedirectClipboard, TRUE)) return FALSE;
+    /* RDPDR — device redirection (drives). Static VC; client joins
+     * when any RedirectDrives/RedirectPrinters/etc. is set. */
+    if (!freerdp_settings_set_bool(s, FreeRDP_RedirectDrives, TRUE)) return FALSE;
     return TRUE;
 }
 
@@ -1157,6 +1235,7 @@ int32_t macrdp_session_run(macrdp_session_t s)
         try_open_audin(s);
         try_open_disp(s);
         try_open_cliprdr(s);
+        try_open_rdpdr(s);
 
         /* FrameAck watchdog: if a client stops acking but the connection
          * is otherwise healthy, force-clear credit so we don't go black. */
@@ -1217,6 +1296,11 @@ void macrdp_session_destroy(macrdp_session_t s)
         (void)s->cliprdr->Close(s->cliprdr);
         cliprdr_server_context_free(s->cliprdr);
         s->cliprdr = NULL;
+    }
+    if (s->rdpdr) {
+        (void)s->rdpdr->Stop(s->rdpdr);
+        rdpdr_server_context_free(s->rdpdr);
+        s->rdpdr = NULL;
     }
     if (s->disp) {
         if (s->disp->Close) (void)s->disp->Close(s->disp);
@@ -1720,15 +1804,29 @@ int32_t macrdp_session_send_clip_file_contents_request(macrdp_session_t s,
                                                        uint64_t offset,
                                                        uint32_t length)
 {
+    /* Back-compat shim: no clipDataID. */
+    return macrdp_session_send_clip_file_contents_request_with_clipdata(
+        s, sid, list_index, want_size, offset, length, 0, 0);
+}
+
+int32_t macrdp_session_send_clip_file_contents_request_with_clipdata(
+    macrdp_session_t s,
+    uint32_t sid,
+    uint32_t list_index,
+    int32_t  want_size,
+    uint64_t offset,
+    uint32_t length,
+    int32_t  have_clipdata_id,
+    uint32_t clipdata_id)
+{
 #if MACRDP_HAVE_FREERDP
     if (!s || !s->cliprdr || !atomic_load(&s->cliprdr_ready)) {
         return MACRDP_E_NOT_IMPLEMENTED;
     }
     CLIPRDR_FILE_CONTENTS_REQUEST req = { 0 };
     req.common.msgType  = CB_FILECONTENTS_REQUEST;
-    /* FreeRDP allocates the wire stream sized to dataLen. The PDU body
-     * is 28 bytes (streamId + listIndex + dwFlags + nPositionLow +
-     * nPositionHigh + cbRequested + clipDataId). */
+    /* PDU body is 28 bytes (streamId + listIndex + dwFlags +
+     * nPositionLow + nPositionHigh + cbRequested + clipDataId). */
     req.common.dataLen   = 28;
     req.streamId         = sid;
     req.listIndex        = list_index;
@@ -1736,11 +1834,49 @@ int32_t macrdp_session_send_clip_file_contents_request(macrdp_session_t s,
     req.nPositionLow     = (UINT32)(offset & 0xFFFFFFFFu);
     req.nPositionHigh    = (UINT32)((offset >> 32) & 0xFFFFFFFFu);
     req.cbRequested      = length;
-    req.haveClipDataId   = FALSE;
+    req.haveClipDataId   = have_clipdata_id ? TRUE : FALSE;
+    req.clipDataId       = clipdata_id;
     UINT rc = s->cliprdr->ServerFileContentsRequest(s->cliprdr, &req);
     return rc == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL;
 #else
-    (void)s; (void)sid; (void)list_index; (void)want_size; (void)offset; (void)length;
+    (void)s; (void)sid; (void)list_index; (void)want_size;
+    (void)offset; (void)length; (void)have_clipdata_id; (void)clipdata_id;
+    return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_send_clip_lock(macrdp_session_t s, uint32_t clipdata_id)
+{
+#if MACRDP_HAVE_FREERDP
+    if (!s || !s->cliprdr || !atomic_load(&s->cliprdr_ready)) {
+        return MACRDP_E_NOT_IMPLEMENTED;
+    }
+    CLIPRDR_LOCK_CLIPBOARD_DATA pdu = { 0 };
+    pdu.common.msgType  = CB_LOCK_CLIPDATA;
+    pdu.common.dataLen  = 4;
+    pdu.clipDataId      = clipdata_id;
+    UINT rc = s->cliprdr->ServerLockClipboardData(s->cliprdr, &pdu);
+    return rc == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL;
+#else
+    (void)s; (void)clipdata_id;
+    return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_send_clip_unlock(macrdp_session_t s, uint32_t clipdata_id)
+{
+#if MACRDP_HAVE_FREERDP
+    if (!s || !s->cliprdr || !atomic_load(&s->cliprdr_ready)) {
+        return MACRDP_E_NOT_IMPLEMENTED;
+    }
+    CLIPRDR_UNLOCK_CLIPBOARD_DATA pdu = { 0 };
+    pdu.common.msgType  = CB_UNLOCK_CLIPDATA;
+    pdu.common.dataLen  = 4;
+    pdu.clipDataId      = clipdata_id;
+    UINT rc = s->cliprdr->ServerUnlockClipboardData(s->cliprdr, &pdu);
+    return rc == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL;
+#else
+    (void)s; (void)clipdata_id;
     return MACRDP_E_NOT_IMPLEMENTED;
 #endif
 }

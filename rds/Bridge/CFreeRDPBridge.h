@@ -148,6 +148,24 @@ typedef void (*macrdp_on_clip_file_contents_response_fn)(
     const uint8_t *data,
     size_t len);
 
+/* RDPDR static VC (Phase 5 drive sharing) — fires once per
+ * Win→Mac redirected drive announce. `dos_name` is up to 8 ASCII
+ * characters (e.g. "C", "D", "MyShare"); `device_type` is the
+ * RDPDR_DTYP_* numeric constant (8 == FILESYSTEM, 4 == PRINT, …).
+ *
+ * Phase 1 just logs; later phases will mount the drive as a
+ * FileProvider domain and route reads through the same XPC
+ * channel the clipboard uses. */
+typedef void (*macrdp_on_rdpdr_device_added_fn)(
+    void *ctx,
+    uint32_t  device_id,
+    uint32_t  device_type,
+    const char *dos_name);     /* NUL-terminated, ASCII */
+
+typedef void (*macrdp_on_rdpdr_device_removed_fn)(
+    void *ctx,
+    uint32_t  device_id);
+
 /* AUDIN dynamic VC (Phase 5) */
 typedef void (*macrdp_on_audio_in_frame_fn)(
     void *ctx,
@@ -181,6 +199,8 @@ typedef struct macrdp_callbacks {
     macrdp_on_audio_in_frame_fn                  on_audio_in_frame;
     macrdp_on_suppress_output_fn                 on_suppress_output;
     macrdp_on_audio_format_selected_fn           on_audio_format_selected;
+    macrdp_on_rdpdr_device_added_fn              on_rdpdr_device_added;
+    macrdp_on_rdpdr_device_removed_fn            on_rdpdr_device_removed;
 } macrdp_callbacks;
 
 /* -------- session lifecycle --------------------------------------- */
@@ -210,6 +230,7 @@ typedef struct macrdp_session_config {
     int32_t     enable_audio_in;       /* 0/1 */
     int32_t     enable_clipboard;      /* 0/1 */
     int32_t     enable_disp;           /* 0/1 */
+    int32_t     enable_rdpdr;          /* 0/1 — drive redirection */
 } macrdp_session_config;
 
 /* Create a session for an already-accepted file descriptor. The bridge
@@ -338,6 +359,29 @@ int32_t macrdp_session_send_clip_file_contents_request(
     int32_t          want_size,
     uint64_t         offset,
     uint32_t         length);
+
+/* Same as above but stamps the PDU with a `clipDataId` so the client
+ * routes the fetch to a specific (lock-pinned) clipboard snapshot
+ * rather than its current FGDW. Used for concurrent paste sessions. */
+int32_t macrdp_session_send_clip_file_contents_request_with_clipdata(
+    macrdp_session_t session,
+    uint32_t         stream_id,
+    uint32_t         list_index,
+    int32_t          want_size,
+    uint64_t         offset,
+    uint32_t         length,
+    int32_t          have_clipdata_id,
+    uint32_t         clipdata_id);
+
+/* Tell the client to preserve the current clipboard snapshot under
+ * `clipdata_id` even after a future FORMAT_LIST replaces it.
+ * Negotiated via canLockClipData = TRUE in the server capability set. */
+int32_t macrdp_session_send_clip_lock(macrdp_session_t session,
+                                       uint32_t        clipdata_id);
+
+/* Tell the client we no longer need the snapshot — it can free it. */
+int32_t macrdp_session_send_clip_unlock(macrdp_session_t session,
+                                         uint32_t        clipdata_id);
 
 /* -------- versioning ---------------------------------------------- */
 

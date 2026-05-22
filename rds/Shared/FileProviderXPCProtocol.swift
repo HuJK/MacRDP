@@ -65,4 +65,16 @@ public protocol ExtensionToHostProtocol {
                     offset: Int64,
                     length: Int64,
                     reply: @escaping (Data?, NSError?) -> Void)
+
+    /// Ask the host for the immediate children of a container. Lets
+    /// the extension lazy-enumerate large folder trees instead of
+    /// eagerly receiving a multi-MB manifest at copy time.
+    ///
+    /// `containerID` is either the empty string (= top-level / root
+    /// container) or a manifest item id. Reply data is a JSON array
+    /// of `ManifestItem` (the same encoding `pushManifest` uses for
+    /// its `items` field).
+    func enumerateChildren(domainSubdir: String,
+                           containerID: String,
+                           reply: @escaping (Data?, NSError?) -> Void)
 }

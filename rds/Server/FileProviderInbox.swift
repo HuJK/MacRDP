@@ -302,8 +302,17 @@ final class FileProviderInbox {
 
         // Synthetic fetcher: returns `length` bytes of a repeating
         // pattern, starting at `offset`. Pure CPU; no network, no RDP.
-        FileProviderXPCService.shared.registerFetcher(
-            domainSubdir: subdir
+        let testItem = ManifestItem(
+            id: testID,
+            filename: testFilename,
+            size: testSize,
+            parentID: nil,
+            isDirectory: false,
+            modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+        FileProviderXPCService.shared.registerSession(
+            domainSubdir: subdir,
+            sessionID: "synthetic-test-file",
+            items: [testItem]
         ) { itemID, offset, length in
             guard itemID == testID else {
                 return (nil, NSError(domain: "MacRDP.testFile", code: 404,
@@ -340,13 +349,19 @@ final class FileProviderInbox {
     /// User-visible URL for an item in this domain. Retries while the
     /// framework ingests the just-published item — `getUserVisibleURL`
     /// returns nil for an item the framework hasn't picked up via its
-    /// working-set enumeration. The retry window is ~6 seconds total,
-    /// which is enough for the framework to call `enumerateChanges`
-    /// on our working-set enumerator after we signal it.
+    /// working-set enumeration.
+    ///
+    /// Budget is generous (~30 s total) because for large folder
+    /// copies (40 k items, 6+ MB manifest JSON), the framework has to
+    /// (a) call our enumerator, (b) wait for the extension to decode
+    /// the manifest, (c) build its own index of every item — that
+    /// can easily take 10–20 s the first time on slower Macs. Once
+    /// the index is built subsequent lookups are instant.
     func userVisibleURL(itemID: String, filename: String) async -> URL? {
         guard let manager else { return nil }
         let id = NSFileProviderItemIdentifier(itemID)
-        let delaysMs: [UInt64] = [50, 100, 200, 400, 800, 1600, 2000]
+        // 100, 200, 400, 800, 1600, 2 × 2 s, 5 × 5 s ≈ 32 s total.
+        let delaysMs: [UInt64] = [100, 200, 400, 800, 1600, 2000, 2000, 5000, 5000, 5000, 5000, 5000]
         for delay in delaysMs {
             if let url = try? await manager.getUserVisibleURL(for: id) {
                 return url
