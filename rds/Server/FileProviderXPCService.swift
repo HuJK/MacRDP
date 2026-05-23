@@ -13,6 +13,7 @@
 //
 
 import Foundation
+import FileProvider
 import os
 
 @MainActor
@@ -71,6 +72,14 @@ final class FileProviderXPCService: NSObject {
         /// map by value) so lazy sessions can populate it from the
         /// resolver without rebuilding the fetcher closure.
         var idToListIndex: [String: Int] = [:]
+        /// Set by the lazy resolver when it couldn't produce a tree
+        /// (timeout / FAIL / empty FGDW). Subsequent
+        /// `enumerateChildren(placeholder)` replies with an error
+        /// instead of an empty list, so Finder aborts the paste and
+        /// (best-effort) cleans up the empty destination folder
+        /// rather than leaving a stub.
+        var resolveFailed: Bool = false
+        var resolveFailureReason: String?
         init(id: String,
              domainSubdir: String,
              items: [ManifestItem],
@@ -292,6 +301,19 @@ final class FileProviderXPCService: NSObject {
         return sessions[sid]?.idToListIndex[itemID]
     }
 
+    /// Mark a lazy session as failed so the next `enumerateChildren`
+    /// for its placeholder replies with an error rather than an empty
+    /// list. Called by the lazy resolver when the FGDW can't be
+    /// obtained.
+    nonisolated func markResolveFailed(sessionID: String, reason: String) {
+        sessionsLock.lock()
+        if let s = sessions[sessionID] {
+            s.resolveFailed = true
+            s.resolveFailureReason = reason
+        }
+        sessionsLock.unlock()
+    }
+
     /// Synthetic test-file path. The synthetic fetcher (no real
     /// clipboard) needs to coexist with a single fixed itemID across
     /// app lifetime, so we treat it as its own session.
@@ -372,10 +394,11 @@ final class FileProviderXPCService: NSObject {
 
         sessionsLock.lock()
         let kids: [ManifestItem]
+        var failedReason: String? = nil
         if containerID.isEmpty {
             // Root: aggregate the synthetic session-folder entries
             // from every live session in this domain so the user sees
-            // all concurrent copies. Sorted oldest-first via UUID
+            // all concurrent copies. Sorted oldest—first via UUID
             // ordering — stable, good enough for now.
             var roots: [ManifestItem] = []
             for state in sessions.values
@@ -386,11 +409,28 @@ final class FileProviderXPCService: NSObject {
             kids = roots
         } else {
             let sessionID = itemToSession[containerID]
-            kids = sessionID
-                .flatMap { sessions[$0]?.tree.childItems(of: containerID) }
-                ?? []
+            let session = sessionID.flatMap { sessions[$0] }
+            // If the lazy resolver couldn't build a tree, signal
+            // failure up to Finder so it aborts the paste rather
+            // than landing an empty wrapper folder at the
+            // destination.
+            if let session, session.resolveFailed,
+               containerID == session.id {
+                failedReason = session.resolveFailureReason
+                    ?? "Could not resolve file list from Windows"
+                kids = []
+            } else {
+                kids = session?.tree.childItems(of: containerID) ?? []
+            }
         }
         sessionsLock.unlock()
+        if let failedReason {
+            reply(nil, NSError(
+                domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.serverUnreachable.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: failedReason]))
+            return
+        }
         do {
             let data = try JSONEncoder().encode(kids)
             reply(data, nil)

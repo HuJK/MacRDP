@@ -792,6 +792,13 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     : "The Windows session returned an empty file list."
                 Log.clip.error("Lazy resolver: \(reason, privacy: .public) — placeholder stays empty")
                 let failedSessionID = session.id
+                // Tell the service this session can't produce children
+                // so the enumerator returns a Finder-facing error
+                // (NSFileProviderErrorDomain.serverUnreachable). Finder
+                // then aborts the paste — empty destination folder is
+                // usually cleaned up automatically.
+                FileProviderXPCService.shared.markResolveFailed(
+                    sessionID: failedSessionID, reason: reason)
                 Task { @MainActor in
                     CopyProgressTracker.shared.failed(
                         sessionID: failedSessionID,
