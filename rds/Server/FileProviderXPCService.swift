@@ -55,6 +55,22 @@ final class FileProviderXPCService: NSObject {
         var cancelled: Bool = false
         var inFlight: Int = 0
         var lastActivityAt: Date = Date()
+        /// Lazy-mode hook: invoked exactly once, the first time someone
+        /// enumerates a non-empty container belonging to this session.
+        /// Closure must populate `tree` (via `TreeStore.replaceItems`)
+        /// AND `idToListIndex` AND call
+        /// `FileProviderXPCService.bindItemsToSession(..)` for every
+        /// newly-discovered item id, all *synchronously*, before
+        /// returning. Cleared on first invocation so it can't fire
+        /// twice.
+        var lazyResolver: ((SessionState) -> Void)?
+        var lazyResolved: Bool = false
+        let lazyLock = NSLock()
+        /// FileProvider item id → FGDW listIndex. The byte fetcher
+        /// closure looks up here each call (rather than capturing the
+        /// map by value) so lazy sessions can populate it from the
+        /// resolver without rebuilding the fetcher closure.
+        var idToListIndex: [String: Int] = [:]
         init(id: String,
              domainSubdir: String,
              items: [ManifestItem],
@@ -80,6 +96,20 @@ final class FileProviderXPCService: NSObject {
         private(set) var children: [String: [String]] = [:]
 
         init(items: [ManifestItem]) {
+            byID.reserveCapacity(items.count)
+            for it in items {
+                byID[it.id] = it
+                children[it.parentID ?? "", default: []].append(it.id)
+            }
+        }
+
+        /// Atomically swap the tree contents. Used by lazy resolvers
+        /// after the FGDW finally arrives — the placeholder session
+        /// was created with just the root folder; this replaces it
+        /// with the full tree (root + descendants).
+        func replaceItems(_ items: [ManifestItem]) {
+            byID = [:]
+            children = [:]
             byID.reserveCapacity(items.count)
             for it in items {
                 byID[it.id] = it
@@ -199,6 +229,69 @@ final class FileProviderXPCService: NSObject {
         cleanup?()
     }
 
+    /// Register a session that doesn't yet know its tree contents — it
+    /// only has a placeholder root folder. The first time anyone
+    /// enumerates that root's children, `lazyResolver` runs
+    /// synchronously and is responsible for populating the tree,
+    /// `idToListIndex`, and registering item IDs via
+    /// `bindItemsToSession`.
+    ///
+    /// Used by the "lazy" file fetch mode: pasteboard is claimed with
+    /// just the placeholder URL on `CB_FORMAT_LIST`, and we defer the
+    /// `CB_FORMAT_DATA_REQUEST` for the FGDW until Finder actually
+    /// asks for the placeholder's contents (i.e. user paste).
+    func registerLazySession(domainSubdir: String,
+                             sessionID: String,
+                             placeholderItem: ManifestItem,
+                             fetcher: @escaping (_ itemID: String,
+                                                  _ offset: Int64,
+                                                  _ length: Int64) async -> (Data?, NSError?),
+                             lazyResolver: @escaping (SessionState) -> Void,
+                             onCleanup: (() -> Void)? = nil) {
+        let state = SessionState(id: sessionID,
+                                 domainSubdir: domainSubdir,
+                                 items: [placeholderItem],
+                                 fetcher: fetcher,
+                                 onCleanup: onCleanup)
+        state.lazyResolver = lazyResolver
+        sessionsLock.lock()
+        var sessionToCheck: String?
+        if let prevID = currentSessionByDomain[domainSubdir],
+           prevID != sessionID,
+           let prev = sessions[prevID] {
+            prev.dismissed = true
+            sessionToCheck = prevID
+        }
+        sessions[sessionID] = state
+        currentSessionByDomain[domainSubdir] = sessionID
+        itemToSession[placeholderItem.id] = sessionID
+        let liveCount = sessions.values.filter { $0.domainSubdir == domainSubdir }.count
+        sessionsLock.unlock()
+        Log.clip.info("Session '\(sessionID, privacy: .public)' registered (lazy) with placeholder '\(placeholderItem.filename, privacy: .public)'; \(liveCount, privacy: .public) live session(s) for domain")
+        if let oldID = sessionToCheck {
+            scheduleCleanupCheck(sessionID: oldID)
+        }
+    }
+
+    /// Bind a set of newly-discovered FileProvider item IDs to a
+    /// session. Called by lazy resolvers after they expand the
+    /// placeholder into the full tree.
+    nonisolated func bindItemsToSession(_ items: [ManifestItem], sessionID: String) {
+        sessionsLock.lock()
+        for it in items { itemToSession[it.id] = sessionID }
+        sessionsLock.unlock()
+    }
+
+    /// Look up the FGDW listIndex bound to a FileProvider item id.
+    /// Used by lazy-mode byte fetchers: rather than capturing a
+    /// pre-built map at closure creation time, they look up via the
+    /// service so the lazy resolver can populate the map later.
+    nonisolated func listIndex(for itemID: String) -> Int? {
+        sessionsLock.lock(); defer { sessionsLock.unlock() }
+        guard let sid = itemToSession[itemID] else { return nil }
+        return sessions[sid]?.idToListIndex[itemID]
+    }
+
     /// Synthetic test-file path. The synthetic fetcher (no real
     /// clipboard) needs to coexist with a single fixed itemID across
     /// app lifetime, so we treat it as its own session.
@@ -253,6 +346,30 @@ final class FileProviderXPCService: NSObject {
         containerID: String,
         reply: @escaping (Data?, NSError?) -> Void)
     {
+        // If the container belongs to a lazy session whose tree hasn't
+        // been resolved yet, run the resolver synchronously here BEFORE
+        // computing children. The resolver populates `tree` +
+        // `idToListIndex` and calls `bindItemsToSession`. Done outside
+        // the global sessionsLock so the resolver can re-enter the
+        // service (it must, to call bindItemsToSession).
+        if !containerID.isEmpty {
+            sessionsLock.lock()
+            let session = itemToSession[containerID].flatMap { sessions[$0] }
+            sessionsLock.unlock()
+            if let session {
+                session.lazyLock.lock()
+                let resolver = session.lazyResolver
+                if !session.lazyResolved, let resolver {
+                    session.lazyResolved = true
+                    session.lazyResolver = nil
+                    session.lazyLock.unlock()
+                    resolver(session)   // blocking
+                } else {
+                    session.lazyLock.unlock()
+                }
+            }
+        }
+
         sessionsLock.lock()
         let kids: [ManifestItem]
         if containerID.isEmpty {

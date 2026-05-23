@@ -468,7 +468,12 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         if config.clipboard.files, let descID, let contID {
             inFileGroupDescID = descID
             inFileContentsID  = contID
-            claimPasteboardWithFilePromisesAsync(descriptorFormatID: descID)
+            let mode = (config.clipboard.fileFetchMode ?? "eager").lowercased()
+            if mode == "lazy" {
+                claimPasteboardLazyAsync(descriptorFormatID: descID)
+            } else {
+                claimPasteboardWithFilePromisesAsync(descriptorFormatID: descID)
+            }
             return
         }
 
@@ -698,6 +703,188 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     let ms: (UInt64, UInt64) -> UInt64 = { (a, b) in (b - a) / 1_000_000 }
                     Log.clip.info("FGDW pipeline timings (count=\(entries.count, privacy: .public)): fetch=\(ms(t0, t1), privacy: .public)ms parse=\(ms(t1, t2), privacy: .public)ms build=\(ms(t2, t3), privacy: .public)ms publish=\(ms(tPubStart, tPubEnd), privacy: .public)ms urls=\(ms(tPubEnd, tDone), privacy: .public)ms total=\(ms(t0, tDone), privacy: .public)ms")
                 }
+            }
+        }
+    }
+
+    /// Lazy variant. Pasteboard is claimed instantly with a placeholder
+    /// folder URL on `CB_FORMAT_LIST` arrival; the `CB_FORMAT_DATA_REQUEST`
+    /// is deferred until Finder enumerates the placeholder's children
+    /// (the moment the user actually pastes). At that point the lazy
+    /// resolver (registered with `FileProviderXPCService`) fires
+    /// synchronously, fetches the FGDW, builds the tree, and the
+    /// enumerator returns the now-populated children to Finder.
+    ///
+    /// UX trade-off vs eager:
+    ///   - Pasted destination always shows `MacRDP_<UUID>/...` (single-
+    ///     file copies are wrapped, same as multi-item copies).
+    ///   - Windows-side `Ctrl+C` activity never reaches mstsc's
+    ///     directory enumeration unless the user pastes on the Mac.
+    ///   - "Paste" appears in Finder immediately (no enumeration wait).
+    @MainActor
+    private func claimPasteboardLazyAsync(descriptorFormatID: UInt32) {
+        let inbox = AppDelegate.sharedClipboardInbox
+        let sessionID = UUID().uuidString
+        let placeholderName = "MacRDP_" + sessionID
+        Log.clip.info("Lazy-mode claim: session=\(sessionID, privacy: .public) placeholder='\(placeholderName, privacy: .public)' — FGDW fetch deferred until paste")
+
+        // LOCK_CLIPDATA so mstsc preserves THIS session's FGDW snapshot
+        // even if the Windows clipboard changes again before paste.
+        let clipDataIDValue = self.allocClipDataID()
+        self.sendClipLock?(clipDataIDValue)
+        let clipDataID: UInt32? = clipDataIDValue
+        let unlockCb = self.sendClipUnlock
+        let descID = descriptorFormatID
+
+        // Byte fetcher reads listIndex from session via the service
+        // (rather than capturing a pre-built map). Pre-resolution the
+        // map is empty; Finder won't reach this path before the
+        // enumerator triggers the resolver, but guard regardless.
+        let fetcher: (String, Int64, Int64) async -> (Data?, NSError?) = { [weak self] itemID, offset, length in
+            guard let self else {
+                return (nil, NSError(domain: "MacRDP.clip", code: 99,
+                    userInfo: [NSLocalizedDescriptionKey: "bridge gone"]))
+            }
+            guard let listIndex = FileProviderXPCService.shared.listIndex(for: itemID) else {
+                return (nil, NSError(domain: "MacRDP.clip", code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "unknown item id \(itemID) — lazy not yet resolved?"]))
+            }
+            let data = self.awaitFileContents(
+                listIndex: UInt32(listIndex),
+                offset: UInt64(offset),
+                length: UInt32(length),
+                timeoutMs: 30_000,
+                clipDataID: clipDataID)
+            if data.isEmpty {
+                return (nil, NSError(domain: "MacRDP.clip", code: 504,
+                    userInfo: [NSLocalizedDescriptionKey: "RDP fetch timed out / FAIL"]))
+            }
+            return (data, nil)
+        }
+
+        // Lazy resolver: fires synchronously on the first
+        // enumerateChildren for the placeholder folder. Must populate
+        // session.tree + session.idToListIndex + call
+        // bindItemsToSession before returning. Re-entrancy from
+        // multiple enumerator threads is guarded by lazyLock in the
+        // service.
+        let resolver: (FileProviderXPCService.SessionState) -> Void = { [weak self] session in
+            guard let self else { return }
+            Log.clip.info("Lazy resolver firing for session=\(session.id, privacy: .public) — sending FormatDataRequest now")
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let raw = self.awaitClientFormatData(formatID: descID, timeoutMs: 60_000)
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            let entries = ClipboardBridge.parseFileGroupDescriptorW(raw)
+            let t2 = DispatchTime.now().uptimeNanoseconds
+            guard !entries.isEmpty else {
+                Log.clip.error("Lazy resolver: empty FGDW — placeholder stays empty")
+                return
+            }
+
+            self.pendingLock.lock()
+            self.inFiles = entries
+            self.pendingLock.unlock()
+
+            // Build manifest items. Top-level entries become children of
+            // the placeholder folder; deeper entries link via path lookup.
+            var ids = [String](repeating: "", count: entries.count)
+            var pathToID: [String: String] = [:]
+            pathToID.reserveCapacity(entries.count)
+            for i in 0..<entries.count {
+                ids[i] = UUID().uuidString
+                pathToID[entries[i].relativePath] = ids[i]
+            }
+
+            var newIdToListIndex: [String: Int] = [:]
+            newIdToListIndex.reserveCapacity(entries.count)
+
+            var manifest: [ManifestItem] = []
+            manifest.reserveCapacity(entries.count + 1)
+            // Re-publish placeholder as tree root so it survives the
+            // replaceItems call below.
+            manifest.append(ManifestItem(
+                id: session.id,
+                filename: placeholderName,
+                size: 0,
+                parentID: nil,
+                isDirectory: true,
+                modificationMs: Int64(Date().timeIntervalSince1970 * 1000)))
+            for (idx, e) in entries.enumerated() {
+                let filename = (e.relativePath as NSString).lastPathComponent
+                let parentInTree: String
+                if let lastSlash = e.relativePath.lastIndex(of: "/") {
+                    parentInTree = pathToID[String(e.relativePath[..<lastSlash])] ?? session.id
+                } else {
+                    parentInTree = session.id
+                }
+                manifest.append(ManifestItem(
+                    id: ids[idx],
+                    filename: filename,
+                    size: Int64(e.size),
+                    parentID: parentInTree,
+                    isDirectory: e.isDirectory,
+                    modificationMs: nil))
+                newIdToListIndex[ids[idx]] = idx
+            }
+
+            session.tree.replaceItems(manifest)
+            session.idToListIndex = newIdToListIndex
+            FileProviderXPCService.shared.bindItemsToSession(manifest, sessionID: session.id)
+
+            let t3 = DispatchTime.now().uptimeNanoseconds
+            let ms: (UInt64, UInt64) -> UInt64 = { (a, b) in (b - a) / 1_000_000 }
+            Log.clip.info("Lazy resolver done: count=\(entries.count, privacy: .public) fetch=\(ms(t0, t1), privacy: .public)ms parse=\(ms(t1, t2), privacy: .public)ms build=\(ms(t2, t3), privacy: .public)ms")
+        }
+
+        // Synthetic placeholder folder. The session tree starts with
+        // just this one item; the lazy resolver replaces it with the
+        // full tree when triggered.
+        let placeholderManifest = ManifestItem(
+            id: sessionID,
+            filename: placeholderName,
+            size: 0,
+            parentID: nil,
+            isDirectory: true,
+            modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+
+        FileProviderXPCService.shared.registerLazySession(
+            domainSubdir: inbox.subdir,
+            sessionID: sessionID,
+            placeholderItem: placeholderManifest,
+            fetcher: fetcher,
+            lazyResolver: resolver,
+            onCleanup: {
+                if let cid = clipDataID {
+                    unlockCb?(cid)
+                }
+            })
+
+        // Publish the placeholder to the FileProvider extension +
+        // claim pasteboard with the placeholder's user-visible URL.
+        Task { @MainActor in
+            do {
+                try await inbox.publish([
+                    FileProviderInbox.PublishItem(
+                        id: sessionID,
+                        filename: placeholderName,
+                        parentID: nil,
+                        isDirectory: true,
+                        size: 0,
+                        modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+                ])
+            } catch {
+                Log.clip.error("Lazy publish failed: \(String(describing: error), privacy: .public)")
+                return
+            }
+            if let url = await inbox.userVisibleURL(itemID: sessionID, filename: placeholderName) {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.writeObjects([url as NSURL])
+                self.selfWroteChangeCount = pb.changeCount
+                self.lastChangeCount      = pb.changeCount
+                Log.clip.info("Lazy-mode pasteboard claimed: \(url.path, privacy: .public)")
+            } else {
+                Log.clip.error("Lazy-mode URL resolution failed for placeholder \(placeholderName, privacy: .public)")
             }
         }
     }
