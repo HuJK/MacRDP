@@ -301,6 +301,14 @@ final class FileProviderXPCService: NSObject {
         return sessions[sid]?.idToListIndex[itemID]
     }
 
+    /// True if the session has been cancelled (user clicked Cancel
+    /// in the copy-progress UI). Read under sessionsLock so it's
+    /// safe to poll from nonisolated contexts like the lazy resolver.
+    nonisolated func isSessionCancelled(sessionID: String) -> Bool {
+        sessionsLock.lock(); defer { sessionsLock.unlock() }
+        return sessions[sessionID]?.cancelled ?? false
+    }
+
     /// Mark a lazy session as failed so the next `enumerateChildren`
     /// for its placeholder replies with an error rather than an empty
     /// list. Called by the lazy resolver when the FGDW can't be

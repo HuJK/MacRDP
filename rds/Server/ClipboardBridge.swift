@@ -781,22 +781,33 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     sessionID: session.id, title: resolveTitle)
             }
 
+            let sessionIDForCancel = session.id
             let t0 = DispatchTime.now().uptimeNanoseconds
-            let raw = self.awaitClientFormatData(formatID: descID, timeoutMs: 60_000)
+            let raw = self.awaitClientFormatDataCancellable(
+                formatID: descID,
+                isCancelled: {
+                    FileProviderXPCService.shared.isSessionCancelled(
+                        sessionID: sessionIDForCancel)
+                })
             let t1 = DispatchTime.now().uptimeNanoseconds
             let entries = ClipboardBridge.parseFileGroupDescriptorW(raw)
             let t2 = DispatchTime.now().uptimeNanoseconds
             guard !entries.isEmpty else {
-                let reason: String = raw.isEmpty
-                    ? "No response from the Windows session within 60 seconds. The folder may be too large or the Windows clipboard owner changed."
-                    : "The Windows session returned an empty file list."
+                let wasCancelled = FileProviderXPCService.shared
+                    .isSessionCancelled(sessionID: session.id)
+                let reason: String
+                if wasCancelled {
+                    reason = "Paste cancelled by user before the Windows session finished enumerating."
+                } else if raw.isEmpty {
+                    // Should be unreachable now — the cancellable wait
+                    // only exits on response OR cancel. Keep the branch
+                    // for defensive logging.
+                    reason = "No response from the Windows session."
+                } else {
+                    reason = "The Windows session returned an empty file list."
+                }
                 Log.clip.error("Lazy resolver: \(reason, privacy: .public) — placeholder stays empty")
                 let failedSessionID = session.id
-                // Tell the service this session can't produce children
-                // so the enumerator returns a Finder-facing error
-                // (NSFileProviderErrorDomain.serverUnreachable). Finder
-                // then aborts the paste — empty destination folder is
-                // usually cleaned up automatically.
                 FileProviderXPCService.shared.markResolveFailed(
                     sessionID: failedSessionID, reason: reason)
                 Task { @MainActor in
@@ -979,6 +990,35 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
 
         let deadline = DispatchTime.now() + .milliseconds(timeoutMs)
         _ = fetch.semaphore.wait(timeout: deadline)
+
+        pendingLock.lock()
+        if pending === fetch { pending = nil }
+        let result = fetch.data ?? Data()
+        pendingLock.unlock()
+        return result
+    }
+
+    /// Cancellable variant for lazy-mode use. No deadline — waits as
+    /// long as mstsc needs, but polls `isCancelled` every 500 ms so
+    /// the user can abort via the copy-progress Cancel button.
+    /// Returns empty Data on cancellation; caller distinguishes that
+    /// from "client returned empty" via the cancellation check.
+    nonisolated private func awaitClientFormatDataCancellable(
+        formatID: UInt32,
+        isCancelled: @escaping () -> Bool
+    ) -> Data {
+        let fetch = PendingFetch(formatID: formatID)
+        pendingLock.lock()
+        pending = fetch
+        pendingLock.unlock()
+
+        sendFormatDataRequest?(formatID)
+
+        while true {
+            let r = fetch.semaphore.wait(timeout: .now() + .milliseconds(500))
+            if r == .success { break }   // response landed
+            if isCancelled()   { break } // user clicked Cancel
+        }
 
         pendingLock.lock()
         if pending === fetch { pending = nil }
