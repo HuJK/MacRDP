@@ -45,6 +45,16 @@ final class CopyProgressTracker {
         }
     }
 
+    /// Per-session UX phase. Eager-mode sessions go straight to
+    /// `.transferring` since `registerItems` has the full file list.
+    /// Lazy-mode sessions start in `.resolving` (marquee bar while
+    /// FGDW is fetched on paste demand), then transition to
+    /// `.transferring` once `resolved(..)` populates the real items.
+    fileprivate enum Phase {
+        case resolving
+        case transferring
+    }
+
     /// One per Windows-clipboard event the user copied.
     fileprivate final class Session {
         let id: String
@@ -58,6 +68,7 @@ final class CopyProgressTracker {
         var lastSampleBytes: Int64 = 0
         var cancelled: Bool = false
         var completedNotifiedAt: Date? = nil
+        var phase: Phase = .transferring
         /// Per-session sample buffer for the expandable line chart.
         var speedSamples: [(pct: Double, bps: Double)] = []
         init(id: String, title: String) {
@@ -108,6 +119,66 @@ final class CopyProgressTracker {
         // The window appears 500 ms after the first chunk lands for
         // this session (see `_chunkDelivered`). Pure copy events
         // shouldn't produce any visible UI.
+    }
+
+    /// Lazy-mode: announce that an FGDW fetch is in flight for this
+    /// session, so the UI can show a "Resolving file list…" marquee
+    /// bar BEFORE any byte transfers begin. The window appears
+    /// immediately (no 500 ms defer) because the resolving phase
+    /// itself can take several seconds for large folders.
+    func registerResolvingSession(sessionID: String, title: String) {
+        // If a session already exists (paranoia — same UUID used
+        // twice), upgrade it to resolving rather than creating a dup.
+        if let existing = sessions.first(where: { $0.id == sessionID }) {
+            existing.phase = .resolving
+            existing.startedAt = existing.startedAt ?? Date()
+            ensureWindow()
+            windowController?.reloadRows(
+                sessions: sessions.filter { $0.startedAt != nil },
+                tracker: self)
+            windowController?.refreshRow(sessionID: sessionID,
+                                          snapshot: snapshot(existing))
+            return
+        }
+        let s = Session(id: sessionID, title: title)
+        s.phase = .resolving
+        s.startedAt = Date()
+        sessions.append(s)
+        ensureWindow()
+        windowController?.reloadRows(
+            sessions: sessions.filter { $0.startedAt != nil },
+            tracker: self)
+        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
+    }
+
+    /// Lazy-mode: the FGDW fetch has completed; transition the
+    /// session from resolving to transferring and populate the
+    /// real item list. Same semantics as `registerItems` but
+    /// applied in-place to an existing session.
+    func resolved(sessionID: String,
+                  entries: [(id: String, name: String, size: Int64, isDirectory: Bool)]) {
+        guard let s = sessions.first(where: { $0.id == sessionID }) else {
+            // Race: resolver finished before registerResolvingSession
+            // got scheduled, or the session was cleaned up. Fall back
+            // to standard registration so byte progress still tracks.
+            registerItems(sessionID: sessionID, title: sessionID, entries: entries)
+            return
+        }
+        s.phase = .transferring
+        // Reset accumulators so the new entries are the only truth.
+        for it in s.items.values { itemToSession.removeValue(forKey: it.id) }
+        s.items.removeAll(keepingCapacity: false)
+        s.totalWeight = 0
+        s.totalRealBytes = 0
+        for e in entries {
+            let it = TrackedItem(id: e.id, name: e.name,
+                                 size: e.size, isDirectory: e.isDirectory)
+            s.items[it.id] = it
+            s.totalWeight += it.weight
+            if !it.isDirectory { s.totalRealBytes += it.size }
+            itemToSession[it.id] = sessionID
+        }
+        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
     }
 
     // MARK: - Chunk firehose
@@ -219,6 +290,7 @@ final class CopyProgressTracker {
         let currentName: String
         let cancelled: Bool
         let isComplete: Bool
+        let isResolving: Bool
         let speedSamples: [(pct: Double, bps: Double)]
     }
 
@@ -248,6 +320,7 @@ final class CopyProgressTracker {
             currentName: current?.name ?? "—",
             cancelled: session.cancelled,
             isComplete: !session.cancelled && weighted >= session.totalWeight && session.totalWeight > 0,
+            isResolving: session.phase == .resolving,
             speedSamples: session.speedSamples)
     }
 
@@ -538,6 +611,32 @@ private final class SessionRowView: NSView {
     }
 
     func apply(_ s: CopyProgressTracker.Snapshot) {
+        // Resolving phase: FGDW fetch in flight, no item list yet.
+        // Bar is indeterminate (marquee), header explains state,
+        // detail labels are placeholders.
+        if s.isResolving && !s.cancelled {
+            if !bar.isIndeterminate {
+                bar.isIndeterminate = true
+            }
+            bar.startAnimation(nil)
+            header.stringValue =
+                "Resolving file list…  ·  id=\(s.id.prefix(8))"
+            percent.stringValue = ""
+            chart.setSamples([], currentBps: 0)
+            speedLabel.stringValue = "Speed: —"
+            nameLabel.stringValue  = "Name: —"
+            etaLabel.stringValue   = "Time remaining: calculating…"
+            itemsLabel.stringValue = "Items remaining: —"
+            cancelButton.isHidden = false
+            return
+        }
+        // Transferring phase (the default). Stop any marquee animation
+        // started during a prior resolving phase, then render
+        // determinate progress like before.
+        if bar.isIndeterminate {
+            bar.stopAnimation(nil)
+            bar.isIndeterminate = false
+        }
         let pctInt = Int((s.progressFraction * 100).rounded())
         bar.doubleValue = s.progressFraction
         let stateTag: String

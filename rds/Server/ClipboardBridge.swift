@@ -771,6 +771,16 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let resolver: (FileProviderXPCService.SessionState) -> Void = { [weak self] session in
             guard let self else { return }
             Log.clip.info("Lazy resolver firing for session=\(session.id, privacy: .public) — sending FormatDataRequest now")
+
+            // Surface the "resolving" UI immediately so the user sees
+            // a marquee bar while mstsc enumerates. Hop to MainActor
+            // since CopyProgressTracker is MainActor-bound.
+            let resolveTitle = placeholderName
+            Task { @MainActor in
+                CopyProgressTracker.shared.registerResolvingSession(
+                    sessionID: session.id, title: resolveTitle)
+            }
+
             let t0 = DispatchTime.now().uptimeNanoseconds
             let raw = self.awaitClientFormatData(formatID: descID, timeoutMs: 60_000)
             let t1 = DispatchTime.now().uptimeNanoseconds
@@ -809,6 +819,12 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 parentID: nil,
                 isDirectory: true,
                 modificationMs: Int64(Date().timeIntervalSince1970 * 1000)))
+            // Mirror entries into the progress-tracker shape (id, name,
+            // size, isDirectory) — only the originals; the synthetic
+            // placeholder root is excluded so the tracker shows the
+            // real file count.
+            var trackerEntries: [(id: String, name: String, size: Int64, isDirectory: Bool)] = []
+            trackerEntries.reserveCapacity(entries.count)
             for (idx, e) in entries.enumerated() {
                 let filename = (e.relativePath as NSString).lastPathComponent
                 let parentInTree: String
@@ -825,11 +841,21 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     isDirectory: e.isDirectory,
                     modificationMs: nil))
                 newIdToListIndex[ids[idx]] = idx
+                trackerEntries.append((id: ids[idx], name: filename,
+                                       size: Int64(e.size),
+                                       isDirectory: e.isDirectory))
             }
 
             session.tree.replaceItems(manifest)
             session.idToListIndex = newIdToListIndex
             FileProviderXPCService.shared.bindItemsToSession(manifest, sessionID: session.id)
+
+            let sessionIDCaptured = session.id
+            Task { @MainActor in
+                CopyProgressTracker.shared.resolved(
+                    sessionID: sessionIDCaptured,
+                    entries: trackerEntries)
+            }
 
             let t3 = DispatchTime.now().uptimeNanoseconds
             let ms: (UInt64, UInt64) -> UInt64 = { (a, b) in (b - a) / 1_000_000 }
