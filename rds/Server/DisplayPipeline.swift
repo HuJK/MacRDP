@@ -50,6 +50,16 @@ final class DisplayPipeline {
     /// its window. While paused we still receive SCK frames but drop them
     /// in `handleSample`, and don't send anything on the GFX channel.
     private var paused = false
+    /// True from the moment `start(..)` is called until `stop()` runs.
+    /// Used by the SCStream stop-with-error handler to distinguish
+    /// "we asked it to stop" vs "macOS killed our capture" — only the
+    /// latter triggers an auto-reconnect.
+    private var expectsRunning = false
+    /// Auto-reconnect attempt counter (exponential backoff).
+    private var reconnectAttempts: Int = 0
+    /// Set while a reconnect is being scheduled or performed so a
+    /// subsequent didStopWithError doesn't stack reconnect tasks.
+    private var reconnectInProgress = false
 
     func pauseCapture()  { paused = true;  nextForceKeyframe = true }
     func resumeCapture() { paused = false; nextForceKeyframe = true }
@@ -189,6 +199,11 @@ final class DisplayPipeline {
                 }
                 let dt = CACurrentMediaTime() - t0
                 audioStats.tick(frames: frameCount, ptsSec: pts, sendMs: dt * 1000)
+            },
+            onStopped: { [weak self] error in
+                Task { @MainActor [weak self] in
+                    self?.handleStreamStopped(error: error)
+                }
             })
         self.output = proxy
 
@@ -207,13 +222,77 @@ final class DisplayPipeline {
         try await stream.startCapture()
         self.stream = stream
         nextForceKeyframe = true
+        expectsRunning = true
+        // Clear any leftover reconnect state so a subsequent
+        // stream death restarts the backoff from 1 s rather than
+        // continuing whatever climb was in flight.
+        reconnectAttempts = 0
+        reconnectInProgress = false
 
         Log.display.info("Display capture started \(pxW, privacy: .public)x\(pxH, privacy: .public) (CGDirectDisplayID=\(self.currentDisplayID, privacy: .public))")
     }
 
     func stop() {
+        expectsRunning = false
         Task { @MainActor in
             try? await teardown()
+        }
+    }
+
+    /// Called from `StreamOutputProxy.stream:didStopWithError`. macOS
+    /// kills our SCStream on display sleep/wake, lid close, GPU driver
+    /// hiccups, etc. If the user still expects us to be capturing
+    /// (i.e. `stop()` wasn't called), reconnect with exponential
+    /// backoff. Without this the RDP screen "freezes" — input still
+    /// flows, but no video frames are produced.
+    @MainActor
+    private func handleStreamStopped(error: Error) {
+        // Ignore if the stop was requested by us.
+        guard expectsRunning else {
+            reconnectAttempts = 0
+            reconnectInProgress = false
+            return
+        }
+        guard !reconnectInProgress else { return }
+        reconnectInProgress = true
+        // Tear down any stale state from the dead stream so the next
+        // `start(..)` doesn't trip over self.stream.
+        self.stream = nil
+        self.encoder?.invalidate()
+        self.encoder = nil
+        self.output = nil
+
+        // Backoff: 1s, 2s, 4s, ..., capped at 30s.
+        let delaySec = min(pow(2.0, Double(reconnectAttempts)), 30.0)
+        reconnectAttempts += 1
+        Log.display.notice("SCStream lost (\(String(describing: error), privacy: .public)); reconnect attempt \(self.reconnectAttempts, privacy: .public) in \(delaySec, privacy: .public)s")
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
+            await self?.attemptReconnect()
+        }
+    }
+
+    @MainActor
+    private func attemptReconnect() async {
+        guard expectsRunning else {
+            reconnectInProgress = false
+            return
+        }
+        let id = currentDisplayID
+        let w = currentWidth
+        let h = currentHeight
+        do {
+            try await start(displayID: id, width: w, height: h)
+            reconnectAttempts = 0
+            reconnectInProgress = false
+            Log.display.info("SCStream reconnected on display \(id, privacy: .public) \(w, privacy: .public)x\(h, privacy: .public)")
+        } catch {
+            Log.display.error("SCStream reconnect failed: \(String(describing: error), privacy: .public)")
+            reconnectInProgress = false
+            // Treat the failure itself as another stop event so we
+            // keep retrying with backoff.
+            handleStreamStopped(error: error)
         }
     }
 
@@ -438,11 +517,14 @@ final class DisplayPipeline {
 private final class StreamOutputProxy: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let onVideoSample: @Sendable (CMSampleBuffer) -> Void
     private let onAudioSample: @Sendable (CMSampleBuffer) -> Void
+    private let onStopped: @Sendable (Error) -> Void
 
     init(onVideoSample: @escaping @Sendable (CMSampleBuffer) -> Void,
-         onAudioSample: @escaping @Sendable (CMSampleBuffer) -> Void) {
+         onAudioSample: @escaping @Sendable (CMSampleBuffer) -> Void,
+         onStopped: @escaping @Sendable (Error) -> Void) {
         self.onVideoSample = onVideoSample
         self.onAudioSample = onAudioSample
+        self.onStopped = onStopped
     }
 
     func stream(_ stream: SCStream,
@@ -457,5 +539,6 @@ private final class StreamOutputProxy: NSObject, SCStreamOutput, SCStreamDelegat
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.display.error("SCStream stopped: \(String(describing: error), privacy: .public)")
+        onStopped(error)
     }
 }
