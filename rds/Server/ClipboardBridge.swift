@@ -787,7 +787,16 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             let entries = ClipboardBridge.parseFileGroupDescriptorW(raw)
             let t2 = DispatchTime.now().uptimeNanoseconds
             guard !entries.isEmpty else {
-                Log.clip.error("Lazy resolver: empty FGDW — placeholder stays empty")
+                let reason: String = raw.isEmpty
+                    ? "No response from the Windows session within 60 seconds. The folder may be too large or the Windows clipboard owner changed."
+                    : "The Windows session returned an empty file list."
+                Log.clip.error("Lazy resolver: \(reason, privacy: .public) — placeholder stays empty")
+                let failedSessionID = session.id
+                Task { @MainActor in
+                    CopyProgressTracker.shared.failed(
+                        sessionID: failedSessionID,
+                        reason: reason)
+                }
                 return
             }
 

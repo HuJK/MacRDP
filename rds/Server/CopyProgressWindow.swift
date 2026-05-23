@@ -18,6 +18,7 @@
 
 import AppKit
 import os
+import UserNotifications
 
 @MainActor
 final class CopyProgressTracker {
@@ -69,6 +70,10 @@ final class CopyProgressTracker {
         var cancelled: Bool = false
         var completedNotifiedAt: Date? = nil
         var phase: Phase = .transferring
+        /// Set by `failed(..)` when the resolver couldn't produce an
+        /// item list (timeout, FAIL, or empty FGDW). The row shows
+        /// an error treatment and the bar stops animating.
+        var failureReason: String? = nil
         /// Per-session sample buffer for the expandable line chart.
         var speedSamples: [(pct: Double, bps: Double)] = []
         init(id: String, title: String) {
@@ -149,6 +154,56 @@ final class CopyProgressTracker {
             sessions: sessions.filter { $0.startedAt != nil },
             tracker: self)
         windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
+    }
+
+    /// Lazy-mode: the resolver couldn't produce a useful file list
+    /// (timeout, CB_RESPONSE_FAIL, or an empty FGDW). Marks the row
+    /// as failed, shows a system notification, and clears the
+    /// pasteboard claim so the user isn't left holding a dead URL.
+    func failed(sessionID: String, reason: String) {
+        guard let s = sessions.first(where: { $0.id == sessionID }) else {
+            // No session was registered yet — still show a system
+            // notification so the user sees *something*.
+            Self.postSystemNotification(
+                title: "Paste from Windows failed",
+                body: reason)
+            return
+        }
+        s.failureReason = reason
+        // Ensure the window is visible — most failure cases happen
+        // BEFORE the user sees the resolving row, so we have to nudge
+        // it onto screen explicitly.
+        ensureWindow()
+        windowController?.reloadRows(
+            sessions: sessions.filter { $0.startedAt != nil },
+            tracker: self)
+        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
+        Self.postSystemNotification(
+            title: "Paste from Windows failed",
+            body: "\(s.title): \(reason)")
+        rescheduleHideIfAllDone()
+    }
+
+    /// Best-effort system notification. Uses UNUserNotificationCenter;
+    /// silently no-ops if authorization is denied / not configured.
+    nonisolated private static func postSystemNotification(title: String,
+                                                            body: String) {
+        // UserNotifications requires authorization. Request the first
+        // time; subsequent calls hit the cached grant. If the user has
+        // denied it, the request returns success=false and the post
+        // call just silently fails — which is fine.
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            let req = UNNotificationRequest(
+                identifier: UUID().uuidString,
+                content: content,
+                trigger: nil)
+            center.add(req) { _ in }
+        }
     }
 
     /// Lazy-mode: the FGDW fetch has completed; transition the
@@ -291,6 +346,7 @@ final class CopyProgressTracker {
         let cancelled: Bool
         let isComplete: Bool
         let isResolving: Bool
+        let failureReason: String?
         let speedSamples: [(pct: Double, bps: Double)]
     }
 
@@ -320,7 +376,8 @@ final class CopyProgressTracker {
             currentName: current?.name ?? "—",
             cancelled: session.cancelled,
             isComplete: !session.cancelled && weighted >= session.totalWeight && session.totalWeight > 0,
-            isResolving: session.phase == .resolving,
+            isResolving: session.phase == .resolving && session.failureReason == nil,
+            failureReason: session.failureReason,
             speedSamples: session.speedSamples)
     }
 
@@ -333,17 +390,23 @@ final class CopyProgressTracker {
 
     private func rescheduleHideIfAllDone() {
         // Hide only when EVERY active (= ever-transferred) session is
-        // done or cancelled. Idle copy events that never received a
-        // chunk don't count.
+        // done, cancelled, or failed. Idle copy events that never
+        // received a chunk don't count.
         let activeSessions = sessions.filter { $0.startedAt != nil }
         guard !activeSessions.isEmpty else { return }
         let allDone = activeSessions.allSatisfy { session in
             let w = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-            return session.cancelled || (w >= session.totalWeight && session.totalWeight > 0)
+            return session.cancelled
+                || session.failureReason != nil
+                || (w >= session.totalWeight && session.totalWeight > 0)
         }
         hideTimer?.invalidate()
         guard allDone else { return }
-        hideTimer = Timer.scheduledTimer(withTimeInterval: Self.idleHideAfter, repeats: false) { [weak self] _ in
+        // Failed rows are sticky for a bit so the user can read the
+        // reason — extend the idle period when any session failed.
+        let anyFailed = activeSessions.contains { $0.failureReason != nil }
+        let delay = anyFailed ? 8.0 : Self.idleHideAfter
+        hideTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             Task { @MainActor in self?.closeWindowIfStillIdle() }
         }
     }
@@ -352,7 +415,9 @@ final class CopyProgressTracker {
         let activeSessions = sessions.filter { $0.startedAt != nil }
         let allDone = activeSessions.allSatisfy { session in
             let w = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-            return session.cancelled || (w >= session.totalWeight && session.totalWeight > 0)
+            return session.cancelled
+                || session.failureReason != nil
+                || (w >= session.totalWeight && session.totalWeight > 0)
         }
         guard allDone else { return }
         // Keep registered-but-never-started sessions around — they
@@ -611,6 +676,26 @@ private final class SessionRowView: NSView {
     }
 
     func apply(_ s: CopyProgressTracker.Snapshot) {
+        // Failed: the lazy resolver couldn't get a file list. Stop
+        // any marquee animation, show an error treatment, and let
+        // the user know via system notification (fired separately).
+        if let reason = s.failureReason {
+            if bar.isIndeterminate {
+                bar.stopAnimation(nil)
+                bar.isIndeterminate = false
+            }
+            bar.doubleValue = 0
+            header.stringValue =
+                "Failed to resolve file list  ·  id=\(s.id.prefix(8))"
+            percent.stringValue = ""
+            chart.setSamples([], currentBps: 0)
+            speedLabel.stringValue = "Reason: \(reason)"
+            nameLabel.stringValue  = "Name: —"
+            etaLabel.stringValue   = "Time remaining: —"
+            itemsLabel.stringValue = "Items remaining: —"
+            cancelButton.isHidden = true
+            return
+        }
         // Resolving phase: FGDW fetch in flight, no item list yet.
         // Bar is indeterminate (marquee), header explains state,
         // detail labels are placeholders.
