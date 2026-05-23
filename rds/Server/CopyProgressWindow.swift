@@ -184,6 +184,18 @@ final class CopyProgressTracker {
         rescheduleHideIfAllDone()
     }
 
+    /// Fire just a system notification, without touching the progress
+    /// window. Used when a copy failure happens BEFORE any session is
+    /// registered (eager mode: empty FGDW arrives before we'd publish
+    /// items or a row). Keeps the "Paste from Windows failed"
+    /// notification a single source of truth for end-user-visible
+    /// alerts about clipboard failures.
+    nonisolated static func notifyPasteFailed(reason: String) {
+        postSystemNotification(
+            title: "Paste from Windows failed",
+            body: reason)
+    }
+
     /// Best-effort system notification. Uses UNUserNotificationCenter;
     /// silently no-ops if authorization is denied / not configured.
     nonisolated private static func postSystemNotification(title: String,

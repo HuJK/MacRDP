@@ -524,7 +524,12 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             let entries = ClipboardBridge.parseFileGroupDescriptorW(raw)
             let t2 = DispatchTime.now().uptimeNanoseconds
             guard !entries.isEmpty else {
+                let reason = "The Windows session returned an empty file list."
                 Log.clip.error("Client file list empty — nothing to paste")
+                // Eager mode hasn't registered a session yet; fire just
+                // the system notification so the user knows the copy
+                // they triggered on Windows didn't reach the Mac.
+                CopyProgressTracker.notifyPasteFailed(reason: reason)
                 return
             }
             self.pendingLock.lock()
@@ -795,25 +800,32 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             guard !entries.isEmpty else {
                 let wasCancelled = FileProviderXPCService.shared
                     .isSessionCancelled(sessionID: session.id)
-                let reason: String
-                if wasCancelled {
-                    reason = "Paste cancelled by user before the Windows session finished enumerating."
-                } else if raw.isEmpty {
-                    // Should be unreachable now — the cancellable wait
-                    // only exits on response OR cancel. Keep the branch
-                    // for defensive logging.
-                    reason = "No response from the Windows session."
-                } else {
-                    reason = "The Windows session returned an empty file list."
-                }
-                Log.clip.error("Lazy resolver: \(reason, privacy: .public) — placeholder stays empty")
                 let failedSessionID = session.id
-                FileProviderXPCService.shared.markResolveFailed(
-                    sessionID: failedSessionID, reason: reason)
-                Task { @MainActor in
-                    CopyProgressTracker.shared.failed(
-                        sessionID: failedSessionID,
-                        reason: reason)
+                if wasCancelled {
+                    // User-initiated abort. The progress row is
+                    // already in the cancelled state via tracker.cancel
+                    // from the row's Cancel button — don't fire a
+                    // notification (the user knows; they pressed it).
+                    // Just mark the session resolve-failed so the
+                    // enumerator returns an error instead of empty.
+                    let reason = "Paste cancelled by user."
+                    Log.clip.notice("Lazy resolver: \(reason, privacy: .public)")
+                    FileProviderXPCService.shared.markResolveFailed(
+                        sessionID: failedSessionID, reason: reason)
+                } else {
+                    // Real empty FGDW (e.g. Windows clipboard owner
+                    // changed between FormatList and our request, or
+                    // the source app returned an explicit empty list).
+                    // Surface a notification AND the failure row.
+                    let reason = "The Windows session returned an empty file list."
+                    Log.clip.error("Lazy resolver: \(reason, privacy: .public) — placeholder stays empty")
+                    FileProviderXPCService.shared.markResolveFailed(
+                        sessionID: failedSessionID, reason: reason)
+                    Task { @MainActor in
+                        CopyProgressTracker.shared.failed(
+                            sessionID: failedSessionID,
+                            reason: reason)
+                    }
                 }
                 return
             }
