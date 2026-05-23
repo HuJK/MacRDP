@@ -61,6 +61,44 @@ enum HostChildEnumerator {
     }
 }
 
+/// Blocking helper around the new `resolveItem` XPC method. Used by
+/// FileProviderExtension.item(for:) to ensure that the lazy
+/// resolver has run before we tell Finder the placeholder folder
+/// exists. Returns true iff the item exists post-resolve.
+enum HostLazyResolver {
+    static func resolveSync(source: ClipboardServiceSource,
+                            domainSubdir: String,
+                            itemID: String,
+                            timeout: TimeInterval = 600) -> Bool {
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        var errored = false
+        let proxy = source.hostProxy { err in
+            log.error("resolveItem proxy error: \(String(describing: err), privacy: .public)")
+            errored = true
+            sem.signal()
+        }
+        guard let proxy else {
+            log.error("resolveItem: no host connection")
+            return false
+        }
+        proxy.resolveItem(domainSubdir: domainSubdir,
+                          itemID: itemID) { exists, err in
+            if let err {
+                log.error("resolveItem reply error: \(String(describing: err), privacy: .public)")
+            }
+            ok = exists
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            log.notice("resolveItem timed out (\(timeout, privacy: .public)s) itemID=\(itemID, privacy: .public)")
+            return false
+        }
+        if errored { return false }
+        return ok
+    }
+}
+
 enum HostByteFetcher {
 
     /// Tunables. mstsc / RDP transfer is the bottleneck; 1 MiB chunks

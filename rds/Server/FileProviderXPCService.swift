@@ -371,6 +371,54 @@ final class FileProviderXPCService: NSObject {
         scheduleCleanupCheck(sessionID: sessionID)
     }
 
+    /// XPC entry point for the extension's `item(for:)`. If the
+    /// item belongs to a lazy session whose resolver hasn't run
+    /// yet, fire the resolver synchronously here. After this
+    /// returns:
+    ///   - reply(true)  : the resolver populated the tree; the
+    ///                    extension may now return the item from
+    ///                    the local manifest cache.
+    ///   - reply(false) : the resolver failed (cancel / empty
+    ///                    FGDW). Extension should return
+    ///                    NSFileProviderError.noSuchItem so Finder
+    ///                    doesn't create a destination wrapper
+    ///                    folder for a source that won't materialise.
+    nonisolated fileprivate func handleResolveItem(
+        domainSubdir: String,
+        itemID: String,
+        reply: @escaping (Bool, NSError?) -> Void)
+    {
+        sessionsLock.lock()
+        let session = itemToSession[itemID].flatMap { sessions[$0] }
+        sessionsLock.unlock()
+        guard let session else {
+            // Item we don't know about — extension's local cache
+            // will decide whether to return it or noSuchItem.
+            reply(true, nil)
+            return
+        }
+        // Run the lazy resolver if it hasn't fired yet. The lock
+        // ensures only one of (resolveItem, enumerateChildren)
+        // actually invokes the closure.
+        session.lazyLock.lock()
+        let resolver = session.lazyResolver
+        if !session.lazyResolved, let resolver {
+            session.lazyResolved = true
+            session.lazyResolver = nil
+            session.lazyLock.unlock()
+            resolver(session)   // blocking
+        } else {
+            session.lazyLock.unlock()
+        }
+        // After the resolver, report success / failure to the
+        // extension so it can choose between returning the item
+        // or noSuchItem.
+        sessionsLock.lock()
+        let failed = session.resolveFailed
+        sessionsLock.unlock()
+        reply(!failed, nil)
+    }
+
     nonisolated fileprivate func handleEnumerateChildren(
         domainSubdir: String,
         containerID: String,
@@ -514,6 +562,15 @@ final class HostFileProviderExporter: NSObject, ExtensionToHostProtocol {
         FileProviderXPCService.shared.handleEnumerateChildren(
             domainSubdir: domainSubdir,
             containerID: containerID,
+            reply: reply)
+    }
+
+    nonisolated func resolveItem(domainSubdir: String,
+                                  itemID: String,
+                                  reply: @escaping (Bool, NSError?) -> Void) {
+        FileProviderXPCService.shared.handleResolveItem(
+            domainSubdir: domainSubdir,
+            itemID: itemID,
             reply: reply)
     }
 }

@@ -77,4 +77,16 @@ public protocol ExtensionToHostProtocol {
     func enumerateChildren(domainSubdir: String,
                            containerID: String,
                            reply: @escaping (Data?, NSError?) -> Void)
+
+    /// Trigger the lazy resolver for the item AND block until it has
+    /// finished. After this returns the host has either populated the
+    /// session's tree (success) or marked it failed (no tree).
+    /// `reply` is `true` if the item now exists, `false` if the
+    /// resolver failed — extension uses the boolean to decide
+    /// between returning real metadata or NSFileProviderError.noSuchItem.
+    /// Items that don't belong to any lazy session reply true
+    /// immediately (no resolver needed).
+    func resolveItem(domainSubdir: String,
+                     itemID: String,
+                     reply: @escaping (Bool, NSError?) -> Void)
 }

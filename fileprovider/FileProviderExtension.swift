@@ -61,6 +61,30 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             completionHandler(RootFileProviderItem(displayName: "Trash"), nil)
             return Progress()
         }
+        // Ask the host whether the item has a lazy resolver that
+        // needs to run. The call blocks until the resolver has
+        // finished (or returns immediately for non-lazy items).
+        // After it returns, the manifest cache is authoritative:
+        //   - exists=true  → item is in cache (or about to be);
+        //                    proceed with normal lookup.
+        //   - exists=false → resolver failed; return noSuchItem
+        //                    so Finder aborts the paste and
+        //                    (best-effort) cleans up the dest dir.
+        // The blocking is required to make the "Finder created an
+        // empty MacRDP_<UUID> wrapper at the paste destination"
+        // outcome avoidable: by the time we say "this item is a
+        // folder", we already know whether its contents will
+        // materialise.
+        let exists = HostLazyResolver.resolveSync(
+            source: serviceSource,
+            domainSubdir: domainSubdir,
+            itemID: identifier.rawValue)
+        guard exists else {
+            log.notice("item(for:) lazy-resolver said the item is gone id=\(identifier.rawValue, privacy: .public)")
+            completionHandler(nil, NSError(domain: NSFileProviderErrorDomain,
+                                            code: NSFileProviderError.noSuchItem.rawValue))
+            return Progress()
+        }
         guard let manifest = ManifestCache.shared.manifest(domainSubdir: domainSubdir),
               let entry = manifest.items.first(where: { $0.id == identifier.rawValue }) else {
             log.notice("item(for:) noSuchItem id=\(identifier.rawValue, privacy: .public)")
