@@ -827,6 +827,14 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                             reason: reason)
                     }
                 }
+                // Drop the placeholder from the FileProvider manifest
+                // so subsequent `item(for: placeholderID)` calls
+                // return noSuchItem. Together with the enumerator
+                // error this nudges Finder to clean up the
+                // partially-created destination folder rather than
+                // leaving an empty wrapper.
+                let inbox = AppDelegate.sharedClipboardInbox
+                Task { await inbox.unpublishItem(id: failedSessionID) }
                 return
             }
 

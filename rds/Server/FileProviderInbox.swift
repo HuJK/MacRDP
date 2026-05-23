@@ -189,6 +189,59 @@ final class FileProviderInbox {
         await signal(.workingSet)
     }
 
+    /// Remove the given item ID (and any descendants whose parent
+    /// chain points at it) from the manifest, then push the updated
+    /// manifest to the extension and re-signal the root container so
+    /// Finder drops the now-deleted item from view.
+    ///
+    /// Used by the lazy-mode resolver when FGDW resolution fails:
+    /// the placeholder folder we published on `CB_FORMAT_LIST` is no
+    /// longer a useful copy source, so we evict it to discourage
+    /// Finder from leaving a stale empty wrapper at the paste
+    /// destination.
+    func unpublishItem(id: String) async {
+        guard let containerURL = AppGroupShared.containerURL() else { return }
+        let domainDir = containerURL.appendingPathComponent(subdir, isDirectory: true)
+        let manifestURL = domainDir.appendingPathComponent("manifest.json")
+        guard let data = try? Data(contentsOf: manifestURL),
+              let current = try? JSONDecoder().decode(ClipboardManifest.self, from: data) else {
+            return
+        }
+        // Drop the target item and anything whose parent chain leads
+        // to it. Build the descendant closure iteratively (works for
+        // the typical small placeholder-only manifest; would be
+        // O(N²) if ever called on a huge tree but that's not the
+        // current use case).
+        var toRemove: Set<String> = [id]
+        var grew = true
+        while grew {
+            grew = false
+            for it in current.items where !toRemove.contains(it.id) {
+                if let p = it.parentID, toRemove.contains(p) {
+                    toRemove.insert(it.id); grew = true
+                }
+            }
+        }
+        let keptItems = current.items.filter { !toRemove.contains($0.id) }
+        // Nothing to do if the item wasn't in the manifest.
+        guard keptItems.count != current.items.count else { return }
+        let updated = ClipboardManifest(
+            version: current.version,
+            sessionID: UUID().uuidString,
+            items: keptItems)
+        guard let newData = try? JSONEncoder().encode(updated) else { return }
+        do {
+            try newData.write(to: manifestURL, options: .atomic)
+        } catch {
+            Log.clip.error("unpublishItem: manifest write failed: \(String(describing: error), privacy: .public)")
+            return
+        }
+        Log.clip.info("Inbox unpublished item \(id, privacy: .public) (+\(toRemove.count - 1, privacy: .public) descendants); \(keptItems.count, privacy: .public) item(s) remain")
+        await pushManifestToExtension(newData)
+        await signal(.rootContainer)
+        await signal(.workingSet)
+    }
+
     /// Open (or reuse) the NSFileProviderService XPC connection to our
     /// extension and call `pushManifest` on it. Best-effort: if the
     /// extension isn't up yet (or the framework can't reach it), we
