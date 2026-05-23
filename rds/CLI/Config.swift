@@ -192,6 +192,31 @@ struct Config: Codable, Sendable {
         var maxFileSizeMiB: Int
         /// NSPasteboard polling interval (Cocoa has no change notifications).
         var pollIntervalMs: Int
+        /// Controls when the FileGroupDescriptorW is fetched from the
+        /// client after a Windows-side file copy event.
+        ///
+        ///   - "eager" — fetch immediately on `CB_FORMAT_LIST` and claim
+        ///     the pasteboard with the real top-level item URLs. Best
+        ///     UX (Finder shows "Paste 5 Items" with real names), but
+        ///     mstsc must enumerate the whole selection before
+        ///     responding, which blocks the cliprdr channel for any
+        ///     subsequent Windows-side clipboard activity (including
+        ///     copies the user never intended to send to the Mac).
+        ///     Painful for big selections (≥10k entries).
+        ///   - "lazy" — on `CB_FORMAT_LIST`, claim the pasteboard with
+        ///     a single placeholder folder (`MacRDP_<UUID>`). Defer the
+        ///     `CB_FORMAT_DATA_REQUEST` until Finder enumerates the
+        ///     placeholder (i.e. the user actually pastes). Channel
+        ///     stays responsive; cost is that every paste lands as a
+        ///     wrapper folder named after the session UUID.
+        ///
+        /// Default "eager" matches existing behaviour. Set to "lazy"
+        /// if you commonly copy huge folders or want Windows-side
+        /// Ctrl+C activity to never touch the Mac.
+        ///
+        /// Optional in JSON so older config files without the field
+        /// keep working — nil is treated as "eager".
+        var fileFetchMode: String?
     }
 
     /// Device redirection (MS-RDPEFS / RDPDR). Phase 1 of this feature
@@ -233,7 +258,8 @@ struct Config: Codable, Sendable {
                             muteLocalOutput: "always"),
             audioIn: .init(enabled: true, outputDeviceUID: nil),
             clipboard: .init(text: true, image: true, files: true,
-                             maxFileSizeMiB: 4096, pollIntervalMs: 200),
+                             maxFileSizeMiB: 4096, pollIntervalMs: 200,
+                             fileFetchMode: nil),
             rdpdr: .init(enabled: true)
         )
     }
