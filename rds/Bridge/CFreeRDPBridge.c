@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <os/log.h>
+#include <os/lock.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -159,6 +160,8 @@ struct macrdp_session {
      * requests (client→server), so we can't rely on it when matching the
      * response to our pending outbound request. */
     _Atomic uint32_t       cliprdr_outbound_request_id;
+    /* Serializes pointer-update sends (fired from the cursor poll thread). */
+    os_unfair_lock         pointer_lock;
 #endif
 };
 
@@ -1201,6 +1204,7 @@ int32_t macrdp_session_create(int fd,
     atomic_init(&s->cliprdr_outbound_request_id, 0);
     atomic_init(&s->outstanding_frames, 0);
     atomic_init(&s->last_ack_ms, now_ms());
+    s->pointer_lock = OS_UNFAIR_LOCK_INIT;
     /* Fall back to a safe value if the caller passes 0/negative. */
     s->max_outstanding_frames =
         (cfg->max_outstanding_frames > 0) ? cfg->max_outstanding_frames : 2;
@@ -1672,6 +1676,167 @@ int32_t macrdp_session_send_progressive_frame(macrdp_session_t s,
 #endif
 }
 
+/* Hybrid per-tile path: AVC420 over the video rects + Progressive over the
+ * static rects, composed onto one surface under a single GFX frame. See the
+ * header for the contract. */
+int32_t macrdp_session_send_hybrid_frame(
+    macrdp_session_t      s,
+    int32_t               surface_id,
+    const uint8_t        *annexb,
+    size_t                annexb_bytes,
+    int32_t               is_idr,
+    int64_t               pts_us,
+    const macrdp_rect16  *video_rects,
+    int32_t               num_video_rects,
+    const uint8_t        *bgra,
+    int32_t               width,
+    int32_t               height,
+    int32_t               stride,
+    const macrdp_rect16  *static_rects,
+    int32_t               num_static_rects)
+{
+#if MACRDP_HAVE_FREERDP
+    (void)is_idr;
+    if (!s || !s->gfx || !s->gfx_caps_confirmed) return MACRDP_E_NOT_IMPLEMENTED;
+
+    const BOOL haveAvc  = (annexb != NULL && annexb_bytes > 0 && num_video_rects > 0);
+    const BOOL wantProg = (bgra != NULL && width > 0 && height > 0 && num_static_rects > 0);
+    if (!haveAvc && !wantProg) return MACRDP_OK;   /* nothing to do */
+
+    if (atomic_load(&s->outstanding_frames) >= s->max_outstanding_frames) {
+        return MACRDP_E_FRAME_DROPPED;
+    }
+
+    /* Lazy surface (+ progressive context) creation on first frame. */
+    if (!s->surface_created) {
+        int32_t rc1 = macrdp_session_reset_graphics(s, s->desktop_width, s->desktop_height, 1);
+        if (rc1 != MACRDP_OK) return rc1;
+        int32_t rc2 = macrdp_session_create_surface(s, surface_id,
+                                                    s->desktop_width, s->desktop_height);
+        if (rc2 != MACRDP_OK) return rc2;
+        int32_t rc3 = macrdp_session_map_surface_to_output(s, surface_id, 0, 0);
+        if (rc3 != MACRDP_OK) return rc3;
+    }
+
+    /* ---- Build the AVC420 command (full-frame stream, region-limited blit). */
+    RECTANGLE_16 *avcRects = NULL;
+    RDPGFX_H264_QUANT_QUALITY *quants = NULL;
+    RDPGFX_AVC420_BITMAP_STREAM avc420 = { 0 };
+    RDPGFX_SURFACE_COMMAND avcCmd = { 0 };
+    if (haveAvc) {
+        avcRects = (RECTANGLE_16*)calloc((size_t)num_video_rects, sizeof(RECTANGLE_16));
+        quants   = (RDPGFX_H264_QUANT_QUALITY*)calloc((size_t)num_video_rects,
+                                                      sizeof(RDPGFX_H264_QUANT_QUALITY));
+        if (!avcRects || !quants) { free(avcRects); free(quants); return MACRDP_E_INTERNAL; }
+        BYTE qp  = (BYTE)((s->cfg.avc420_qp > 0) ? s->cfg.avc420_qp : 22);
+        BYTE qv  = (BYTE)((s->cfg.avc420_quality_val > 0) ? s->cfg.avc420_quality_val : 100);
+        for (int i = 0; i < num_video_rects; i++) {
+            avcRects[i].left   = video_rects[i].left;
+            avcRects[i].top    = video_rects[i].top;
+            avcRects[i].right  = video_rects[i].right;
+            avcRects[i].bottom = video_rects[i].bottom;
+            quants[i].qp = qp; quants[i].r = 0; quants[i].p = 0; quants[i].qualityVal = qv;
+        }
+        avc420.meta.numRegionRects   = (UINT32)num_video_rects;
+        avc420.meta.regionRects      = avcRects;
+        avc420.meta.quantQualityVals = quants;
+        avc420.length = (UINT32)annexb_bytes;
+        avc420.data   = (BYTE*)annexb;
+
+        avcCmd.surfaceId = (UINT32)surface_id;
+        avcCmd.codecId   = RDPGFX_CODECID_AVC420;
+        avcCmd.format    = PIXEL_FORMAT_BGRX32;
+        avcCmd.left = 0; avcCmd.top = 0;
+        avcCmd.right  = (UINT32)s->desktop_width;
+        avcCmd.bottom = (UINT32)s->desktop_height;
+        avcCmd.width  = (UINT32)s->desktop_width;
+        avcCmd.height = (UINT32)s->desktop_height;
+        avcCmd.length = (UINT32)annexb_bytes;
+        avcCmd.data   = (BYTE*)annexb;
+        avcCmd.extra  = &avc420;
+    }
+
+    /* ---- Build the Progressive command over the static region. */
+    BYTE  *progData = NULL;
+    UINT32 progLen  = 0;
+    RDPGFX_SURFACE_COMMAND progCmd = { 0 };
+    if (wantProg) {
+        if (!s->progressive) {
+            s->progressive = progressive_context_new(TRUE /* compressor */);
+            if (s->progressive && !progressive_context_reset(s->progressive)) {
+                progressive_context_free(s->progressive);
+                s->progressive = NULL;
+            }
+        }
+        if (s->progressive) {
+            REGION16 region;
+            region16_init(&region);
+            BOOL regionOK = TRUE;
+            for (int i = 0; i < num_static_rects; i++) {
+                RECTANGLE_16 r = { static_rects[i].left, static_rects[i].top,
+                                   static_rects[i].right, static_rects[i].bottom };
+                if (!region16_union_rect(&region, &region, &r)) { regionOK = FALSE; break; }
+            }
+            if (regionOK) {
+                int rc = progressive_compress(
+                    s->progressive, bgra, (UINT32)(stride * height),
+                    PIXEL_FORMAT_BGRX32, (UINT32)width, (UINT32)height,
+                    (UINT32)stride, &region, &progData, &progLen);
+                if (rc < 0) { progData = NULL; progLen = 0; }
+            }
+            region16_uninit(&region);
+        }
+        if (progData && progLen > 0) {
+            progCmd.surfaceId = (UINT32)surface_id;
+            progCmd.codecId   = RDPGFX_CODECID_CAPROGRESSIVE;
+            progCmd.format    = PIXEL_FORMAT_BGRX32;
+            progCmd.left = 0; progCmd.top = 0;
+            progCmd.right  = (UINT32)width;
+            progCmd.bottom = (UINT32)height;
+            progCmd.width  = (UINT32)width;
+            progCmd.height = (UINT32)height;
+            progCmd.length = progLen;
+            progCmd.data   = progData;
+            progCmd.extra  = NULL;
+        }
+    }
+
+    const BOOL emitAvc  = haveAvc;
+    const BOOL emitProg = (progData && progLen > 0);
+    if (!emitAvc && !emitProg) {
+        free(avcRects); free(quants);
+        return MACRDP_OK;   /* progressive found no change and no video tiles */
+    }
+
+    /* ---- One frame, up to two surface commands. */
+    UINT32 frameId = s->next_frame_id++;
+    RDPGFX_START_FRAME_PDU start = { 0 };
+    start.frameId   = frameId;
+    start.timestamp = (UINT32)(pts_us / 1000);
+    RDPGFX_END_FRAME_PDU end = { 0 };
+    end.frameId = frameId;
+
+    UINT rc = s->gfx->StartFrame(s->gfx, &start);
+    if (rc == CHANNEL_RC_OK && emitAvc)  rc = s->gfx->SurfaceCommand(s->gfx, &avcCmd);
+    if (rc == CHANNEL_RC_OK && emitProg) rc = s->gfx->SurfaceCommand(s->gfx, &progCmd);
+    if (rc == CHANNEL_RC_OK)             rc = s->gfx->EndFrame(s->gfx, &end);
+
+    free(avcRects);
+    free(quants);
+
+    if (rc == CHANNEL_RC_OK) {
+        atomic_fetch_add(&s->outstanding_frames, 1);
+        return MACRDP_OK;
+    }
+    return MACRDP_E_INTERNAL;
+#else
+    (void)s; (void)surface_id; (void)annexb; (void)annexb_bytes; (void)is_idr;
+    (void)pts_us; (void)video_rects; (void)num_video_rects; (void)bgra;
+    (void)width; (void)height; (void)stride; (void)static_rects; (void)num_static_rects;
+    return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
 void macrdp_session_set_desktop_size(macrdp_session_t s,
                                      int32_t width, int32_t height) {
 #if MACRDP_HAVE_FREERDP
@@ -1698,6 +1863,145 @@ int32_t macrdp_session_outstanding_frames(macrdp_session_t s) {
 #else
     (void)s;
     return 0;
+#endif
+}
+
+/* -------- hardware cursor (RDP pointer channel) ------------------- */
+
+#if MACRDP_HAVE_FREERDP
+static rdpPointerUpdate *bridge_pointer(macrdp_session_t s) {
+    if (!s || !s->peer || !s->peer->context || !s->peer->context->update) return NULL;
+    return s->peer->context->update->pointer;
+}
+
+/* Fill RDP bottom-up xor (32bpp BGRA) + 1-bpp and masks from a top-down BGRA
+ * source. AND bit = 1 (transparent) where alpha == 0. `and_out` must be
+ * pre-zeroed. */
+static void bridge_fill_pointer_masks(int w, int h, const uint8_t *bgra_topdown,
+                                      uint8_t *xor_out, int xor_stride,
+                                      uint8_t *and_out, int and_stride) {
+    for (int dstRow = 0; dstRow < h; dstRow++) {
+        const uint8_t *src = bgra_topdown + (size_t)(h - 1 - dstRow) * (size_t)w * 4;
+        uint8_t *xrow = xor_out + (size_t)dstRow * xor_stride;
+        uint8_t *arow = and_out + (size_t)dstRow * and_stride;
+        for (int x = 0; x < w; x++) {
+            uint8_t b = src[x * 4 + 0], g = src[x * 4 + 1];
+            uint8_t r = src[x * 4 + 2], a = src[x * 4 + 3];
+            xrow[x * 4 + 0] = b; xrow[x * 4 + 1] = g;
+            xrow[x * 4 + 2] = r; xrow[x * 4 + 3] = a;
+            if (a == 0) arow[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
+        }
+    }
+}
+#endif
+
+int32_t macrdp_session_send_pointer_position(macrdp_session_t s, int32_t x, int32_t y) {
+#if MACRDP_HAVE_FREERDP
+    rdpPointerUpdate *p = bridge_pointer(s);
+    if (!p || !p->PointerPosition) return MACRDP_E_NOT_IMPLEMENTED;
+    POINTER_POSITION_UPDATE pos = { 0 };
+    pos.xPos = (UINT32)(x < 0 ? 0 : x);
+    pos.yPos = (UINT32)(y < 0 ? 0 : y);
+    os_unfair_lock_lock(&s->pointer_lock);
+    BOOL ok = p->PointerPosition(s->peer->context, &pos);
+    os_unfair_lock_unlock(&s->pointer_lock);
+    return ok ? MACRDP_OK : MACRDP_E_INTERNAL;
+#else
+    (void)s; (void)x; (void)y;
+    return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_send_pointer_hidden(macrdp_session_t s) {
+#if MACRDP_HAVE_FREERDP
+    rdpPointerUpdate *p = bridge_pointer(s);
+    if (!p || !p->PointerSystem) return MACRDP_E_NOT_IMPLEMENTED;
+    POINTER_SYSTEM_UPDATE sys = { 0 };
+    sys.type = SYSPTR_NULL;
+    os_unfair_lock_lock(&s->pointer_lock);
+    BOOL ok = p->PointerSystem(s->peer->context, &sys);
+    os_unfair_lock_unlock(&s->pointer_lock);
+    return ok ? MACRDP_OK : MACRDP_E_INTERNAL;
+#else
+    (void)s;
+    return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_send_pointer_shape(macrdp_session_t s,
+                                          int32_t width, int32_t height,
+                                          int32_t hot_x, int32_t hot_y,
+                                          const uint8_t *bgra,
+                                          int32_t allow_large)
+{
+#if MACRDP_HAVE_FREERDP
+    rdpPointerUpdate *p = bridge_pointer(s);
+    if (!p || !bgra || width <= 0 || height <= 0) return MACRDP_E_NOT_IMPLEMENTED;
+
+    int W = width, H = height, HX = hot_x, HY = hot_y;
+    const uint8_t *src = bgra;
+    uint8_t *scaled = NULL;
+
+    int useLarge = (W > 96 || H > 96);
+    /* Too big and large pointers not allowed → nearest-neighbour downsample. */
+    if (useLarge && !allow_large) {
+        int maxdim = (W > H) ? W : H;
+        int factor = (maxdim + 95) / 96;
+        if (factor < 1) factor = 1;
+        int nW = W / factor, nH = H / factor;
+        if (nW < 1) nW = 1;
+        if (nH < 1) nH = 1;
+        scaled = (uint8_t*)malloc((size_t)nW * nH * 4);
+        if (!scaled) return MACRDP_E_INTERNAL;
+        for (int yy = 0; yy < nH; yy++) {
+            for (int xx = 0; xx < nW; xx++) {
+                const uint8_t *sp = bgra + ((size_t)(yy * factor) * W + (xx * factor)) * 4;
+                uint8_t *dp = scaled + ((size_t)yy * nW + xx) * 4;
+                dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = sp[3];
+            }
+        }
+        src = scaled; W = nW; H = nH; HX = hot_x / factor; HY = hot_y / factor;
+        useLarge = 0;
+    }
+
+    int xor_stride = W * 4;
+    int and_bytes  = (W + 7) / 8;
+    int and_stride = (and_bytes + 1) & ~1;          /* 2-byte aligned */
+    size_t xorLen = (size_t)xor_stride * H;
+    size_t andLen = (size_t)and_stride * H;
+    uint8_t *xorM = (uint8_t*)malloc(xorLen);
+    uint8_t *andM = (uint8_t*)calloc(1, andLen);
+    if (!xorM || !andM) { free(xorM); free(andM); free(scaled); return MACRDP_E_INTERNAL; }
+    bridge_fill_pointer_masks(W, H, src, xorM, xor_stride, andM, and_stride);
+
+    BOOL ok = FALSE;
+    os_unfair_lock_lock(&s->pointer_lock);
+    if (useLarge && p->PointerLarge) {
+        POINTER_LARGE_UPDATE pl = { 0 };
+        pl.xorBpp = 32; pl.cacheIndex = 0;
+        pl.hotSpotX = (UINT16)HX; pl.hotSpotY = (UINT16)HY;
+        pl.width = (UINT16)W; pl.height = (UINT16)H;
+        pl.lengthAndMask = (UINT32)andLen; pl.lengthXorMask = (UINT32)xorLen;
+        pl.xorMaskData = xorM; pl.andMaskData = andM;
+        ok = p->PointerLarge(s->peer->context, &pl);
+    } else if (p->PointerNew) {
+        POINTER_NEW_UPDATE pn = { 0 };
+        pn.xorBpp = 32;
+        pn.colorPtrAttr.cacheIndex = 0;
+        pn.colorPtrAttr.hotSpotX = (UINT16)HX; pn.colorPtrAttr.hotSpotY = (UINT16)HY;
+        pn.colorPtrAttr.width = (UINT16)W; pn.colorPtrAttr.height = (UINT16)H;
+        pn.colorPtrAttr.lengthAndMask = (UINT16)andLen;
+        pn.colorPtrAttr.lengthXorMask = (UINT16)xorLen;
+        pn.colorPtrAttr.xorMaskData = xorM; pn.colorPtrAttr.andMaskData = andM;
+        ok = p->PointerNew(s->peer->context, &pn);
+    }
+    os_unfair_lock_unlock(&s->pointer_lock);
+
+    free(xorM); free(andM); free(scaled);
+    return ok ? MACRDP_OK : MACRDP_E_INTERNAL;
+#else
+    (void)s; (void)width; (void)height; (void)hot_x; (void)hot_y; (void)bgra; (void)allow_large;
+    return MACRDP_E_NOT_IMPLEMENTED;
 #endif
 }
 

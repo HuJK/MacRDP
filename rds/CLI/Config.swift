@@ -20,6 +20,11 @@ struct Config: Codable, Sendable {
     var audioIn: AudioInConfig
     var clipboard: ClipboardConfig
     var rdpdr: RDPDRConfig
+    /// Optional so older config files decode without it — see `effectiveCursor`.
+    var cursor: CursorConfig?
+
+    /// Cursor config with defaults filled in.
+    var effectiveCursor: CursorConfig { cursor ?? .default }
 
     struct ListenConfig: Codable, Sendable {
         var host: String
@@ -85,12 +90,138 @@ struct Config: Codable, Sendable {
         var avc420QualityVal: Int
 
         /// Which RDPGFX codec to emit per frame.
-        ///   "avc420"      → H.264 via VideoToolbox hardware encoder (default).
+        ///   "avc420"      → H.264 via VideoToolbox hardware encoder.
         ///                   Best for video, smooth full-frame motion.
         ///   "progressive" → RemoteFX Progressive V2 via FreeRDP's CPU codec.
         ///                   Tile-based wavelet — automatic damage tracking,
         ///                   excellent for sparse desktop changes. Higher CPU.
+        ///   "hybrid"      → per-tile mix of the two (default). A background
+        ///                   analysis thread classifies each tile; video/motion
+        ///                   tiles go to H.264, text/static tiles to Progressive,
+        ///                   both composed onto one surface per frame. Tunables
+        ///                   live in `hybrid`.
         var codec: String
+
+        /// Hybrid-codec tunables. Optional so older config files (and the
+        /// non-hybrid codecs) decode without it — see `effectiveHybrid`.
+        var hybrid: HybridConfig?
+
+        /// Hybrid config with defaults filled in. Use this everywhere the
+        /// hybrid path needs a value so `codec:"hybrid"` works even when the
+        /// config omits the `hybrid` block.
+        var effectiveHybrid: HybridConfig { hybrid ?? .default }
+    }
+
+    /// Per-tile hybrid-encoding tunables. Every threshold here is a knob,
+    /// never a literal baked into the analysis/encode code.
+    struct HybridConfig: Codable, Sendable {
+        // --- tile grid ---
+        /// Square tile edge in pixels. The grid is cols×rows where
+        /// cols = ceil(width/tileSize), rows = ceil(height/tileSize).
+        var tileSize: Int
+
+        // --- analysis cadence (抽幀) ---
+        /// Analyze only every Nth submitted frame (1 = every frame).
+        var analysisFrameInterval: Int
+        /// Floor between two analyses, milliseconds (rate limit under load).
+        var analysisMinIntervalMs: Int
+        /// Pixel subsample stride inside a tile (1 = every pixel).
+        var spatialSampleStride: Int
+
+        // --- change detection (temporal) ---
+        // Classification is driven by the *character of the change*, not static
+        // content. `classifiers` is an ordered FALLBACK CHAIN: each frame uses
+        // the first classifier whose data requirements are met; if every
+        // classifier in the chain needs dirtyRects and they're unavailable, the
+        // chain is exhausted and the server exits (telling you to fix the chain).
+        //   "region"          — connected-component AREA of changed tiles
+        //                        (large region → H.264, small → Progressive).
+        //                        Needs dirtyRects.
+        //   "coverageHistory" — per-tile: over the last `coverageHistoryFrames`
+        //                        analyses, the fraction whose change-coverage
+        //                        exceeded `coverageHighThreshold`; ≥
+        //                        `coverageVideoFraction` → H.264. Captures
+        //                        "video = repeatedly changes a large FRACTION
+        //                        of the tile (small magnitude ok); UI = changes
+        //                        a small fraction (large magnitude ok)".
+        //                        Needs dirtyRects.
+        //   "luma"            — same coverage-history rule but coverage comes
+        //                        from per-pixel luma deltas. Needs NO dirtyRects
+        //                        (good as a last-resort fallback).
+        var classifiers: [String]
+
+        /// Per-pixel |Δluma| above which a sampled pixel counts as changed.
+        /// Filters compression shimmer / gradient banding.
+        var pixelNoiseThreshold: Double
+        /// Fraction of a tile's sampled pixels that must be changed for the
+        /// tile to count as "active" (i.e. it gets sent at all, vs skipped).
+        var tileActiveCoverage: Double
+
+        // -- "region" classifier --
+        /// Connected changed-tile blobs with area (in tiles) ≥ this go to
+        /// H.264; smaller blobs go to Progressive.
+        var largeRegionTiles: Int
+
+        // -- "coverageHistory" classifier --
+        /// Window length (analyses) of the per-tile coverage history.
+        var coverageHistoryFrames: Int
+        /// Per-frame change-coverage above which a tile's frame counts as
+        /// "high-change" (fraction 0–1).
+        var coverageHighThreshold: Double
+        /// Fraction (0–1) of the windowed frames that must be "high-change"
+        /// for the tile to be classified video → H.264.
+        var coverageVideoFraction: Double
+
+        /// A tile only adopts a *new* codec after the new decision persists
+        /// this many consecutive analyses (anti-flap at region edges).
+        var codecSwitchHysteresisFrames: Int
+        /// When a tile that was H.264 stops changing, send it once via
+        /// Progressive (crisp re-render) before going idle — keeps text sharp
+        /// after a window drag / video stops.
+        var settleRepaint: Bool
+
+        // --- H.264 bit-waste masking ---
+        /// Paint non-video tiles a flat colour before VT encode so the
+        /// ignored regions compress to ~nothing. Toggleable.
+        var maskNonVideoTiles: Bool
+        /// Flat colour written into masked tiles, as the 32-bit little-endian
+        /// word laid down in a BGRX32 pixel (0xFF000000 = opaque black).
+        var maskColorBGRA: UInt32
+        /// Keep this many tiles of REAL pixels as a halo around the video
+        /// region in the encoder input (they're kept real but NOT blitted —
+        /// they stay out of the AVC420 regionRects). This keeps the H.264
+        /// decoder's references realistic at the video↔static seam, so a tile
+        /// *entering* video doesn't decode a large delta-from-mask and flash
+        /// black on the transition frame. 0 = mask right up to the video edge
+        /// (max savings, more seam flicker).
+        var maskHaloTiles: Int
+
+        // --- AVC420 quant hints for the hybrid video region ---
+        /// nil → fall back to video.avc420Qp / video.avc420QualityVal.
+        var videoQp: Int?
+        var videoQualityVal: Int?
+
+        static var `default`: HybridConfig {
+            HybridConfig(
+                tileSize: 64,
+                analysisFrameInterval: 2,
+                analysisMinIntervalMs: 33,
+                spatialSampleStride: 4,
+                classifiers: ["coverageHistory", "luma"],
+                pixelNoiseThreshold: 8.0,
+                tileActiveCoverage: 0.02,
+                largeRegionTiles: 12,
+                coverageHistoryFrames: 5,
+                coverageHighThreshold: 0.4,
+                coverageVideoFraction: 0.2,
+                codecSwitchHysteresisFrames: 3,
+                settleRepaint: true,
+                maskNonVideoTiles: false,
+                maskColorBGRA: 0xFF00_0000,
+                maskHaloTiles: 2,
+                videoQp: nil,
+                videoQualityVal: nil)
+        }
     }
 
     struct QualityProfile: Codable, Sendable {
@@ -112,6 +243,35 @@ struct Config: Codable, Sendable {
         /// (primary first, then by displayID ascending), capped at the
         /// negotiated client monitor count.
         var monitors: [MonitorBinding]?
+
+        /// How to react to a client desktop-resize (DISP) request. One of:
+        ///   "none"        — ignore resize events.
+        ///   "resize"      — GPU-resample the captured frame to the client
+        ///                   size (aspect-preserving) before encoding; skips
+        ///                   when the fit is already exact (lowest latency).
+        ///   "setOnServer" — change the macOS display to the largest available
+        ///                   mode that fits the client pixels, DPI-aware (uses
+        ///                   the client's DesktopScaleFactor to pick HiDPI vs
+        ///                   1× and the point size). Auto-reverts on exit.
+        ///   "cliCommand"  — run `resizeHook` (e.g. a virtual-display driver
+        ///                   command), then resample to the result.
+        var resizePolicy: String
+
+        /// Per-RDP-screen overrides, keyed by rdp screen id (slot) as a string
+        /// (e.g. {"0":"setOnServer","1":"resize"}). Slots without an entry use
+        /// `resizePolicy`.
+        var resizePolicies: [String: String]?
+
+        /// HiDPI selection for "setOnServer":
+        ///   "client" — honor the client's DesktopScaleFactor (default).
+        ///   "force"  — always prefer 2× HiDPI modes.
+        ///   "off"    — always prefer 1× modes (max real estate).
+        var resizeHiDPIPolicy: String
+
+        /// Effective resize policy for an rdp screen id (slot).
+        func effectiveResizePolicy(slot: Int) -> String {
+            resizePolicies?[String(slot)] ?? resizePolicy
+        }
     }
 
     /// One entry in `DisplayConfig.monitors`. Both fields are required.
@@ -162,6 +322,30 @@ struct Config: Codable, Sendable {
         /// Pixels of scroll per wheel notch (RDP WHEEL_DELTA = 120 magnitude
         /// units in the wire format). 50 px ≈ a Mac wheel-mouse one-notch feel.
         var wheelPixelsPerNotch: Int
+    }
+
+    /// Hardware-cursor (RDP pointer channel) settings.
+    struct CursorConfig: Codable, Sendable {
+        /// When true, capture with `showsCursor=false` and send the cursor's
+        /// position + shape out-of-band via RDP pointer updates so the client
+        /// renders it locally (removes mouse-move churn from the frame).
+        var hardwareCursor: Bool
+        /// Poll interval (ms) for cursor shape-change detection.
+        var pollIntervalMs: Int
+        /// Allow POINTER_LARGE (up to 384²) for big/Retina cursors; otherwise
+        /// large cursors are downscaled to the 96² color-pointer limit.
+        var allowLargePointer: Bool
+        /// Stream cursor *position* to the client. Off by default: RDP clients
+        /// render the cursor at their own (local) mouse position, so streaming
+        /// the server position adds a latency-lagged correction that can feel
+        /// jittery. Enable only if you need server-initiated cursor moves to
+        /// reflect on the client.
+        var streamPosition: Bool
+
+        static var `default`: CursorConfig {
+            CursorConfig(hardwareCursor: true, pollIntervalMs: 16,
+                         allowLargePointer: true, streamPosition: false)
+        }
     }
 
     struct AudioOutConfig: Codable, Sendable {
@@ -259,9 +443,12 @@ struct Config: Codable, Sendable {
                          maxOutstandingFrames: 2,
                          avc420Qp: 22,
                          avc420QualityVal: 100,
-                         codec: "progressive"),
+                         codec: "hybrid",
+                         hybrid: .default),
             display: .init(resizeHook: nil, resizeTimeoutSeconds: 3.0,
-                           captureDisplayID: 0, monitors: nil),
+                           captureDisplayID: 0, monitors: nil,
+                           resizePolicy: "resize", resizePolicies: nil,
+                           resizeHiDPIPolicy: "client"),
             input: .init(wheelPixelsPerNotch: 50),
             audioOut: .init(enabled: true, preferAAC: true,
                             muteLocalOutput: "always"),
@@ -269,7 +456,8 @@ struct Config: Codable, Sendable {
             clipboard: .init(text: true, image: true, files: true,
                              maxFileSizeMiB: 4096, pollIntervalMs: 200,
                              fileFetchMode: "lazy", showInFinder: false),
-            rdpdr: .init(enabled: true)
+            rdpdr: .init(enabled: true),
+            cursor: .default
         )
     }
 }

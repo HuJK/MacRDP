@@ -31,9 +31,13 @@ final class H264Encoder {
         var dataRateBurstMultiplier: Double
         var dataRateBurstSeconds: Int
         var maxFrameDelayCount: Int
+        /// CVPixelBuffer pixel format the encoder is fed. AVC420 capture is
+        /// NV12 (VT-native); the hybrid path feeds BGRA (VT converts).
+        var pixelFormat: OSType
 
         static func from(_ video: Config.VideoConfig,
-                         width: Int, height: Int) -> Settings {
+                         width: Int, height: Int,
+                         pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) -> Settings {
             Settings(
                 width: Int32(width),
                 height: Int32(height),
@@ -43,14 +47,17 @@ final class H264Encoder {
                 hwAcceleration: video.hwAcceleration,
                 dataRateBurstMultiplier: video.dataRateBurstMultiplier,
                 dataRateBurstSeconds: video.dataRateBurstSeconds,
-                maxFrameDelayCount: video.maxFrameDelayCount
+                maxFrameDelayCount: video.maxFrameDelayCount,
+                pixelFormat: pixelFormat
             )
         }
     }
 
     /// Annex-B output. `isIDR` is true on keyframes; in that case
-    /// SPS+PPS NALs are already prepended.
-    typealias Output = (Data, _ isIDR: Bool, _ pts: CMTime) -> Void
+    /// SPS+PPS NALs are already prepended. `userData` is the opaque value
+    /// passed to `encode` for this frame (the hybrid path threads its
+    /// tile-routing payload through here).
+    typealias Output = (Data, _ isIDR: Bool, _ pts: CMTime, _ userData: (any Sendable)?) -> Void
 
     private let settings: Settings
     private var session: VTCompressionSession?
@@ -91,8 +98,7 @@ final class H264Encoder {
         }
 
         let imageBufferAttrs: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey:
-                Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) as CFNumber
+            kCVPixelBufferPixelFormatTypeKey: Int(settings.pixelFormat) as CFNumber
         ]
 
         var s: VTCompressionSession?
@@ -194,7 +200,7 @@ final class H264Encoder {
     // MARK: - Encode
 
     func encode(pixelBuffer: CVPixelBuffer, pts: CMTime,
-                forceKeyframe: Bool) throws {
+                forceKeyframe: Bool, userData: (any Sendable)? = nil) throws {
         guard let s = session else {
             throw MacRDPError.encoderInitFailed(osStatus: -1)
         }
@@ -214,7 +220,7 @@ final class H264Encoder {
         ) { [weak self] status, _, sample in
             guard status == noErr, let sample else { return }
             self?.outputQueue.async {
-                self?.handleEncoded(sample)
+                self?.handleEncoded(sample, userData: userData)
             }
         }
         if status != noErr {
@@ -224,7 +230,7 @@ final class H264Encoder {
 
     // MARK: - AVCC -> Annex-B
 
-    private func handleEncoded(_ sample: CMSampleBuffer) {
+    private func handleEncoded(_ sample: CMSampleBuffer, userData: (any Sendable)?) {
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sample) else { return }
         guard let formatDesc = CMSampleBufferGetFormatDescription(sample) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
@@ -268,7 +274,7 @@ final class H264Encoder {
             offset += nalLen
         }
 
-        onEncoded(annexB, isIDR, pts)
+        onEncoded(annexB, isIDR, pts, userData)
     }
 
     private func isKeyframe(_ sample: CMSampleBuffer) -> Bool {

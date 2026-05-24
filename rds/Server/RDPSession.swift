@@ -25,6 +25,13 @@ final class RDPSession {
 
     // Per-session subsystems (populated when peer activates).
     private var displayPipeline: DisplayPipeline?
+    #if MACRDP_BRIDGE_AVAILABLE
+    /// Hybrid per-tile codec coordinator (owns the tile map + analysis
+    /// engine). Held for the session lifetime; nil for non-hybrid codecs.
+    private var hybridCoordinator: HybridCoordinator?
+    /// Hardware-cursor pipeline (RDP pointer channel). nil when disabled.
+    private var cursorPipeline: CursorPipeline?
+    #endif
     private var audioOut: AudioOutPipeline?
     private var audioIn: AudioInPipeline?
     private var clipboard: ClipboardBridge?
@@ -34,6 +41,8 @@ final class RDPSession {
     /// MainActor hop — that saves ~1-5ms per mouse / keyboard event.
     private let inputBox = ThreadSafeBox<InputInjector>()
     private var displayControl: DisplayControl?
+    /// "setOnServer" resize policy — changes the macOS display mode.
+    private var displayModeController: DisplayModeController?
     private var displayMapping = DisplayMapping()
     /// Audio routing path. Holds the bridge plus an optional AAC
     /// encoder (engaged when mstsc selects WAVE_FORMAT_AAC_MS at
@@ -109,6 +118,14 @@ final class RDPSession {
         // *console* gets interpreted as a Cmd-shortcut.
         inputBox.value?.releaseAllModifiers()
         displayPipeline?.stop()
+        // Restore any display whose mode we changed for "setOnServer".
+        displayModeController?.restoreAll()
+        displayModeController = nil
+        #if MACRDP_BRIDGE_AVAILABLE
+        cursorPipeline?.stop()
+        cursorPipeline = nil
+        hybridCoordinator = nil
+        #endif
         audioOut?.stop()
         audioIn?.stop()
         clipboard?.stop()
@@ -337,12 +354,41 @@ final class RDPSession {
         let inputBoxRef = self.inputBox
         let outBounds = CGDisplayBounds(primary)
         let wheelPx = config.input.wheelPixelsPerNotch
+
+        // Hybrid coordinator (per-tile codec). Created up front so the
+        // dimension-resolved callback can rebuild its tile grid. Seeded with
+        // the activated size; the real capture size arrives via onResolved.
+        let hybridCoord: HybridCoordinator?
+        if config.video.codec.lowercased() == "hybrid" {
+            let tileSize = config.video.effectiveHybrid.tileSize
+            let seed = TileGrid(width: width, height: height, tileSize: tileSize)
+            let coord = HybridCoordinator(config: config, bridge: bridge, initialGrid: seed)
+            self.hybridCoordinator = coord
+            hybridCoord = coord
+        } else {
+            hybridCoord = nil
+        }
+
+        // Hardware cursor: capture without the pointer baked in and stream it
+        // over the RDP pointer channel instead.
+        let cursorPipe: CursorPipeline?
+        if config.effectiveCursor.hardwareCursor {
+            let cp = CursorPipeline(bridge: bridge, config: config.effectiveCursor)
+            self.cursorPipeline = cp
+            cursorPipe = cp
+            cp.start()
+        } else {
+            cursorPipe = nil
+        }
+
         let onResolved: @Sendable (Int, Int) -> Void = { w, h in
             bridge.setDesktopSize(width: w, height: h)
             inputBoxRef.value = InputInjector(
                 surfaceWidth: w, surfaceHeight: h,
                 outputDisplayBounds: outBounds,
                 wheelPixelsPerNotch: wheelPx)
+            hybridCoord?.resolutionChanged(width: w, height: h)
+            cursorPipe?.updateGeometry(surfaceWidth: w, surfaceHeight: h, displayID: primary)
         }
 
         // SCK-delivered audio path: only enabled when the client
@@ -362,6 +408,16 @@ final class RDPSession {
 
         let pipeline: DisplayPipeline
         switch config.video.codec.lowercased() {
+        case "hybrid":
+            Log.encoder.notice("Using RDPGFX codec: hybrid (per-tile AVC420 + Progressive)")
+            pipeline = DisplayPipeline(
+                config: config,
+                onAudioFrame: audioHandler,
+                onDimensionsResolved: onResolved,
+                hybridSink: hybridCoord,
+                shouldDropCapture: {
+                    bridge.outstandingFrames >= maxOutstanding
+                })
         case "progressive":
             Log.encoder.notice("Using RDPGFX codec: RemoteFX Progressive V2")
             pipeline = DisplayPipeline(
@@ -471,6 +527,12 @@ final class RDPSession {
         }
 
         self.displayPipeline = pipeline
+        // Resize-policy collaborators: mode-setter ("setOnServer") and the
+        // resize-hook driver ("cliCommand"). Selected per-screen in onDispLayout.
+        self.displayModeController = DisplayModeController(
+            hidpiPolicy: config.display.resizeHiDPIPolicy)
+        self.displayControl = DisplayControl(
+            config: config, pipeline: pipeline, mapping: displayMapping)
         let w = width, h = height
         Task { @MainActor in
             do {
@@ -504,15 +566,45 @@ final class RDPSession {
         guard let primary = monitors.first(where: { $0.primary }) ?? monitors.first else {
             return
         }
+        let slot = primary.rdpSlot
+        let policy = ResizePolicy(config.display.effectiveResizePolicy(slot: slot))
         let w = primary.width, h = primary.height
-        Log.resize.info("Client DISP request: \(w, privacy: .public)x\(h, privacy: .public)")
+        let scale = primary.scale
+        Log.resize.info("Client DISP request: slot=\(slot, privacy: .public) \(w, privacy: .public)x\(h, privacy: .public) scale=\(scale, privacy: .public) policy=\(policy.rawValue, privacy: .public)")
         guard let pipeline = displayPipeline else { return }
-        Task { @MainActor in
-            do {
-                try await pipeline.resize(width: w, height: h)
-            } catch {
-                Log.resize.error("DISP resize failed: \(String(describing: error), privacy: .public)")
+
+        switch policy {
+        case .none:
+            return
+
+        case .resize:
+            // GPU resample the captured frame to the client size (aspect-fit);
+            // pipeline.resize skips when the fit is already exact.
+            Task { @MainActor in
+                do { try await pipeline.resize(width: w, height: h) }
+                catch { Log.resize.error("resize failed: \(String(describing: error), privacy: .public)") }
             }
+
+        case .setOnServer:
+            let displayID = displayMapping.displayID(forSlot: slot) ?? CGMainDisplayID()
+            let ctrl = displayModeController
+            Task { @MainActor in
+                let fit = ctrl?.applyBestFit(displayID: displayID,
+                                             clientPixelW: w, clientPixelH: h,
+                                             desktopScale: scale)
+                // Capture at the new native size (1:1) if we changed it, else
+                // fall back to resampling to the client size.
+                let (rw, rh) = fit ?? (w, h)
+                do { try await pipeline.resize(width: rw, height: rh) }
+                catch { Log.resize.error("setOnServer resize failed: \(String(describing: error), privacy: .public)") }
+            }
+
+        case .cliCommand:
+            guard let ctrl = displayControl else {
+                Log.resize.error("cliCommand policy but no DisplayControl / resize_hook configured")
+                return
+            }
+            Task { @MainActor in await ctrl.handleClientResize(raw: monitors) }
         }
     }
 }

@@ -136,6 +136,12 @@ final class BridgePeer: @unchecked Sendable {
         cfg.max_outstanding_frames   = Int32(config.video.maxOutstandingFrames)
         cfg.avc420_qp                = Int32(config.video.avc420Qp)
         cfg.avc420_quality_val       = Int32(config.video.avc420QualityVal)
+        // Hybrid mode can override the AVC420 quant hint for its video region.
+        if config.video.codec.lowercased() == "hybrid" {
+            let hy = config.video.effectiveHybrid
+            cfg.avc420_qp          = Int32(hy.videoQp ?? config.video.avc420Qp)
+            cfg.avc420_quality_val = Int32(hy.videoQualityVal ?? config.video.avc420QualityVal)
+        }
         cfg.enable_audio_out         = config.audioOut.enabled ? 1 : 0
         cfg.enable_audio_in          = config.audioIn.enabled  ? 1 : 0
         cfg.enable_clipboard         = (config.clipboard.text || config.clipboard.image
@@ -216,6 +222,32 @@ final class BridgePeer: @unchecked Sendable {
         macrdp_session_set_desktop_size(s, Int32(width), Int32(height))
     }
 
+    // MARK: - Hardware cursor (RDP pointer channel)
+
+    /// Move the client-rendered pointer (surface pixel coords).
+    func sendPointerPosition(x: Int, y: Int) {
+        guard let s = session else { return }
+        _ = macrdp_session_send_pointer_position(s, Int32(x), Int32(y))
+    }
+
+    /// Set the client-rendered pointer shape. `bgra` is top-down,
+    /// premultiplied, width*height*4 bytes.
+    func sendPointerShape(width: Int, height: Int, hotX: Int, hotY: Int,
+                          bgra: [UInt8], allowLarge: Bool) {
+        guard let s = session, !bgra.isEmpty else { return }
+        bgra.withUnsafeBufferPointer { buf in
+            _ = macrdp_session_send_pointer_shape(
+                s, Int32(width), Int32(height), Int32(hotX), Int32(hotY),
+                buf.baseAddress, allowLarge ? 1 : 0)
+        }
+    }
+
+    /// Hide the client-rendered pointer.
+    func sendPointerHidden() {
+        guard let s = session else { return }
+        _ = macrdp_session_send_pointer_hidden(s)
+    }
+
     /// Push a chunk of Int16LE stereo @ 48 kHz PCM to RDPSND.
     @discardableResult
     func sendAudioPCM(_ pcm: Data) -> Bool {
@@ -238,6 +270,45 @@ final class BridgePeer: @unchecked Sendable {
             s, surfaceID, bgra,
             Int32(width), Int32(height), Int32(stride))
         return rc == MACRDP_OK
+    }
+
+    /// Hybrid per-tile path: AVC420 over `videoRects` + Progressive over
+    /// `staticRects`, composed onto one surface in one GFX frame. Pass
+    /// `annexB == nil` for a Progressive-only frame. `bgra` must stay valid
+    /// for the duration of the call. Callers must serialize invocations
+    /// (the GFX send + progressive context are single-threaded by design).
+    @discardableResult
+    func sendHybrid(annexB: Data?, isIDR: Bool, pts: CMTime,
+                    surfaceID: Int32 = 0,
+                    videoRects: [Rect16],
+                    bgra: UnsafePointer<UInt8>, width: Int, height: Int, stride: Int,
+                    staticRects: [Rect16]) -> Bool {
+        guard let s = session else { return false }
+        let secs = CMTimeGetSeconds(pts)
+        let ptsMicros: Int64 = secs.isFinite ? Int64((secs * 1_000_000).rounded()) : 0
+        let vr = videoRects.map {
+            macrdp_rect16(left: $0.left, top: $0.top, right: $0.right, bottom: $0.bottom)
+        }
+        let sr = staticRects.map {
+            macrdp_rect16(left: $0.left, top: $0.top, right: $0.right, bottom: $0.bottom)
+        }
+        func invoke(_ annexbPtr: UnsafePointer<UInt8>?, _ annexbLen: Int) -> Bool {
+            vr.withUnsafeBufferPointer { vrp in
+                sr.withUnsafeBufferPointer { srp in
+                    macrdp_session_send_hybrid_frame(
+                        s, surfaceID, annexbPtr, annexbLen, isIDR ? 1 : 0, ptsMicros,
+                        vrp.baseAddress, Int32(vr.count),
+                        bgra, Int32(width), Int32(height), Int32(stride),
+                        srp.baseAddress, Int32(sr.count)) == MACRDP_OK
+                }
+            }
+        }
+        if let annexB, !annexB.isEmpty {
+            return annexB.withUnsafeBytes { raw -> Bool in
+                invoke(raw.baseAddress?.assumingMemoryBound(to: UInt8.self), annexB.count)
+            }
+        }
+        return invoke(nil, 0)
     }
 
     /// Ship one AAC-LC packet (raw frame bytes) via the Wave2 PDU path.

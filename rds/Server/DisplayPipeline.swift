@@ -68,6 +68,10 @@ final class DisplayPipeline {
     let onRawFrame: RawFrameHandler?
     let onAudioFrame: AudioFrameHandler?
     let onDimensionsResolved: DimensionsResolved?
+    /// Hybrid per-tile codec sink. When set, capture is BGRA, the H.264
+    /// encoder is stood up, and each frame is routed per-tile through this
+    /// sink instead of the avc420/progressive single-codec paths.
+    let hybridSink: HybridFrameSink?
     /// Returns true if the encoder should skip this capture (network /
     /// client behind). Polled per captured sample buffer.
     let shouldDropCapture: BackpressureProbe
@@ -77,12 +81,14 @@ final class DisplayPipeline {
          onRawFrame: RawFrameHandler? = nil,
          onAudioFrame: AudioFrameHandler? = nil,
          onDimensionsResolved: DimensionsResolved? = nil,
+         hybridSink: HybridFrameSink? = nil,
          shouldDropCapture: @escaping BackpressureProbe = { false }) {
         self.config = config
         self.onEncodedFrame = onEncodedFrame
         self.onRawFrame = onRawFrame
         self.onAudioFrame = onAudioFrame
         self.onDimensionsResolved = onDimensionsResolved
+        self.hybridSink = hybridSink
         self.shouldDropCapture = shouldDropCapture
     }
 
@@ -147,8 +153,10 @@ final class DisplayPipeline {
         let cfg = SCStreamConfiguration()
         cfg.width  = pxW
         cfg.height = pxH
-        // AVC420 path uses NV12 (VT-native). Progressive needs BGRA bytes.
-        if onRawFrame != nil {
+        // AVC420 path uses NV12 (VT-native). Progressive and hybrid both
+        // need BGRA bytes (progressive_compress + per-tile analysis); the
+        // hybrid H.264 encoder is fed BGRA too (VT converts internally).
+        if onRawFrame != nil || hybridSink != nil {
             cfg.pixelFormat = kCVPixelFormatType_32BGRA
         } else {
             cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -156,7 +164,9 @@ final class DisplayPipeline {
         cfg.minimumFrameInterval = CMTime(value: 1,
             timescale: CMTimeScale(max(config.video.maxFps * 2, 120)))
         cfg.queueDepth = config.video.sckQueueDepth
-        cfg.showsCursor = true
+        // Hardware cursor: keep the pointer OUT of the captured frame and send
+        // it over the RDP pointer channel instead (see CursorPipeline).
+        cfg.showsCursor = !config.effectiveCursor.hardwareCursor
         cfg.colorSpaceName = CGColorSpace.sRGB
         // System audio capture (SCK 14+). Cheaper and more reliable than
         // building our own CATap-on-aggregate-device — Apple's own
@@ -170,11 +180,21 @@ final class DisplayPipeline {
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
 
-        // Only stand up the H.264 encoder for the AVC420 path.
-        if let handler = onEncodedFrame {
+        // Stand up the H.264 encoder for the AVC420 path or the hybrid path.
+        // Hybrid feeds BGRA (VT converts); AVC420 feeds NV12.
+        if let sink = hybridSink {
+            let encoderSettings = H264Encoder.Settings.from(
+                config.video, width: pxW, height: pxH,
+                pixelFormat: kCVPixelFormatType_32BGRA)
+            self.encoder = try H264Encoder(settings: encoderSettings) { data, isIDR, pts, userData in
+                if let payload = userData as? HybridFramePayload {
+                    sink.send(annexB: data, isIDR: isIDR, pts: pts, payload: payload)
+                }
+            }
+        } else if let handler = onEncodedFrame {
             let encoderSettings = H264Encoder.Settings.from(
                 config.video, width: pxW, height: pxH)
-            self.encoder = try H264Encoder(settings: encoderSettings) { data, isIDR, pts in
+            self.encoder = try H264Encoder(settings: encoderSettings) { data, isIDR, pts, _ in
                 handler(data, isIDR, pts)
             }
         } else {
@@ -318,24 +338,41 @@ final class DisplayPipeline {
             pxW = max(2, Int((Double(height) * macAR).rounded()))
         }
 
+        // Skip the reconfigure entirely if the aspect-fit lands on the size we
+        // already capture (covers "one dim equal, the other larger" and "both
+        // equal") — avoids a needless SCStream reconfigure + latency hit.
+        if pxW == currentWidth && pxH == currentHeight {
+            Log.display.info("Resize \(width, privacy: .public)x\(height, privacy: .public) → no-op (already \(pxW, privacy: .public)x\(pxH, privacy: .public))")
+            return
+        }
+
         let cfg = SCStreamConfiguration()
         cfg.width  = pxW
         cfg.height = pxH
-        cfg.pixelFormat = (onRawFrame != nil)
+        cfg.pixelFormat = (onRawFrame != nil || hybridSink != nil)
             ? kCVPixelFormatType_32BGRA
             : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         cfg.minimumFrameInterval = CMTime(value: 1,
             timescale: CMTimeScale(max(config.video.maxFps * 2, 120)))
         cfg.queueDepth = config.video.sckQueueDepth
-        cfg.showsCursor = true
+        cfg.showsCursor = !config.effectiveCursor.hardwareCursor
 
         try await stream.updateConfiguration(cfg)
 
         encoder?.invalidate()
-        if let handler = onEncodedFrame {
+        if let sink = hybridSink {
+            let settings = H264Encoder.Settings.from(
+                config.video, width: pxW, height: pxH,
+                pixelFormat: kCVPixelFormatType_32BGRA)
+            self.encoder = try H264Encoder(settings: settings) { data, isIDR, pts, userData in
+                if let payload = userData as? HybridFramePayload {
+                    sink.send(annexB: data, isIDR: isIDR, pts: pts, payload: payload)
+                }
+            }
+        } else if let handler = onEncodedFrame {
             let settings = H264Encoder.Settings.from(
                 config.video, width: pxW, height: pxH)
-            self.encoder = try H264Encoder(settings: settings) { data, isIDR, pts in
+            self.encoder = try H264Encoder(settings: settings) { data, isIDR, pts, _ in
                 handler(data, isIDR, pts)
             }
         } else {
@@ -446,6 +483,20 @@ final class DisplayPipeline {
         return status == .complete
     }
 
+    /// SCK attaches the frame's changed regions as `SCStreamFrameInfoDirtyRects`
+    /// — per the header, "an array of CGRect in NSValue … specified in pixels"
+    /// (i.e. surface pixel coords, the same space as the tile grid). Returns
+    /// nil when the attachment is absent so the analyzer falls back to a
+    /// luma-delta change signal.
+    private static func dirtyRects(from sample: CMSampleBuffer) -> [CGRect]? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: false) as? [[CFString: Any]],
+              let first = attachments.first,
+              let values = first[SCStreamFrameInfo.dirtyRects as CFString] as? [NSValue]
+        else { return nil }
+        return values.map { $0.rectValue }
+    }
+
     private func teardown() async throws {
         if let s = stream {
             try? await s.stopCapture()
@@ -488,6 +539,38 @@ final class DisplayPipeline {
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         let force = nextForceKeyframe
         nextForceKeyframe = false
+
+        // Hybrid per-tile path. Route the frame (analysis submit + read the
+        // tile map + coalesce + optional mask), then either send a
+        // Progressive-only frame (no video tiles) or encode the (masked)
+        // frame; the encoder output callback composes both codecs.
+        if let sink = hybridSink {
+            let dirty = Self.dirtyRects(from: sample)
+            CVPixelBufferLockBaseAddress(pixel, .readOnly)
+            let w = CVPixelBufferGetWidth(pixel)
+            let h = CVPixelBufferGetHeight(pixel)
+            let stride = CVPixelBufferGetBytesPerRow(pixel)
+            let routing = sink.route(pixel: pixel, width: w, height: h, stride: stride,
+                                     dirtyRects: dirty)
+            CVPixelBufferUnlockBaseAddress(pixel, .readOnly)
+
+            let payload = HybridFramePayload(
+                videoRects: routing.videoRects, staticRects: routing.staticRects,
+                grid: routing.grid, pixel: pixel)
+
+            if routing.videoRects.isEmpty {
+                // Nothing photographic this frame — Progressive only.
+                sink.send(annexB: nil, isIDR: false, pts: pts, payload: payload)
+                return
+            }
+            do {
+                try encoder?.encode(pixelBuffer: routing.maskedBuffer ?? pixel,
+                                    pts: pts, forceKeyframe: force, userData: payload)
+            } catch {
+                Log.encoder.error("hybrid encode failed: \(String(describing: error), privacy: .public)")
+            }
+            return
+        }
 
         // Raw-frame path (RemoteFX Progressive) — hand the locked BGRA
         // pointer straight to the bridge; FreeRDP's progressive_compress

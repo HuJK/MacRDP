@@ -310,9 +310,69 @@ int32_t macrdp_session_send_progressive_frame(
     int32_t          height,
     int32_t          stride);
 
+/* A rectangle in surface pixel coordinates. Mirrors RECTANGLE_16. */
+typedef struct macrdp_rect16 {
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+} macrdp_rect16;
+
+/* Hybrid per-tile path. Composes up to two codec commands onto ONE surface
+ * under a single GFX frame (one StartFrame/EndFrame, one outstanding-frame
+ * credit, one client FRAME_ACKNOWLEDGE):
+ *
+ *   - AVC420 over `video_rects` (the H.264 stream is full-frame; the rects
+ *     tell the client which parts of the decoded frame to blit). Skipped
+ *     when `annexb == NULL` or `num_video_rects == 0`.
+ *   - RemoteFX Progressive over `static_rects` (built into a REGION16 and
+ *     run through progressive_compress). Skipped when `num_static_rects == 0`
+ *     or the encoder reports no change.
+ *
+ * If neither side produces output the call sends nothing and returns
+ * MACRDP_OK without spending a frame credit. Returns MACRDP_E_FRAME_DROPPED
+ * when flow-controlled. `bgra`/`width`/`height`/`stride` describe the raw
+ * (unmasked) frame used for the Progressive region. */
+int32_t macrdp_session_send_hybrid_frame(
+    macrdp_session_t      session,
+    int32_t               surface_id,
+    const uint8_t        *annexb,           /* nullable; H.264 Annex-B */
+    size_t                annexb_bytes,
+    int32_t               is_idr,
+    int64_t               pts_microseconds,
+    const macrdp_rect16  *video_rects,
+    int32_t               num_video_rects,
+    const uint8_t        *bgra,
+    int32_t               width,
+    int32_t               height,
+    int32_t               stride,
+    const macrdp_rect16  *static_rects,
+    int32_t               num_static_rects);
+
 /* Returns the number of frames in flight (sent but unacked). Swift checks
  * this before encoding to apply backpressure at the encoder input. */
 int32_t macrdp_session_outstanding_frames(macrdp_session_t session);
+
+/* -------- hardware cursor (RDP pointer channel) ------------------- */
+
+/* Move the client-rendered pointer. (x,y) in surface pixel coordinates. */
+int32_t macrdp_session_send_pointer_position(macrdp_session_t session,
+                                             int32_t x, int32_t y);
+
+/* Set the client-rendered pointer shape. `bgra` is a TOP-DOWN,
+ * premultiplied-alpha BGRA bitmap (row 0 = top), width*height*4 bytes; the
+ * bridge flips to RDP's bottom-up layout and derives the 1-bpp AND mask from
+ * alpha. Uses a 32-bpp color pointer (POINTER_NEW); if w/h exceed 96 and
+ * `allow_large` is set, uses POINTER_LARGE (≤384²), otherwise downsamples to
+ * fit 96². (hot_x,hot_y) is the hotspot in pixels from top-left. */
+int32_t macrdp_session_send_pointer_shape(macrdp_session_t session,
+                                          int32_t width, int32_t height,
+                                          int32_t hot_x, int32_t hot_y,
+                                          const uint8_t *bgra,
+                                          int32_t allow_large);
+
+/* Hide the pointer (system null cursor). */
+int32_t macrdp_session_send_pointer_hidden(macrdp_session_t session);
 
 /* Override the desktop size the bridge uses for RESETGRAPHICS /
  * CreateSurface / MapSurfaceToOutput. Call before the first
