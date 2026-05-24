@@ -166,6 +166,35 @@ typedef void (*macrdp_on_rdpdr_device_removed_fn)(
     void *ctx,
     uint32_t  device_id);
 
+/* RDPDR drive I/O completions. Every request carries a `token` chosen by
+ * Swift; the matching completion echoes it back so the caller can wake
+ * the right pending request. All fire on the FreeRDP channel thread.
+ *
+ * Directory enumeration streams: one query yields N entry callbacks
+ * (is_entry=1, fields valid), terminated by one with is_entry=0 (no
+ * fields; io_status carries the terminal status, e.g. STATUS_NO_MORE_FILES). */
+typedef void (*macrdp_on_rdpdr_dir_entry_fn)(
+    void *ctx, uint64_t token, int32_t is_entry, uint32_t io_status,
+    const char *name,            /* UTF-8; valid only when is_entry */
+    uint32_t file_attributes,
+    uint64_t size,
+    int64_t  mtime_unix_ms);
+
+typedef void (*macrdp_on_rdpdr_open_complete_fn)(
+    void *ctx, uint64_t token, uint32_t io_status,
+    uint32_t device_id, uint32_t file_id);
+
+typedef void (*macrdp_on_rdpdr_read_complete_fn)(
+    void *ctx, uint64_t token, uint32_t io_status,
+    const uint8_t *buffer, uint32_t length);
+
+typedef void (*macrdp_on_rdpdr_write_complete_fn)(
+    void *ctx, uint64_t token, uint32_t io_status, uint32_t bytes_written);
+
+/* close / create-dir / delete / rename all just report an io_status. */
+typedef void (*macrdp_on_rdpdr_status_complete_fn)(
+    void *ctx, uint64_t token, uint32_t io_status);
+
 /* AUDIN dynamic VC (Phase 5) */
 typedef void (*macrdp_on_audio_in_frame_fn)(
     void *ctx,
@@ -201,6 +230,12 @@ typedef struct macrdp_callbacks {
     macrdp_on_audio_format_selected_fn           on_audio_format_selected;
     macrdp_on_rdpdr_device_added_fn              on_rdpdr_device_added;
     macrdp_on_rdpdr_device_removed_fn            on_rdpdr_device_removed;
+    macrdp_on_rdpdr_dir_entry_fn                 on_rdpdr_dir_entry;
+    macrdp_on_rdpdr_open_complete_fn             on_rdpdr_open_complete;
+    macrdp_on_rdpdr_read_complete_fn             on_rdpdr_read_complete;
+    macrdp_on_rdpdr_write_complete_fn            on_rdpdr_write_complete;
+    macrdp_on_rdpdr_status_complete_fn           on_rdpdr_close_complete;
+    macrdp_on_rdpdr_status_complete_fn           on_rdpdr_simple_complete;
 } macrdp_callbacks;
 
 /* -------- session lifecycle --------------------------------------- */
@@ -382,6 +417,37 @@ int32_t macrdp_session_send_clip_lock(macrdp_session_t session,
 /* Tell the client we no longer need the snapshot — it can free it. */
 int32_t macrdp_session_send_clip_unlock(macrdp_session_t session,
                                          uint32_t        clipdata_id);
+
+/* -------- RDPDR drive I/O (server → client IRPs) ------------------ */
+/* Each takes a Swift-chosen `token` echoed back on the matching
+ * completion callback. `path` is a backslash-rooted Windows path
+ * relative to the drive root (e.g. "\\Users\\me\\file.txt", or "\\"
+ * + "*" pattern for a directory listing). Return MACRDP_OK if the IRP
+ * was enqueued. */
+int32_t macrdp_session_rdpdr_query_dir(macrdp_session_t s, uint64_t token,
+                                       uint32_t device_id, const char *path);
+int32_t macrdp_session_rdpdr_open_file(macrdp_session_t s, uint64_t token,
+                                       uint32_t device_id, const char *path,
+                                       uint32_t desired_access,
+                                       uint32_t create_disposition);
+int32_t macrdp_session_rdpdr_read_file(macrdp_session_t s, uint64_t token,
+                                       uint32_t device_id, uint32_t file_id,
+                                       uint32_t length, uint32_t offset);
+int32_t macrdp_session_rdpdr_write_file(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, uint32_t file_id,
+                                        const uint8_t *buffer, uint32_t length,
+                                        uint32_t offset);
+int32_t macrdp_session_rdpdr_close_file(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, uint32_t file_id);
+int32_t macrdp_session_rdpdr_create_dir(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, const char *path);
+int32_t macrdp_session_rdpdr_delete_file(macrdp_session_t s, uint64_t token,
+                                         uint32_t device_id, const char *path);
+int32_t macrdp_session_rdpdr_delete_dir(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, const char *path);
+int32_t macrdp_session_rdpdr_rename_file(macrdp_session_t s, uint64_t token,
+                                         uint32_t device_id, const char *old_path,
+                                         const char *new_path);
 
 /* -------- versioning ---------------------------------------------- */
 

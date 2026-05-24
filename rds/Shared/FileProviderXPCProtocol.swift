@@ -89,4 +89,42 @@ public protocol ExtensionToHostProtocol {
     func resolveItem(domainSubdir: String,
                      itemID: String,
                      reply: @escaping (Bool, NSError?) -> Void)
+
+    // MARK: Write path (RDPDR drives; clipboard replies unsupported)
+
+    /// Open `path` on the drive for writing (create or truncate), returning
+    /// an opaque file handle the extension uses for the following chunked
+    /// writes. `path` is the backslash item id.
+    func openWrite(domainSubdir: String,
+                   path: String,
+                   reply: @escaping (NSNumber?, NSError?) -> Void)
+
+    /// Write one chunk at `offset` to a handle from `openWrite`.
+    func writeChunk(domainSubdir: String,
+                    fileID: NSNumber,
+                    offset: Int64,
+                    data: Data,
+                    reply: @escaping (NSError?) -> Void)
+
+    /// Finish a write session (closes the client file handle).
+    func closeWrite(domainSubdir: String,
+                    fileID: NSNumber,
+                    reply: @escaping (NSError?) -> Void)
+
+    /// Create a directory at `path` (backslash item id).
+    func createDirectory(domainSubdir: String,
+                         path: String,
+                         reply: @escaping (NSError?) -> Void)
+
+    /// Delete the file or directory at `path`.
+    func deleteItem(domainSubdir: String,
+                    path: String,
+                    isDirectory: Bool,
+                    reply: @escaping (NSError?) -> Void)
+
+    /// Rename / move from `oldPath` to `newPath` (both backslash item ids).
+    func renameItem(domainSubdir: String,
+                    oldPath: String,
+                    newPath: String,
+                    reply: @escaping (NSError?) -> Void)
 }

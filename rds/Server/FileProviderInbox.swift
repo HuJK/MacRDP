@@ -51,10 +51,14 @@ final class FileProviderInbox {
     /// daemon cache (left over from earlier broken extension binaries)
     /// gets wiped — without this, fileproviderd can keep serving an
     /// empty domain even after we publish a fresh manifest.
-    func register() async {
+    /// `hidden` registers the domain without showing it in Finder's
+    /// sidebar (still fully functional — storage on disk, paste URLs
+    /// resolve). Used for the clipboard staging domain.
+    func register(hidden: Bool = false) async {
         let domain = NSFileProviderDomain(
             identifier: domainIdentifier,
             displayName: domainDisplayName)
+        domain.isHidden = hidden
 
         // Pre-add scrub: remove any prior registration of this domain.
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in

@@ -46,7 +46,8 @@ final class FileProviderXPCService: NSObject {
 
 /// `exportedObject` for the NSFileProviderService connection on the host
 /// side — the extension calls into this when it needs bytes / children /
-/// item resolution. Delegates to the shared `CopyEventStore`.
+/// item resolution. Routes by domain: redirected RDP drives go to the
+/// live `DriveStore`, everything else to the clipboard `CopyEventStore`.
 final class HostFileProviderExporter: NSObject, ExtensionToHostProtocol {
 
     nonisolated func fetchBytes(domainSubdir: String,
@@ -54,29 +55,102 @@ final class HostFileProviderExporter: NSObject, ExtensionToHostProtocol {
                                 offset: Int64,
                                 length: Int64,
                                 reply: @escaping (Data?, NSError?) -> Void) {
-        CopyEventStore.shared.handleFetch(
-            domainSubdir: domainSubdir,
-            itemID: itemID,
-            offset: offset,
-            length: length,
-            reply: reply)
+        if DriveStore.shared.handles(domainSubdir: domainSubdir) {
+            DriveStore.shared.handleFetch(
+                domainSubdir: domainSubdir, itemID: itemID,
+                offset: offset, length: length, reply: reply)
+        } else {
+            CopyEventStore.shared.handleFetch(
+                domainSubdir: domainSubdir, itemID: itemID,
+                offset: offset, length: length, reply: reply)
+        }
     }
 
     nonisolated func enumerateChildren(domainSubdir: String,
                                        containerID: String,
                                        reply: @escaping (Data?, NSError?) -> Void) {
-        CopyEventStore.shared.handleEnumerateChildren(
-            domainSubdir: domainSubdir,
-            containerID: containerID,
-            reply: reply)
+        if DriveStore.shared.handles(domainSubdir: domainSubdir) {
+            DriveStore.shared.handleEnumerateChildren(
+                domainSubdir: domainSubdir, containerID: containerID, reply: reply)
+        } else {
+            CopyEventStore.shared.handleEnumerateChildren(
+                domainSubdir: domainSubdir, containerID: containerID, reply: reply)
+        }
     }
 
     nonisolated func resolveItem(domainSubdir: String,
                                   itemID: String,
                                   reply: @escaping (Bool, NSError?) -> Void) {
-        CopyEventStore.shared.handleResolveItem(
-            domainSubdir: domainSubdir,
-            itemID: itemID,
-            reply: reply)
+        if DriveStore.shared.handles(domainSubdir: domainSubdir) {
+            DriveStore.shared.handleResolveItem(
+                domainSubdir: domainSubdir, itemID: itemID, reply: reply)
+        } else {
+            CopyEventStore.shared.handleResolveItem(
+                domainSubdir: domainSubdir, itemID: itemID, reply: reply)
+        }
+    }
+
+    // MARK: Write path — only drive domains; clipboard is read-only.
+
+    nonisolated func openWrite(domainSubdir: String, path: String,
+                               reply: @escaping (NSNumber?, NSError?) -> Void) {
+        guard DriveStore.shared.handles(domainSubdir: domainSubdir) else {
+            reply(nil, Self.readOnly()); return
+        }
+        if let session = DriveStore.shared.openForWrite(itemID: path) {
+            reply(NSNumber(value: session), nil)
+        } else {
+            reply(nil, Self.ioErr())
+        }
+    }
+
+    nonisolated func writeChunk(domainSubdir: String, fileID: NSNumber, offset: Int64,
+                                data: Data, reply: @escaping (NSError?) -> Void) {
+        guard DriveStore.shared.handles(domainSubdir: domainSubdir) else {
+            reply(Self.readOnly()); return
+        }
+        reply(DriveStore.shared.writeChunk(session: fileID.uint32Value,
+                                           offset: offset, data: data) ? nil : Self.ioErr())
+    }
+
+    nonisolated func closeWrite(domainSubdir: String, fileID: NSNumber,
+                                reply: @escaping (NSError?) -> Void) {
+        guard DriveStore.shared.handles(domainSubdir: domainSubdir) else {
+            reply(Self.readOnly()); return
+        }
+        reply(DriveStore.shared.closeWrite(session: fileID.uint32Value) ? nil : Self.ioErr())
+    }
+
+    nonisolated func createDirectory(domainSubdir: String, path: String,
+                                     reply: @escaping (NSError?) -> Void) {
+        guard DriveStore.shared.handles(domainSubdir: domainSubdir) else {
+            reply(Self.readOnly()); return
+        }
+        reply(DriveStore.shared.createDirectory(itemID: path) ? nil : Self.ioErr())
+    }
+
+    nonisolated func deleteItem(domainSubdir: String, path: String, isDirectory: Bool,
+                                reply: @escaping (NSError?) -> Void) {
+        guard DriveStore.shared.handles(domainSubdir: domainSubdir) else {
+            reply(Self.readOnly()); return
+        }
+        reply(DriveStore.shared.deleteItem(itemID: path, isDirectory: isDirectory) ? nil : Self.ioErr())
+    }
+
+    nonisolated func renameItem(domainSubdir: String, oldPath: String, newPath: String,
+                                reply: @escaping (NSError?) -> Void) {
+        guard DriveStore.shared.handles(domainSubdir: domainSubdir) else {
+            reply(Self.readOnly()); return
+        }
+        reply(DriveStore.shared.renameItem(oldItemID: oldPath, newItemID: newPath) ? nil : Self.ioErr())
+    }
+
+    private static func readOnly() -> NSError {
+        NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError,
+                userInfo: [NSLocalizedDescriptionKey: "This domain is read-only"])
+    }
+    private static func ioErr() -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(EIO),
+                userInfo: [NSLocalizedDescriptionKey: "Drive write failed"])
     }
 }

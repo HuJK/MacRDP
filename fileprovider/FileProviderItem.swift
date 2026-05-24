@@ -14,10 +14,14 @@ import Foundation
 final class FileProviderItem: NSObject, NSFileProviderItem {
     private let entry: ManifestItem
     private let manifestSessionID: String
+    /// Writable domains (RDPDR drives) advertise create/move capabilities;
+    /// the clipboard domain stays read-only (copy-out only).
+    private let isWritable: Bool
 
-    init(_ entry: ManifestItem, manifestSessionID: String) {
+    init(_ entry: ManifestItem, manifestSessionID: String, isWritable: Bool = false) {
         self.entry = entry
         self.manifestSessionID = manifestSessionID
+        self.isWritable = isWritable
     }
 
     var itemIdentifier: NSFileProviderItemIdentifier {
@@ -58,11 +62,18 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// support writing back INTO the domain — but the clipboard staging
     /// folder is only ever copied OUT of, so no modify path is exercised.)
     var capabilities: NSFileProviderItemCapabilities {
-        return entry.isDirectory
+        var caps: NSFileProviderItemCapabilities = entry.isDirectory
             ? [.allowsReading, .allowsContentEnumerating, .allowsWriting,
                .allowsDeleting, .allowsRenaming, .allowsTrashing]
             : [.allowsReading, .allowsWriting,
                .allowsDeleting, .allowsRenaming, .allowsTrashing]
+        if isWritable {
+            // Write-back to the client drive: allow moving items in, and
+            // creating new children inside folders.
+            caps.insert(.allowsReparenting)
+            if entry.isDirectory { caps.insert(.allowsAddingSubItems) }
+        }
+        return caps
     }
 
     /// Surface the item to Finder as a normal user-readable AND
@@ -104,13 +115,20 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 /// enumeration into the manifest items.
 final class RootFileProviderItem: NSObject, NSFileProviderItem {
     let displayName: String
-    init(displayName: String) { self.displayName = displayName }
+    private let isWritable: Bool
+    init(displayName: String, isWritable: Bool = false) {
+        self.displayName = displayName
+        self.isWritable = isWritable
+    }
     var itemIdentifier: NSFileProviderItemIdentifier { .rootContainer }
     var parentItemIdentifier: NSFileProviderItemIdentifier { .rootContainer }
     var filename: String { displayName }
     var contentType: UTType { .folder }
     var capabilities: NSFileProviderItemCapabilities {
-        [.allowsReading, .allowsContentEnumerating  , .allowsWriting]
+        var caps: NSFileProviderItemCapabilities =
+            [.allowsReading, .allowsContentEnumerating, .allowsWriting]
+        if isWritable { caps.insert(.allowsAddingSubItems) }
+        return caps
     }
     var fileSystemFlags: NSFileProviderFileSystemFlags {
         [.userReadable, .userWritable, .userExecutable]

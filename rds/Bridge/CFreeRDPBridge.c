@@ -845,6 +845,69 @@ static UINT rdpdr_on_drive_delete_cb(RdpdrServerContext *ctx,
     return CHANNEL_RC_OK;
 }
 
+/* FILETIME (100-ns ticks since 1601-01-01) → Unix epoch milliseconds. */
+static int64_t rdpdr_filetime_to_unix_ms(int64_t ft) {
+    if (ft <= 0) return 0;
+    return ft / 10000LL - 11644473600000LL;
+}
+
+/* --- Drive I/O completion callbacks (fire on the channel thread). The
+ *     IRP's CallbackData carries the Swift-chosen token verbatim. --- */
+
+static void rdpdr_query_dir_complete_cb(RdpdrServerContext *ctx, void *cbData,
+                                        UINT32 ioStatus,
+                                        FILE_DIRECTORY_INFORMATION *fdi) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (!s || !s->cbs.on_rdpdr_dir_entry) return;
+    uint64_t token = (uint64_t)(uintptr_t)cbData;
+    if (fdi) {
+        s->cbs.on_rdpdr_dir_entry(
+            s->swift_ctx, token, 1, ioStatus,
+            fdi->FileName, fdi->FileAttributes,
+            (uint64_t)fdi->EndOfFile.QuadPart,
+            rdpdr_filetime_to_unix_ms(fdi->LastWriteTime.QuadPart));
+    } else {
+        s->cbs.on_rdpdr_dir_entry(s->swift_ctx, token, 0, ioStatus, NULL, 0, 0, 0);
+    }
+}
+
+static void rdpdr_open_complete_cb(RdpdrServerContext *ctx, void *cbData,
+                                   UINT32 ioStatus, UINT32 deviceId, UINT32 fileId) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (s && s->cbs.on_rdpdr_open_complete)
+        s->cbs.on_rdpdr_open_complete(s->swift_ctx, (uint64_t)(uintptr_t)cbData,
+                                      ioStatus, deviceId, fileId);
+}
+
+static void rdpdr_read_complete_cb(RdpdrServerContext *ctx, void *cbData,
+                                   UINT32 ioStatus, const char *buffer, UINT32 length) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (s && s->cbs.on_rdpdr_read_complete)
+        s->cbs.on_rdpdr_read_complete(s->swift_ctx, (uint64_t)(uintptr_t)cbData,
+                                      ioStatus, (const uint8_t*)buffer, length);
+}
+
+static void rdpdr_write_complete_cb(RdpdrServerContext *ctx, void *cbData,
+                                    UINT32 ioStatus, UINT32 bytesWritten) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (s && s->cbs.on_rdpdr_write_complete)
+        s->cbs.on_rdpdr_write_complete(s->swift_ctx, (uint64_t)(uintptr_t)cbData,
+                                       ioStatus, bytesWritten);
+}
+
+static void rdpdr_close_complete_cb(RdpdrServerContext *ctx, void *cbData, UINT32 ioStatus) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (s && s->cbs.on_rdpdr_close_complete)
+        s->cbs.on_rdpdr_close_complete(s->swift_ctx, (uint64_t)(uintptr_t)cbData, ioStatus);
+}
+
+/* create-dir / delete-dir / delete-file / rename all just report status. */
+static void rdpdr_simple_complete_cb(RdpdrServerContext *ctx, void *cbData, UINT32 ioStatus) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (s && s->cbs.on_rdpdr_simple_complete)
+        s->cbs.on_rdpdr_simple_complete(s->swift_ctx, (uint64_t)(uintptr_t)cbData, ioStatus);
+}
+
 static void try_open_rdpdr(struct macrdp_session *s) {
     if (s->rdpdr_open || !s->cfg.enable_rdpdr) return;
     if (!atomic_load(&s->activated)) return;
@@ -866,6 +929,16 @@ static void try_open_rdpdr(struct macrdp_session *s) {
     ctx->supported  = RDPDR_DTYP_FILESYSTEM;
     ctx->OnDriveCreate = rdpdr_on_drive_create_cb;
     ctx->OnDriveDelete = rdpdr_on_drive_delete_cb;
+    /* Drive I/O completions → Swift (DriveStore). */
+    ctx->OnDriveQueryDirectoryComplete  = rdpdr_query_dir_complete_cb;
+    ctx->OnDriveOpenFileComplete        = rdpdr_open_complete_cb;
+    ctx->OnDriveReadFileComplete        = rdpdr_read_complete_cb;
+    ctx->OnDriveWriteFileComplete       = rdpdr_write_complete_cb;
+    ctx->OnDriveCloseFileComplete       = rdpdr_close_complete_cb;
+    ctx->OnDriveCreateDirectoryComplete = rdpdr_simple_complete_cb;
+    ctx->OnDriveDeleteDirectoryComplete = rdpdr_simple_complete_cb;
+    ctx->OnDriveDeleteFileComplete      = rdpdr_simple_complete_cb;
+    ctx->OnDriveRenameFileComplete      = rdpdr_simple_complete_cb;
 
     UINT rc = ctx->Start(ctx);
     if (rc != CHANNEL_RC_OK) {
@@ -1877,6 +1950,118 @@ int32_t macrdp_session_send_clip_unlock(macrdp_session_t s, uint32_t clipdata_id
     return rc == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL;
 #else
     (void)s; (void)clipdata_id;
+    return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+/* -------- RDPDR drive I/O (server → client IRPs) ------------------ */
+
+#if MACRDP_HAVE_FREERDP
+#  define RDPDR_TOKEN(t) ((void*)(uintptr_t)(t))
+#  define RDPDR_GUARD(s)  if (!(s) || !(s)->rdpdr) return MACRDP_E_NOT_IMPLEMENTED
+#  define RDPDR_RET(rc)   return ((rc) == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL)
+#endif
+
+int32_t macrdp_session_rdpdr_query_dir(macrdp_session_t s, uint64_t token,
+                                       uint32_t device_id, const char *path) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveQueryDirectory(s->rdpdr, RDPDR_TOKEN(token), device_id, path));
+#else
+    (void)s;(void)token;(void)device_id;(void)path; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_open_file(macrdp_session_t s, uint64_t token,
+                                       uint32_t device_id, const char *path,
+                                       uint32_t desired_access,
+                                       uint32_t create_disposition) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveOpenFile(s->rdpdr, RDPDR_TOKEN(token), device_id, path,
+                                      desired_access, create_disposition));
+#else
+    (void)s;(void)token;(void)device_id;(void)path;
+    (void)desired_access;(void)create_disposition; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_read_file(macrdp_session_t s, uint64_t token,
+                                       uint32_t device_id, uint32_t file_id,
+                                       uint32_t length, uint32_t offset) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveReadFile(s->rdpdr, RDPDR_TOKEN(token), device_id,
+                                      file_id, length, offset));
+#else
+    (void)s;(void)token;(void)device_id;(void)file_id;
+    (void)length;(void)offset; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_write_file(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, uint32_t file_id,
+                                        const uint8_t *buffer, uint32_t length,
+                                        uint32_t offset) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveWriteFile(s->rdpdr, RDPDR_TOKEN(token), device_id, file_id,
+                                       (const char*)buffer, length, offset));
+#else
+    (void)s;(void)token;(void)device_id;(void)file_id;
+    (void)buffer;(void)length;(void)offset; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_close_file(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, uint32_t file_id) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveCloseFile(s->rdpdr, RDPDR_TOKEN(token), device_id, file_id));
+#else
+    (void)s;(void)token;(void)device_id;(void)file_id; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_create_dir(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, const char *path) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveCreateDirectory(s->rdpdr, RDPDR_TOKEN(token), device_id, path));
+#else
+    (void)s;(void)token;(void)device_id;(void)path; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_delete_file(macrdp_session_t s, uint64_t token,
+                                         uint32_t device_id, const char *path) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveDeleteFile(s->rdpdr, RDPDR_TOKEN(token), device_id, path));
+#else
+    (void)s;(void)token;(void)device_id;(void)path; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_delete_dir(macrdp_session_t s, uint64_t token,
+                                        uint32_t device_id, const char *path) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveDeleteDirectory(s->rdpdr, RDPDR_TOKEN(token), device_id, path));
+#else
+    (void)s;(void)token;(void)device_id;(void)path; return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+int32_t macrdp_session_rdpdr_rename_file(macrdp_session_t s, uint64_t token,
+                                         uint32_t device_id, const char *old_path,
+                                         const char *new_path) {
+#if MACRDP_HAVE_FREERDP
+    RDPDR_GUARD(s);
+    RDPDR_RET(s->rdpdr->DriveRenameFile(s->rdpdr, RDPDR_TOKEN(token), device_id,
+                                        old_path, new_path));
+#else
+    (void)s;(void)token;(void)device_id;(void)old_path;(void)new_path;
     return MACRDP_E_NOT_IMPLEMENTED;
 #endif
 }

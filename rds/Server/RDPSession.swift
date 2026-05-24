@@ -113,6 +113,7 @@ final class RDPSession {
         audioIn?.stop()
         clipboard?.stop()
         #if MACRDP_BRIDGE_AVAILABLE
+        if let bridge { DriveStore.shared.removeAllDrives(adapter: bridge) }
         bridge?.requestStop()
         bridge = nil
         #endif
@@ -226,10 +227,11 @@ final class RDPSession {
         sinks.onClipFileContentsResponse = { [weak self] sid, data in
             self?.clipboard?.handleClientFileContentsResponse(streamID: sid, data: data)
         }
-        // RDPDR Phase 1: just log device announces. Later phases will
-        // register a per-drive FileProvider domain and stream reads
-        // back through the same XPC pipeline the clipboard uses.
-        sinks.onRdpdrDeviceAdded = { id, type, dos in
+        // RDPDR drive redirection: mount each announced filesystem device
+        // as its own FileProvider domain; route browse/read IRPs through
+        // DriveStore. Completions are token-correlated, so they just need
+        // the shared store (no session reference).
+        sinks.onRdpdrDeviceAdded = { [weak self] id, type, dos in
             let kind: String
             switch type {
             case 0x01: kind = "SERIAL"
@@ -240,9 +242,33 @@ final class RDPSession {
             default:   kind = String(format: "0x%X", type)
             }
             Log.session.notice("RDPDR device announced: id=\(id, privacy: .public) type=\(kind, privacy: .public) name='\(dos, privacy: .public)'")
+            // OnDriveCreate only fires for filesystem devices, but guard anyway.
+            guard type == 0x08, let bridge = self?.bridge else { return }
+            DriveStore.shared.addDrive(adapter: bridge, deviceID: id, dosName: dos)
         }
-        sinks.onRdpdrDeviceRemoved = { id in
+        sinks.onRdpdrDeviceRemoved = { [weak self] id in
             Log.session.notice("RDPDR device removed: id=\(id, privacy: .public)")
+            guard let bridge = self?.bridge else { return }
+            DriveStore.shared.removeDrive(adapter: bridge, deviceID: id)
+        }
+        sinks.onRdpdrDirEntry = { token, isEntry, ioStatus, name, attrs, size, mtime in
+            DriveStore.shared.onDirEntry(token: token, isEntry: isEntry, ioStatus: ioStatus,
+                                         name: name, attributes: attrs, size: size, mtimeMs: mtime)
+        }
+        sinks.onRdpdrOpenComplete = { token, st, dev, fid in
+            DriveStore.shared.onOpenComplete(token: token, ioStatus: st, deviceID: dev, fileID: fid)
+        }
+        sinks.onRdpdrReadComplete = { token, st, data in
+            DriveStore.shared.onReadComplete(token: token, ioStatus: st, data: data)
+        }
+        sinks.onRdpdrWriteComplete = { token, st, bw in
+            DriveStore.shared.onWriteComplete(token: token, ioStatus: st, bytesWritten: bw)
+        }
+        sinks.onRdpdrCloseComplete = { token, st in
+            DriveStore.shared.onCloseComplete(token: token, ioStatus: st)
+        }
+        sinks.onRdpdrSimpleComplete = { token, st in
+            DriveStore.shared.onSimpleComplete(token: token, ioStatus: st)
         }
 
         let cfgWithPaths = withTLSPaths(certPath: certPath, keyPath: keyPath)

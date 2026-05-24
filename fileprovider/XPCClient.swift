@@ -191,3 +191,118 @@ enum HostByteFetcher {
         }
     }
 }
+
+// MARK: - Write path (extension → host)
+
+/// Drives the EXTENSION → HOST write operations for RDPDR drive domains:
+/// create / modify (content + rename/move) / delete. All async wrappers
+/// over the `ExtensionToHostProtocol` write methods.
+enum HostWriteOps {
+
+    static let chunkSize = 1024 * 1024
+
+    /// Create or overwrite the file at `path` with the bytes of `localURL`
+    /// (nil → an empty file). Opens a write handle, streams chunks, closes.
+    static func writeFile(source: ClipboardServiceSource,
+                          domainSubdir: String,
+                          path: String,
+                          localURL: URL?) async throws {
+        let fileID = try await openWrite(source: source, domainSubdir: domainSubdir, path: path)
+        do {
+            if let localURL {
+                let handle = try FileHandle(forReadingFrom: localURL)
+                defer { try? handle.close() }
+                var offset: Int64 = 0
+                while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+                    try await writeChunk(source: source, domainSubdir: domainSubdir,
+                                         fileID: fileID, offset: offset, data: chunk)
+                    offset += Int64(chunk.count)
+                }
+            }
+        } catch {
+            _ = try? await closeWrite(source: source, domainSubdir: domainSubdir, fileID: fileID)
+            throw error
+        }
+        try await closeWrite(source: source, domainSubdir: domainSubdir, fileID: fileID)
+    }
+
+    static func createDirectory(source: ClipboardServiceSource,
+                                domainSubdir: String, path: String) async throws {
+        try await simpleOp(source: source) { proxy, done in
+            proxy.createDirectory(domainSubdir: domainSubdir, path: path, reply: done)
+        }
+    }
+
+    static func delete(source: ClipboardServiceSource, domainSubdir: String,
+                       path: String, isDirectory: Bool) async throws {
+        try await simpleOp(source: source) { proxy, done in
+            proxy.deleteItem(domainSubdir: domainSubdir, path: path,
+                             isDirectory: isDirectory, reply: done)
+        }
+    }
+
+    static func rename(source: ClipboardServiceSource, domainSubdir: String,
+                       oldPath: String, newPath: String) async throws {
+        try await simpleOp(source: source) { proxy, done in
+            proxy.renameItem(domainSubdir: domainSubdir, oldPath: oldPath,
+                             newPath: newPath, reply: done)
+        }
+    }
+
+    // MARK: - primitives
+
+    private static func openWrite(source: ClipboardServiceSource,
+                                  domainSubdir: String, path: String) async throws -> NSNumber {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NSNumber, Error>) in
+            var resumed = false
+            let proxy = source.hostProxy { err in
+                guard !resumed else { return }; resumed = true; cont.resume(throwing: err)
+            }
+            guard let proxy else { cont.resume(throwing: Self.noHost()); return }
+            proxy.openWrite(domainSubdir: domainSubdir, path: path) { fid, err in
+                guard !resumed else { return }; resumed = true
+                if let err { cont.resume(throwing: err) }
+                else if let fid { cont.resume(returning: fid) }
+                else { cont.resume(throwing: Self.noHost()) }
+            }
+        }
+    }
+
+    private static func writeChunk(source: ClipboardServiceSource, domainSubdir: String,
+                                   fileID: NSNumber, offset: Int64, data: Data) async throws {
+        try await simpleOp(source: source) { proxy, done in
+            proxy.writeChunk(domainSubdir: domainSubdir, fileID: fileID,
+                             offset: offset, data: data, reply: done)
+        }
+    }
+
+    @discardableResult
+    private static func closeWrite(source: ClipboardServiceSource, domainSubdir: String,
+                                   fileID: NSNumber) async throws -> Bool {
+        try await simpleOp(source: source) { proxy, done in
+            proxy.closeWrite(domainSubdir: domainSubdir, fileID: fileID, reply: done)
+        }
+        return true
+    }
+
+    /// Run an op whose reply is just an optional error.
+    private static func simpleOp(source: ClipboardServiceSource,
+                                 _ call: @escaping (ExtensionToHostProtocol, @escaping (NSError?) -> Void) -> Void) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            var resumed = false
+            let proxy = source.hostProxy { err in
+                guard !resumed else { return }; resumed = true; cont.resume(throwing: err)
+            }
+            guard let proxy else { cont.resume(throwing: Self.noHost()); return }
+            call(proxy) { err in
+                guard !resumed else { return }; resumed = true
+                if let err { cont.resume(throwing: err) } else { cont.resume(returning: ()) }
+            }
+        }
+    }
+
+    private static func noHost() -> NSError {
+        NSError(domain: "MacRDP.xpc.client", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "No host connection for write"])
+    }
+}

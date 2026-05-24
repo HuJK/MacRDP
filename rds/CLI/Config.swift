@@ -221,6 +221,11 @@ struct Config: Codable, Sendable {
         /// is averaged. Larger = smoother (small/fast files won't spike
         /// the number); smaller = more responsive. nil → 4s.
         var speedStatsWindowSec: Double?
+        /// Whether the clipboard FileProvider domain appears in Finder's
+        /// sidebar. The domain is a transient paste-staging area the user
+        /// never needs to browse, so it's hidden by default (registered +
+        /// functional, just not user-visible). nil → false (hidden).
+        var showInFinder: Bool?
     }
 
     /// Device redirection (MS-RDPEFS / RDPDR). Phase 1 of this feature
@@ -263,7 +268,7 @@ struct Config: Codable, Sendable {
             audioIn: .init(enabled: true, outputDeviceUID: nil),
             clipboard: .init(text: true, image: true, files: true,
                              maxFileSizeMiB: 4096, pollIntervalMs: 200,
-                             fileFetchMode: "lazy"),
+                             fileFetchMode: "lazy", showInFinder: false),
             rdpdr: .init(enabled: true)
         )
     }

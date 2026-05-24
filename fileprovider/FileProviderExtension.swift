@@ -11,6 +11,7 @@
 
 import FileProvider
 import Foundation
+import UniformTypeIdentifiers
 import os
 
 private let log = Logger(subsystem: "com.macrdp.server", category: "fileprovider")
@@ -19,6 +20,19 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
 
     let domain: NSFileProviderDomain
     let domainSubdir: String
+
+    /// Drive domains are read-write; the clipboard domain is read-only.
+    private var isWritable: Bool {
+        domainSubdir.hasPrefix(AppGroupShared.driveDomainPrefix)
+    }
+
+    /// Backslash drive path for a container id (root → "").
+    private func drivePath(forParent id: NSFileProviderItemIdentifier) -> String {
+        id == .rootContainer ? "" : id.rawValue
+    }
+    private func driveName(ofPath path: String) -> String {
+        path.split(separator: "\\").last.map(String.init) ?? path
+    }
 
     // Strong references to enumerators we've vended. Without this, ARC
     // can drop the enumerator the moment enumerator(for:) returns —
@@ -50,7 +64,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
               completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void) -> Progress {
         log.info("item(for:) id=\(identifier.rawValue, privacy: .public)")
         if identifier == .rootContainer {
-            completionHandler(RootFileProviderItem(displayName: domain.displayName), nil)
+            completionHandler(RootFileProviderItem(displayName: domain.displayName,
+                                                   isWritable: isWritable), nil)
             return Progress()
         }
         if identifier == .workingSet {
@@ -92,7 +107,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                                             code: NSFileProviderError.noSuchItem.rawValue))
             return Progress()
         }
-        completionHandler(FileProviderItem(entry, manifestSessionID: manifest.sessionID), nil)
+        completionHandler(FileProviderItem(entry, manifestSessionID: manifest.sessionID,
+                                           isWritable: isWritable), nil)
         return Progress()
     }
 
@@ -151,6 +167,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         let domainSubdir = self.domainSubdir
         let sessionID = manifest.sessionID
         let source = self.serviceSource
+        let writable = self.isWritable
 
         // Lazy fetch: stream bytes from the host over the
         // NSFileProviderService XPC connection (extension → host
@@ -172,7 +189,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                 log.info("fetchContents DONE id=\(itemID, privacy: .public) bytes=\(totalSize, privacy: .public) took=\(endMs - startMs, privacy: .public)ms")
                 progress.completedUnitCount = progress.totalUnitCount
                 completionHandler(tempURL,
-                                  FileProviderItem(entry, manifestSessionID: sessionID),
+                                  FileProviderItem(entry, manifestSessionID: sessionID,
+                                                   isWritable: writable),
                                   nil)
             } catch {
                 log.error("Host fetch failed: \(String(describing: error), privacy: .public)")
@@ -196,14 +214,51 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
 
     // MARK: - Read-only stubs
 
+    private static func unsupported() -> NSError {
+        NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError)
+    }
+
+    private static func fileSize(of url: URL?) -> Int64 {
+        guard let url, let v = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let s = v.fileSize else { return 0 }
+        return Int64(s)
+    }
+
     func createItem(basedOn itemTemplate: NSFileProviderItem,
                     fields: NSFileProviderItemFields,
                     contents url: URL?,
                     options: NSFileProviderCreateItemOptions = [],
                     request: NSFileProviderRequest,
                     completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
-        completionHandler(itemTemplate, [], false,
-                          NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+        guard isWritable else {
+            completionHandler(itemTemplate, [], false, Self.unsupported()); return Progress()
+        }
+        let parentPath = drivePath(forParent: itemTemplate.parentItemIdentifier)
+        let name = itemTemplate.filename
+        let path = parentPath + "\\" + name
+        let isDir = itemTemplate.contentType?.conforms(to: .folder) ?? false
+        let size = Self.fileSize(of: url)
+        let subdir = domainSubdir, source = serviceSource, writable = isWritable
+        log.info("createItem path='\(path, privacy: .public)' dir=\(isDir, privacy: .public)")
+        Task.detached {
+            do {
+                if isDir {
+                    try await HostWriteOps.createDirectory(source: source, domainSubdir: subdir, path: path)
+                } else {
+                    try await HostWriteOps.writeFile(source: source, domainSubdir: subdir,
+                                                     path: path, localURL: url)
+                }
+                let entry = ManifestItem(id: path, filename: name, size: size,
+                                         parentID: parentPath.isEmpty ? nil : parentPath,
+                                         isDirectory: isDir,
+                                         modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+                ManifestCache.shared.merge(items: [entry], domainSubdir: subdir)
+                completionHandler(FileProviderItem(entry, manifestSessionID: "drive",
+                                                   isWritable: writable), [], false, nil)
+            } catch {
+                completionHandler(itemTemplate, [], false, error as NSError)
+            }
+        }
         return Progress()
     }
 
@@ -214,8 +269,45 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     options: NSFileProviderModifyItemOptions = [],
                     request: NSFileProviderRequest,
                     completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void) -> Progress {
-        completionHandler(nil, [], false,
-                          NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+        guard isWritable else {
+            completionHandler(nil, [], false, Self.unsupported()); return Progress()
+        }
+        let oldPath = item.itemIdentifier.rawValue
+        let parentPath = drivePath(forParent: item.parentItemIdentifier)
+        let newPath = parentPath + "\\" + item.filename
+        let wantsRename = changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier)
+        let wantsContent = changedFields.contains(.contents)
+        let isDir = item.contentType?.conforms(to: .folder) ?? false
+        let cachedSize = ManifestCache.shared.items(domainSubdir: domainSubdir)
+            .first { $0.id == oldPath }?.size ?? 0
+        let newSize = wantsContent ? Self.fileSize(of: newContents) : cachedSize
+        let doRename = wantsRename && newPath != oldPath
+        let finalPath = doRename ? newPath : oldPath
+        let finalName = driveName(ofPath: finalPath)
+        let subdir = domainSubdir, source = serviceSource, writable = isWritable
+        log.info("modifyItem '\(oldPath, privacy: .public)' rename=\(wantsRename, privacy: .public) content=\(wantsContent, privacy: .public)")
+        Task.detached {
+            do {
+                if doRename {
+                    try await HostWriteOps.rename(source: source, domainSubdir: subdir,
+                                                  oldPath: oldPath, newPath: newPath)
+                }
+                if wantsContent {
+                    try await HostWriteOps.writeFile(source: source, domainSubdir: subdir,
+                                                     path: finalPath, localURL: newContents)
+                }
+                let entry = ManifestItem(id: finalPath, filename: finalName,
+                                         size: newSize,
+                                         parentID: parentPath.isEmpty ? nil : parentPath,
+                                         isDirectory: isDir,
+                                         modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+                ManifestCache.shared.merge(items: [entry], domainSubdir: subdir)
+                completionHandler(FileProviderItem(entry, manifestSessionID: "drive",
+                                                   isWritable: writable), [], false, nil)
+            } catch {
+                completionHandler(nil, [], false, error as NSError)
+            }
+        }
         return Progress()
     }
 
@@ -224,7 +316,21 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     options: NSFileProviderDeleteItemOptions = [],
                     request: NSFileProviderRequest,
                     completionHandler: @escaping (Error?) -> Void) -> Progress {
-        completionHandler(NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+        guard isWritable else { completionHandler(Self.unsupported()); return Progress() }
+        let path = identifier.rawValue
+        let isDir = ManifestCache.shared.items(domainSubdir: domainSubdir)
+            .first { $0.id == path }?.isDirectory ?? false
+        let subdir = domainSubdir, source = serviceSource
+        log.info("deleteItem '\(path, privacy: .public)' dir=\(isDir, privacy: .public)")
+        Task.detached {
+            do {
+                try await HostWriteOps.delete(source: source, domainSubdir: subdir,
+                                              path: path, isDirectory: isDir)
+                completionHandler(nil)
+            } catch {
+                completionHandler(error as NSError)
+            }
+        }
         return Progress()
     }
 

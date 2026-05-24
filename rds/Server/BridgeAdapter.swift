@@ -64,6 +64,20 @@ final class BridgePeer: @unchecked Sendable {
         var onRdpdrDeviceAdded: (_ deviceID: UInt32, _ deviceType: UInt32,
                                  _ dosName: String) -> Void = { _,_,_ in }
         var onRdpdrDeviceRemoved: (_ deviceID: UInt32) -> Void = { _ in }
+        // RDPDR drive-I/O completions (token-correlated). `isEntry`/`name`
+        // valid only for streamed directory entries; the terminal entry has
+        // isEntry=false and carries the final ioStatus.
+        var onRdpdrDirEntry: (_ token: UInt64, _ isEntry: Bool, _ ioStatus: UInt32,
+                              _ name: String, _ attributes: UInt32, _ size: UInt64,
+                              _ mtimeUnixMs: Int64) -> Void = { _,_,_,_,_,_,_ in }
+        var onRdpdrOpenComplete: (_ token: UInt64, _ ioStatus: UInt32,
+                                  _ deviceID: UInt32, _ fileID: UInt32) -> Void = { _,_,_,_ in }
+        var onRdpdrReadComplete: (_ token: UInt64, _ ioStatus: UInt32,
+                                  _ data: Data) -> Void = { _,_,_ in }
+        var onRdpdrWriteComplete: (_ token: UInt64, _ ioStatus: UInt32,
+                                   _ bytesWritten: UInt32) -> Void = { _,_,_ in }
+        var onRdpdrCloseComplete: (_ token: UInt64, _ ioStatus: UInt32) -> Void = { _,_ in }
+        var onRdpdrSimpleComplete: (_ token: UInt64, _ ioStatus: UInt32) -> Void = { _,_ in }
     }
 
     private var session: macrdp_session_t?
@@ -107,6 +121,12 @@ final class BridgePeer: @unchecked Sendable {
         cbs.on_suppress_output           = Self.cbSuppressOutput
         cbs.on_rdpdr_device_added        = Self.cbRdpdrDeviceAdded
         cbs.on_rdpdr_device_removed      = Self.cbRdpdrDeviceRemoved
+        cbs.on_rdpdr_dir_entry           = Self.cbRdpdrDirEntry
+        cbs.on_rdpdr_open_complete       = Self.cbRdpdrOpenComplete
+        cbs.on_rdpdr_read_complete       = Self.cbRdpdrReadComplete
+        cbs.on_rdpdr_write_complete      = Self.cbRdpdrWriteComplete
+        cbs.on_rdpdr_close_complete      = Self.cbRdpdrCloseComplete
+        cbs.on_rdpdr_simple_complete     = Self.cbRdpdrSimpleComplete
 
         var cfg = macrdp_session_config()
         cfg.require_nla              = config.auth.requireNLA ? 1 : 0
@@ -335,6 +355,84 @@ final class BridgePeer: @unchecked Sendable {
         _ = macrdp_session_send_clip_unlock(s, clipDataID)
     }
 
+    // MARK: - RDPDR drive I/O (server → client IRPs)
+
+    /// Serializes RDPDR send calls (FreeRDP's server send path isn't
+    /// re-entrant); the DriveStore issues these from FileProvider XPC
+    /// threads. Each returns false if the channel isn't up.
+    private let rdpdrSendLock = NSLock()
+
+    @discardableResult
+    func rdpdrQueryDir(token: UInt64, deviceID: UInt32, path: String) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_query_dir(s, token, deviceID, path) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrOpenFile(token: UInt64, deviceID: UInt32, path: String,
+                       desiredAccess: UInt32, createDisposition: UInt32) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_open_file(s, token, deviceID, path,
+                                              desiredAccess, createDisposition) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrReadFile(token: UInt64, deviceID: UInt32, fileID: UInt32,
+                       length: UInt32, offset: UInt32) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_read_file(s, token, deviceID, fileID, length, offset) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrWriteFile(token: UInt64, deviceID: UInt32, fileID: UInt32,
+                        data: Data, offset: UInt32) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return data.withUnsafeBytes { raw -> Bool in
+            let base = raw.bindMemory(to: UInt8.self).baseAddress
+            return macrdp_session_rdpdr_write_file(s, token, deviceID, fileID,
+                                                   base, UInt32(data.count), offset) == MACRDP_OK
+        }
+    }
+
+    @discardableResult
+    func rdpdrCloseFile(token: UInt64, deviceID: UInt32, fileID: UInt32) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_close_file(s, token, deviceID, fileID) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrCreateDir(token: UInt64, deviceID: UInt32, path: String) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_create_dir(s, token, deviceID, path) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrDeleteFile(token: UInt64, deviceID: UInt32, path: String) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_delete_file(s, token, deviceID, path) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrDeleteDir(token: UInt64, deviceID: UInt32, path: String) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_delete_dir(s, token, deviceID, path) == MACRDP_OK
+    }
+
+    @discardableResult
+    func rdpdrRenameFile(token: UInt64, deviceID: UInt32, oldPath: String, newPath: String) -> Bool {
+        guard let s = session else { return false }
+        rdpdrSendLock.lock(); defer { rdpdrSendLock.unlock() }
+        return macrdp_session_rdpdr_rename_file(s, token, deviceID, oldPath, newPath) == MACRDP_OK
+    }
+
     // MARK: - C trampolines
 
     private static func unmanagedSelf(_ ctx: UnsafeMutableRawPointer?) -> BridgePeer? {
@@ -444,6 +542,32 @@ final class BridgePeer: @unchecked Sendable {
     }
     private static let cbRdpdrDeviceRemoved: macrdp_on_rdpdr_device_removed_fn = { ctx, id in
         unmanagedSelf(ctx)?.sinks.onRdpdrDeviceRemoved(id)
+    }
+    private static let cbRdpdrDirEntry: macrdp_on_rdpdr_dir_entry_fn = {
+        ctx, token, isEntry, ioStatus, name, attrs, size, mtime in
+        let n = name.map { String(cString: $0) } ?? ""
+        unmanagedSelf(ctx)?.sinks.onRdpdrDirEntry(token, isEntry != 0, ioStatus, n, attrs, size, mtime)
+    }
+    private static let cbRdpdrOpenComplete: macrdp_on_rdpdr_open_complete_fn = {
+        ctx, token, ioStatus, deviceID, fileID in
+        unmanagedSelf(ctx)?.sinks.onRdpdrOpenComplete(token, ioStatus, deviceID, fileID)
+    }
+    private static let cbRdpdrReadComplete: macrdp_on_rdpdr_read_complete_fn = {
+        ctx, token, ioStatus, buffer, length in
+        let d = (buffer != nil && length > 0) ? Data(bytes: buffer!, count: Int(length)) : Data()
+        unmanagedSelf(ctx)?.sinks.onRdpdrReadComplete(token, ioStatus, d)
+    }
+    private static let cbRdpdrWriteComplete: macrdp_on_rdpdr_write_complete_fn = {
+        ctx, token, ioStatus, bytesWritten in
+        unmanagedSelf(ctx)?.sinks.onRdpdrWriteComplete(token, ioStatus, bytesWritten)
+    }
+    private static let cbRdpdrCloseComplete: macrdp_on_rdpdr_status_complete_fn = {
+        ctx, token, ioStatus in
+        unmanagedSelf(ctx)?.sinks.onRdpdrCloseComplete(token, ioStatus)
+    }
+    private static let cbRdpdrSimpleComplete: macrdp_on_rdpdr_status_complete_fn = {
+        ctx, token, ioStatus in
+        unmanagedSelf(ctx)?.sinks.onRdpdrSimpleComplete(token, ioStatus)
     }
 }
 

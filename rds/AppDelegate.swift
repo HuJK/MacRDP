@@ -138,7 +138,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Note: the host-side XPC channel is the
             // NSFileProviderService connection opened on first publish;
             // no Mach service listener to start up front.
-            await AppDelegate.sharedClipboardInbox.register()
+            // Clipboard is a transient paste-staging domain; hide it from
+            // Finder unless the user opts in via config.
+            await AppDelegate.sharedClipboardInbox.register(
+                hidden: !(config.clipboard.showInFinder ?? false))
             // Wire the copy-progress UI: it polls CopyEventStore for
             // progress snapshots (the store wakes it when work starts).
             CopyProgressTracker.shared.configure(
