@@ -70,6 +70,7 @@ typedef struct macrdp_raw_monitor {
 /* Audio format chosen at RDPSND activation. */
 #define MACRDP_AUDIO_FORMAT_PCM      0
 #define MACRDP_AUDIO_FORMAT_AAC      1
+#define MACRDP_AUDIO_FORMAT_OPUS     2
 
 /* Connection lifecycle */
 typedef void (*macrdp_on_activated_fn)(
@@ -262,6 +263,16 @@ typedef struct macrdp_session_config {
 
     /* Channel enables */
     int32_t     enable_audio_out;      /* 0/1 */
+    /* Preferred RDPSND codec: 0=none, 1=pcm, 2=aac, 3=opus. PCM is always
+     * advertised as a fallback for aac/opus. */
+    int32_t     audio_codec;
+    /* Drop-to-recover, from RDPSND block-confirm lag. Drift detector: drop
+     * while (shortWindow floor − refWindow floor) > drift_allowance; plus a
+     * hard backstop on the absolute short floor. All ms; 0 disables a part. */
+    int32_t     audio_lag_short_window_ms;
+    int32_t     audio_lag_ref_window_ms;
+    int32_t     audio_lag_drift_allowance_ms;
+    int32_t     audio_max_lag_ms;          /* backstop on short floor */
     int32_t     enable_audio_in;       /* 0/1 */
     int32_t     enable_clipboard;      /* 0/1 */
     int32_t     enable_disp;           /* 0/1 */

@@ -59,7 +59,12 @@ final class RDPSession {
         let bridge: BridgePeer
         #endif
         private let lock = NSLock()
-        private var encoder: AACEncoder?
+        private var encoder: CompressedAudioEncoder?
+        /// True only when the client negotiated raw PCM. When a compressed
+        /// format was negotiated but the encoder failed, we must NOT ship raw
+        /// PCM (the client would decode it as the compressed format = garbage)
+        /// — we drop instead.
+        private var rawPCMOK = true
 
         #if MACRDP_BRIDGE_AVAILABLE
         init(bridge: BridgePeer) { self.bridge = bridge }
@@ -67,21 +72,21 @@ final class RDPSession {
         init() {}
         #endif
 
-        func setEncoder(_ enc: AACEncoder?) {
-            lock.lock(); encoder = enc; lock.unlock()
+        func setEncoder(_ enc: CompressedAudioEncoder?, allowRawPCM: Bool) {
+            lock.lock(); encoder = enc; rawPCMOK = allowRawPCM; lock.unlock()
         }
 
         func ingest(_ pcm: Data) {
             lock.lock()
             let enc = encoder
+            let pcmOK = rawPCMOK
             lock.unlock()
             #if MACRDP_BRIDGE_AVAILABLE
             if let enc {
-                let packets = enc.encode(pcm: pcm)
-                for p in packets {
-                    bridge.sendAudioAAC(p.data, pcmSampleCount: p.pcmSampleCount)
+                for p in enc.encode(pcm: pcm) {
+                    bridge.sendAudioCompressed(p.data, pcmSampleCount: p.pcmSampleCount)
                 }
-            } else {
+            } else if pcmOK {
                 bridge.sendAudioPCM(pcm)
             }
             #endif
@@ -214,15 +219,29 @@ final class RDPSession {
                 case .aac:
                     do {
                         let enc = try AACEncoder()
-                        self.audioPath?.setEncoder(enc)
+                        self.audioPath?.setEncoder(enc, allowRawPCM: false)
                         Log.audioOut.notice("Audio: AAC-LC selected (HW-accelerated encoder)")
                     } catch {
-                        Log.audioOut.error("AAC encoder init failed, staying on PCM: \(String(describing: error), privacy: .public)")
-                        self.audioPath?.setEncoder(nil)
+                        // AAC negotiated but encoder unavailable → drop (don't
+                        // mislabel raw PCM as AAC).
+                        Log.audioOut.error("AAC encoder init failed, dropping audio: \(String(describing: error), privacy: .public)")
+                        self.audioPath?.setEncoder(nil, allowRawPCM: false)
+                    }
+                case .opus:
+                    do {
+                        let ao = self.config.audioOut
+                        let frames = max(120, 48 * max(1, ao.opusFrameMs))   // 48 samples/ms @ 48k
+                        let enc = try OpusEncoder(bitRate: max(8, ao.opusBitrateKbps) * 1000,
+                                                  framesPerPacket: frames)
+                        self.audioPath?.setEncoder(enc, allowRawPCM: false)
+                        Log.audioOut.notice("Audio: Opus selected (AudioToolbox encoder)")
+                    } catch {
+                        Log.audioOut.error("Opus encoder init failed, dropping audio: \(String(describing: error), privacy: .public)")
+                        self.audioPath?.setEncoder(nil, allowRawPCM: false)
                     }
                 case .pcm:
-                    self.audioPath?.setEncoder(nil)
-                    Log.audioOut.notice("Audio: PCM selected (mstsc didn't pick AAC)")
+                    self.audioPath?.setEncoder(nil, allowRawPCM: true)
+                    Log.audioOut.notice("Audio: PCM selected")
                 }
             }
         }
@@ -396,7 +415,7 @@ final class RDPSession {
         // self.audioPath, which is a single object the
         // onAudioFormatSelected callback updates with an AAC encoder
         // when mstsc picks AAC. No need to rebuild the pipeline.
-        let audioEnabled = config.audioOut.enabled && audioMode == .playOnThisComputer
+        let audioEnabled = config.audioOut.effectivelyEnabled && audioMode == .playOnThisComputer
         let audioHandler: DisplayPipeline.AudioFrameHandler?
         if audioEnabled {
             let path = AudioPath(bridge: bridge)

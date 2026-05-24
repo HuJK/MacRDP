@@ -350,7 +350,19 @@ struct Config: Codable, Sendable {
 
     struct AudioOutConfig: Codable, Sendable {
         var enabled: Bool
-        var preferAAC: Bool
+
+        /// System-audio-out codec advertised to the client:
+        ///   "none" — don't send audio at all.
+        ///   "pcm"  — uncompressed 16-bit PCM (lossless, highest bandwidth,
+        ///            largest client jitter buffer).
+        ///   "aac"  — AAC-LC (HW-encoded; broad client support incl. mstsc).
+        ///   "opus" — Opus (HW/SW-encoded via AudioToolbox). Only FreeRDP
+        ///            clients decode it; others fall back to PCM in negotiation.
+        /// PCM is always advertised as a fallback for "aac"/"opus".
+        var codec: String
+
+        /// True when audio out should run at all.
+        var effectivelyEnabled: Bool { enabled && codec.lowercased() != "none" }
 
         /// Control whether captured system audio also plays on the
         /// physical Mac speakers. Maps to CATapDescription.muteBehavior:
@@ -362,6 +374,32 @@ struct Config: Codable, Sendable {
         ///   "always"     → .muted          (Mac silent regardless;
         ///                                    rarely useful)
         var muteLocalOutput: String   // "never" | "whileTapped" | "always"
+
+        /// Opus frame size in ms (2.5/5/10/20/40/60). Smaller = lower latency,
+        /// more overhead. 10 is a good low-latency default.
+        var opusFrameMs: Int
+        /// Opus target bitrate, kbps.
+        var opusBitrateKbps: Int
+
+        // --- drop-to-recover (bounds buffered audio latency) ---
+        // Latency is estimated from RDPSND block confirms (sent-vs-played
+        // timestamp gap). To tell *sustained* latency (a stall that won't
+        // drain, or clock skew) from harmless *jitter*, we track the windowed
+        // MINIMUM of that gap: jitter raises the max but not the floor, while
+        // accumulation raises the floor itself. We drop (skip sending) when the
+        // short-window floor drifts above the long-window floor — never on
+        // jitter. Codec-independent (PCM/AAC/Opus). All windows in ms.
+        /// Short window: the "current" latency floor.
+        var lagShortWindowMs: Int
+        /// Reference window: the best achievable floor to compare against.
+        var lagRefWindowMs: Int
+        /// Drop while (shortFloor − refFloor) exceeds this. 0 disables drift
+        /// detection.
+        var lagDriftAllowanceMs: Int
+        /// Hard backstop on the absolute short-window floor (ms). Catches very
+        /// slow clock skew that rises slower than the reference window forgets
+        /// (so drift stays small). 0 disables the backstop.
+        var maxLagMs: Int
     }
 
     struct AudioInConfig: Codable, Sendable {
@@ -450,8 +488,11 @@ struct Config: Codable, Sendable {
                            resizePolicy: "resize", resizePolicies: nil,
                            resizeHiDPIPolicy: "client"),
             input: .init(wheelPixelsPerNotch: 50),
-            audioOut: .init(enabled: true, preferAAC: true,
-                            muteLocalOutput: "always"),
+            audioOut: .init(enabled: true, codec: "aac",
+                            muteLocalOutput: "always",
+                            opusFrameMs: 10, opusBitrateKbps: 96,
+                            lagShortWindowMs: 1000, lagRefWindowMs: 20000,
+                            lagDriftAllowanceMs: 80, maxLagMs: 500),
             audioIn: .init(enabled: true, outputDeviceUID: nil),
             clipboard: .init(text: true, image: true, files: true,
                              maxFileSizeMiB: 4096, pollIntervalMs: 200,

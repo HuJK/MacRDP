@@ -16,14 +16,19 @@ import Foundation
 @preconcurrency import AVFoundation
 import os
 
-final class AACEncoder: @unchecked Sendable {
+/// One encoded audio packet + how many PCM input samples it covers.
+struct CompressedAudioPacket {
+    let data: Data
+    let pcmSampleCount: UInt32
+}
 
-    /// One encoded packet + how many PCM input samples it covers (the
-    /// AAC frame size — 1024 for LC, 512 for LD, 480 for ELD).
-    struct Packet {
-        let data: Data
-        let pcmSampleCount: UInt32
-    }
+/// A streaming PCM→compressed audio encoder (AAC, Opus, …) feeding RDPSND.
+protocol CompressedAudioEncoder: AnyObject, Sendable {
+    /// Feed Int16LE stereo PCM; return any whole packets produced.
+    func encode(pcm: Data) -> [CompressedAudioPacket]
+}
+
+final class AACEncoder: CompressedAudioEncoder, @unchecked Sendable {
 
     private let converter: AVAudioConverter
     private let inputFormat: AVAudioFormat
@@ -87,7 +92,7 @@ final class AACEncoder: @unchecked Sendable {
     /// produces. The encoder buffers partial frames internally, so
     /// chunks smaller than 1024 samples are fine — packets come out as
     /// they're ready.
-    func encode(pcm: Data) -> [Packet] {
+    func encode(pcm: Data) -> [CompressedAudioPacket] {
         let frameCount = pcm.count / 4   // Int16 stereo = 4 bytes/frame
         if frameCount == 0 { return [] }
 
@@ -105,7 +110,7 @@ final class AACEncoder: @unchecked Sendable {
             }
         }
 
-        var packets: [Packet] = []
+        var packets: [CompressedAudioPacket] = []
         var consumedInput = false
 
         // Drain the encoder until it tells us "need more input". The
@@ -141,7 +146,7 @@ final class AACEncoder: @unchecked Sendable {
                     let d = descs[i]
                     let bytes = Data(bytes: base.advanced(by: Int(d.mStartOffset)),
                                      count: Int(d.mDataByteSize))
-                    packets.append(Packet(data: bytes,
+                    packets.append(CompressedAudioPacket(data: bytes,
                                            pcmSampleCount: UInt32(framesPerPacket)))
                     bumpPacketStats(bytes: bytes.count)
                 }

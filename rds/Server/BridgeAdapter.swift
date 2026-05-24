@@ -32,10 +32,11 @@ final class BridgePeer: @unchecked Sendable {
         case playOnThisComputer = 2  // MACRDP_AUDIO_MODE_REDIRECTED
     }
 
-    /// Format mstsc chose at RDPSND activation.
+    /// Format the client chose at RDPSND activation.
     enum AudioFormat: Int32 {
-        case pcm = 0   // MACRDP_AUDIO_FORMAT_PCM
-        case aac = 1   // MACRDP_AUDIO_FORMAT_AAC
+        case pcm  = 0   // MACRDP_AUDIO_FORMAT_PCM
+        case aac  = 1   // MACRDP_AUDIO_FORMAT_AAC
+        case opus = 2   // MACRDP_AUDIO_FORMAT_OPUS
     }
 
     /// What the bridge calls back into.
@@ -142,7 +143,17 @@ final class BridgePeer: @unchecked Sendable {
             cfg.avc420_qp          = Int32(hy.videoQp ?? config.video.avc420Qp)
             cfg.avc420_quality_val = Int32(hy.videoQualityVal ?? config.video.avc420QualityVal)
         }
-        cfg.enable_audio_out         = config.audioOut.enabled ? 1 : 0
+        cfg.enable_audio_out         = config.audioOut.effectivelyEnabled ? 1 : 0
+        switch config.audioOut.codec.lowercased() {
+        case "none": cfg.audio_codec = 0
+        case "pcm":  cfg.audio_codec = 1
+        case "opus": cfg.audio_codec = 3
+        default:     cfg.audio_codec = 2   // aac
+        }
+        cfg.audio_lag_short_window_ms    = Int32(config.audioOut.lagShortWindowMs)
+        cfg.audio_lag_ref_window_ms      = Int32(config.audioOut.lagRefWindowMs)
+        cfg.audio_lag_drift_allowance_ms = Int32(config.audioOut.lagDriftAllowanceMs)
+        cfg.audio_max_lag_ms             = Int32(config.audioOut.maxLagMs)
         cfg.enable_audio_in          = config.audioIn.enabled  ? 1 : 0
         cfg.enable_clipboard         = (config.clipboard.text || config.clipboard.image
                                         || config.clipboard.files) ? 1 : 0
@@ -311,15 +322,15 @@ final class BridgePeer: @unchecked Sendable {
         return invoke(nil, 0)
     }
 
-    /// Ship one AAC-LC packet (raw frame bytes) via the Wave2 PDU path.
-    /// `pcmSampleCount` is how many PCM samples this packet decodes to
-    /// (1024 for AAC-LC). Used for the Wave2 audioTimeStamp field so
-    /// mstsc can pace playback precisely.
-    func sendAudioAAC(_ aac: Data, pcmSampleCount: UInt32) {
+    /// Ship one compressed audio packet (AAC or Opus raw frame bytes) via the
+    /// Wave2 PDU path, tagged with the negotiated client format index.
+    /// `pcmSampleCount` is how many PCM samples this packet decodes to (1024
+    /// for AAC-LC, 960 for 20 ms Opus). Used for the Wave2 audioTimeStamp.
+    func sendAudioCompressed(_ frame: Data, pcmSampleCount: UInt32) {
         guard let s = session else { return }
-        aac.withUnsafeBytes { raw in
+        frame.withUnsafeBytes { raw in
             let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self)
-            _ = macrdp_session_send_audio_aac(s, ptr, aac.count, pcmSampleCount)
+            _ = macrdp_session_send_audio_aac(s, ptr, frame.count, pcmSampleCount)
         }
     }
 

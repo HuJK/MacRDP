@@ -75,6 +75,10 @@ static os_log_t bridge_log(void) {
 
 /* -------- session struct ------------------------------------------ */
 
+/* 1-second buckets of the minimum observed audio lag, for the windowed-floor
+ * drift detector. 64 buckets = up to 64 s of reference history. */
+#define MACRDP_AUDIO_LAG_BUCKETS 64
+
 struct macrdp_session {
     int                    fd;
     void                  *swift_ctx;
@@ -134,6 +138,22 @@ struct macrdp_session {
     /* Sample-time monotonic counter for AAC's audioTimeStamp field
      * (UINT32 wraps at ~89000s @ 48kHz). */
     _Atomic uint32_t       audio_total_samples;
+    /* Playback-progress tracking (RDPSND block confirms). All wTimestamps are
+     * ms-since-activation mod 2^16. Lag = last_sent_ts - confirmed_ts. Used to
+     * drop-to-recover so a stall can't accumulate unbounded latency. */
+    _Atomic uint16_t       audio_last_sent_ts;
+    _Atomic uint16_t       audio_confirmed_ts;
+    _Atomic uint8_t        audio_confirmed_block;
+    _Atomic int32_t        audio_have_confirm;     /* 0 until first confirm */
+    _Atomic uint64_t       audio_lag_log_ms;       /* last periodic log time */
+    /* Windowed-floor drift state. Written only by the confirm callback (single
+     * channel thread → no lock); the send path reads the published floors. */
+    uint16_t               audio_lag_bucket[MACRDP_AUDIO_LAG_BUCKETS]; /* per-1s min, 0xFFFF=empty */
+    uint64_t               audio_lag_bucket_t0;    /* start ms of current bucket */
+    int32_t                audio_lag_head;         /* current bucket index */
+    int32_t                audio_lag_count;        /* valid buckets so far */
+    _Atomic int32_t        audio_short_floor_ms;   /* min lag over short window */
+    _Atomic int32_t        audio_drift_ms;         /* shortFloor − refFloor */
     /* MACRDP_AUDIO_MODE_* — resolved at Activate from client info PDU. */
     int32_t                audio_mode;
     /* AUDIN — client mic → server. */
@@ -448,11 +468,16 @@ static void rdpsnd_activated_cb(RdpsndServerContext *ctx) {
      * We MUST call SelectFormat to pick one and tell the client; only
      * after that does the channel become activated for SendSamples. */
 
-    /* Prefer AAC over PCM — mstsc's AAC jitter buffer is ~50-100ms vs
-     * PCM's ~300-500ms (and unbounded growth under clock skew). */
-    int pickedIdx = rdpsnd_match_format(ctx, WAVE_FORMAT_AAC_MS);
-    int32_t fmtType = MACRDP_AUDIO_FORMAT_AAC;
-    if (pickedIdx < 0) {
+    /* Prefer the configured codec, fall back to PCM (always advertised). */
+    UINT16 wantTag;
+    int32_t fmtType;
+    switch (s->cfg.audio_codec) {
+    case 1:  wantTag = WAVE_FORMAT_PCM;    fmtType = MACRDP_AUDIO_FORMAT_PCM;  break;
+    case 3:  wantTag = WAVE_FORMAT_OPUS;   fmtType = MACRDP_AUDIO_FORMAT_OPUS; break;
+    default: wantTag = WAVE_FORMAT_AAC_MS; fmtType = MACRDP_AUDIO_FORMAT_AAC;  break;
+    }
+    int pickedIdx = rdpsnd_match_format(ctx, wantTag);
+    if (pickedIdx < 0 && wantTag != WAVE_FORMAT_PCM) {
         pickedIdx = rdpsnd_match_format(ctx, WAVE_FORMAT_PCM);
         fmtType = MACRDP_AUDIO_FORMAT_PCM;
     }
@@ -478,11 +503,111 @@ static void rdpsnd_activated_cb(RdpsndServerContext *ctx) {
            pickedIdx,
            (unsigned)fmt->wFormatTag, (unsigned)fmt->nSamplesPerSec,
            (unsigned)fmt->nChannels, (unsigned)fmt->wBitsPerSample,
-           fmtType == MACRDP_AUDIO_FORMAT_AAC ? "AAC" : "PCM");
+           fmtType == MACRDP_AUDIO_FORMAT_AAC ? "AAC"
+             : (fmtType == MACRDP_AUDIO_FORMAT_OPUS ? "Opus" : "PCM"));
     /* Tell Swift which encoder to engage. */
     if (s->cbs.on_audio_format_selected) {
         s->cbs.on_audio_format_selected(s->swift_ctx, fmtType);
     }
+}
+
+/* Client → server playback confirmation. Updates the windowed-floor drift
+ * estimate (sustained latency vs jitter) and periodically logs progress.
+ * Single-threaded (FreeRDP channel thread), so the bucket ring needs no lock;
+ * results are published to the send path via atomics. */
+static UINT rdpsnd_confirm_block_cb(RdpsndServerContext *ctx,
+                                    BYTE confirmBlockNum, UINT16 wtimestamp) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->data;
+    if (!s) return CHANNEL_RC_OK;
+    atomic_store(&s->audio_confirmed_block, confirmBlockNum);
+    atomic_store(&s->audio_confirmed_ts, wtimestamp);
+    atomic_store(&s->audio_have_confirm, 1);
+
+    uint64_t now = now_ms();
+    /* Lag = gap between our latest sent packet and the just-played block. */
+    UINT16 sentTs = atomic_load(&s->audio_last_sent_ts);
+    int lag = (int)(UINT16)(sentTs - wtimestamp);   /* mod-2^16 ms */
+    if (lag < 0) lag = 0;
+    if (lag > 30000) lag = 30000;                   /* guard wrap / client-ahead */
+
+    /* Update the 1-second bucket ring of lag minima. */
+    if (s->audio_lag_count == 0) {
+        s->audio_lag_bucket_t0 = now;
+        s->audio_lag_head = 0;
+        s->audio_lag_bucket[0] = (uint16_t)lag;
+        s->audio_lag_count = 1;
+    } else {
+        int64_t elapsed = (int64_t)(now - s->audio_lag_bucket_t0);
+        int advance = (elapsed > 0) ? (int)(elapsed / 1000) : 0;
+        if (advance > 0) {
+            if (advance > MACRDP_AUDIO_LAG_BUCKETS) advance = MACRDP_AUDIO_LAG_BUCKETS;
+            for (int i = 0; i < advance; i++) {
+                s->audio_lag_head = (s->audio_lag_head + 1) % MACRDP_AUDIO_LAG_BUCKETS;
+                s->audio_lag_bucket[s->audio_lag_head] = 0xFFFF;
+            }
+            s->audio_lag_bucket_t0 += (uint64_t)advance * 1000;
+            s->audio_lag_bucket[s->audio_lag_head] = (uint16_t)lag;
+            s->audio_lag_count += advance;
+            if (s->audio_lag_count > MACRDP_AUDIO_LAG_BUCKETS)
+                s->audio_lag_count = MACRDP_AUDIO_LAG_BUCKETS;
+        } else if ((uint16_t)lag < s->audio_lag_bucket[s->audio_lag_head]) {
+            s->audio_lag_bucket[s->audio_lag_head] = (uint16_t)lag;
+        }
+    }
+
+    /* Floors over the short and reference windows (in 1s buckets). */
+    int refBuckets = s->cfg.audio_lag_ref_window_ms / 1000;
+    if (refBuckets < 1) refBuckets = 1;
+    if (refBuckets > MACRDP_AUDIO_LAG_BUCKETS) refBuckets = MACRDP_AUDIO_LAG_BUCKETS;
+    int shortBuckets = s->cfg.audio_lag_short_window_ms / 1000;
+    if (shortBuckets < 1) shortBuckets = 1;
+    if (shortBuckets > refBuckets) shortBuckets = refBuckets;
+
+    int valid = s->audio_lag_count;
+    int refScan   = (refBuckets   < valid) ? refBuckets   : valid;
+    int shortScan = (shortBuckets < valid) ? shortBuckets : valid;
+    int refFloor = INT32_MAX, shortFloor = INT32_MAX;
+    for (int i = 0; i < refScan; i++) {
+        int idx = (s->audio_lag_head - i + MACRDP_AUDIO_LAG_BUCKETS) % MACRDP_AUDIO_LAG_BUCKETS;
+        uint16_t v = s->audio_lag_bucket[idx];
+        if (v == 0xFFFF) continue;
+        if ((int)v < refFloor) refFloor = v;
+        if (i < shortScan && (int)v < shortFloor) shortFloor = v;
+    }
+    if (refFloor == INT32_MAX) refFloor = lag;
+    if (shortFloor == INT32_MAX) shortFloor = lag;
+
+    atomic_store(&s->audio_short_floor_ms, shortFloor);
+    atomic_store(&s->audio_drift_ms, shortFloor - refFloor);
+
+    uint64_t last = atomic_load(&s->audio_lag_log_ms);
+    if (now - last >= 2000) {
+        atomic_store(&s->audio_lag_log_ms, now);
+        os_log(bridge_log(),
+               "RDPSND progress: sent_block=%u played_block=%u lag=%dms shortFloor=%dms drift=%dms",
+               (unsigned)ctx->block_no, (unsigned)confirmBlockNum,
+               lag, shortFloor, shortFloor - refFloor);
+    }
+    return CHANNEL_RC_OK;
+}
+
+/* True if we should DROP this audio packet to bound buffered latency. Records
+ * the would-be send timestamp (for lag), then decides from the published
+ * floors: drop on sustained DRIFT (floor rising above the reference) — never
+ * on jitter — plus an absolute backstop for very slow skew. Codec-independent. */
+static bool rdpsnd_should_drop(struct macrdp_session *s, UINT16 wTimestamp) {
+    atomic_store(&s->audio_last_sent_ts, wTimestamp);
+    if (!atomic_load(&s->audio_have_confirm)) return false;   /* let it prime */
+    int drift = atomic_load(&s->audio_drift_ms);
+    int shortFloor = atomic_load(&s->audio_short_floor_ms);
+    if (s->cfg.audio_lag_drift_allowance_ms > 0 &&
+        drift > s->cfg.audio_lag_drift_allowance_ms) {
+        return true;
+    }
+    if (s->cfg.audio_max_lag_ms > 0 && shortFloor > s->cfg.audio_max_lag_ms) {
+        return true;
+    }
+    return false;
 }
 
 static void try_open_rdpsnd(struct macrdp_session *s) {
@@ -502,60 +627,73 @@ static void try_open_rdpsnd(struct macrdp_session *s) {
      * own preferred order (mstsc on Windows 10+ picks AAC-MS gladly).
      * Heap-allocated: rdpsnd_server_context_free() frees both the
      * array and any per-entry .data pointers. */
-    AUDIO_FORMAT *fmts = (AUDIO_FORMAT *)calloc(2, sizeof(AUDIO_FORMAT));
+    /* Advertise the configured compressed codec (if any) first, then PCM as
+     * a universal fallback. audio_codec: 1=pcm, 2=aac, 3=opus. */
+    const BOOL wantCompressed = (s->cfg.audio_codec == 2 || s->cfg.audio_codec == 3);
+    const int nfmt = wantCompressed ? 2 : 1;
+    AUDIO_FORMAT *fmts = (AUDIO_FORMAT *)calloc((size_t)nfmt, sizeof(AUDIO_FORMAT));
     if (!fmts) {
         rdpsnd_server_context_free(ctx);
         return;
     }
-    /* AAC-LC 48k stereo @ 128 kbps. mstsc needs the HEAACWAVEINFO
-     * extension data to know how to decode our raw AAC frames — without
-     * it, it falls back to treating packets as opaque blobs and buffers
-     * them forever. The cbSize=14 payload is:
-     *   wPayloadType (UINT16 LE) = 0   (Raw — no ADTS framing)
-     *   wAudioProfileLevelIndication (UINT16 LE) = 0x29 (AAC-LC L2)
-     *   wStructType                  (UINT16 LE) = 0
-     *   wReserved1                   (UINT16 LE) = 0
-     *   dwReserved2                  (UINT32 LE) = 0
-     *   AudioSpecificConfig (2 bytes) = 0x11 0x90
-     *     = AOT=2 (LC), samplingFreqIndex=3 (48k), channelConfig=2 (stereo)
-     */
-    static const size_t kAacExtraLen = 14;
-    BYTE *aacExtra = (BYTE *)calloc(1, kAacExtraLen);
-    if (!aacExtra) {
-        free(fmts);
-        rdpsnd_server_context_free(ctx);
-        return;
-    }
-    /* wPayloadType = 0 (Raw); already zero from calloc */
-    aacExtra[2] = 0x29;          /* wAudioProfileLevelIndication low byte */
-    /* wStructType / wReserved1 / dwReserved2 already zero */
-    aacExtra[12] = 0x11;         /* AudioSpecificConfig byte 0 */
-    aacExtra[13] = 0x90;         /* AudioSpecificConfig byte 1 */
 
-    fmts[0].wFormatTag      = WAVE_FORMAT_AAC_MS;
-    fmts[0].nChannels       = 2;
-    fmts[0].nSamplesPerSec  = 48000;
-    fmts[0].wBitsPerSample  = 16;
-    fmts[0].nBlockAlign     = 4;
-    fmts[0].nAvgBytesPerSec = 16000;     /* 128 kbps */
-    fmts[0].cbSize          = (UINT16)kAacExtraLen;
-    fmts[0].data            = aacExtra;
-    /* PCM 16-bit 48 kHz stereo — fallback for older clients. */
-    fmts[1].wFormatTag      = WAVE_FORMAT_PCM;
-    fmts[1].nChannels       = 2;
-    fmts[1].nSamplesPerSec  = 48000;
-    fmts[1].wBitsPerSample  = 16;
-    fmts[1].nBlockAlign     = 4;
-    fmts[1].nAvgBytesPerSec = 48000 * 4;
-    fmts[1].cbSize          = 0;
-    fmts[1].data            = NULL;
+    if (s->cfg.audio_codec == 2) {
+        /* AAC-LC 48k stereo @ 128 kbps. mstsc needs the HEAACWAVEINFO
+         * extension data to decode our raw AAC frames. cbSize=14 payload:
+         *   wPayloadType (UINT16 LE) = 0   (Raw — no ADTS framing)
+         *   wAudioProfileLevelIndication (UINT16 LE) = 0x29 (AAC-LC L2)
+         *   wStructType / wReserved1 / dwReserved2 = 0
+         *   AudioSpecificConfig (2 bytes) = 0x11 0x90
+         *     = AOT=2 (LC), samplingFreqIndex=3 (48k), channelConfig=2 (stereo) */
+        static const size_t kAacExtraLen = 14;
+        BYTE *aacExtra = (BYTE *)calloc(1, kAacExtraLen);
+        if (!aacExtra) {
+            free(fmts);
+            rdpsnd_server_context_free(ctx);
+            return;
+        }
+        aacExtra[2] = 0x29;          /* wAudioProfileLevelIndication low byte */
+        aacExtra[12] = 0x11;         /* AudioSpecificConfig byte 0 */
+        aacExtra[13] = 0x90;         /* AudioSpecificConfig byte 1 */
+        fmts[0].wFormatTag      = WAVE_FORMAT_AAC_MS;
+        fmts[0].nChannels       = 2;
+        fmts[0].nSamplesPerSec  = 48000;
+        fmts[0].wBitsPerSample  = 16;
+        fmts[0].nBlockAlign     = 4;
+        fmts[0].nAvgBytesPerSec = 16000;     /* 128 kbps */
+        fmts[0].cbSize          = (UINT16)kAacExtraLen;
+        fmts[0].data            = aacExtra;
+    } else if (s->cfg.audio_codec == 3) {
+        /* Opus 48k stereo. FreeRDP's WAVE_FORMAT_OPUS (0x704F); the client
+         * builds an Opus decoder from channels + sample rate, no extra data.
+         * Only FreeRDP clients with Opus support advertise/accept it. */
+        fmts[0].wFormatTag      = WAVE_FORMAT_OPUS;
+        fmts[0].nChannels       = 2;
+        fmts[0].nSamplesPerSec  = 48000;
+        fmts[0].wBitsPerSample  = 16;
+        fmts[0].nBlockAlign     = 4;
+        fmts[0].nAvgBytesPerSec = 12000;     /* ~96 kbps */
+        fmts[0].cbSize          = 0;
+        fmts[0].data            = NULL;
+    }
+
+    /* PCM 16-bit 48 kHz stereo — always present (primary for "pcm", else
+     * the fallback for older / non-Opus clients). */
+    const int pcmIdx = wantCompressed ? 1 : 0;
+    fmts[pcmIdx].wFormatTag      = WAVE_FORMAT_PCM;
+    fmts[pcmIdx].nChannels       = 2;
+    fmts[pcmIdx].nSamplesPerSec  = 48000;
+    fmts[pcmIdx].wBitsPerSample  = 16;
+    fmts[pcmIdx].nBlockAlign     = 4;
+    fmts[pcmIdx].nAvgBytesPerSec = 48000 * 4;
+    fmts[pcmIdx].cbSize          = 0;
+    fmts[pcmIdx].data            = NULL;
 
     ctx->server_formats     = fmts;
-    ctx->num_server_formats = 2;
-    /* src_format describes the format we'll DELIVER samples in (always
-     * PCM at the SendSamples API; AAC is sent via SendSamples2). Keeping
-     * src_format pointing at PCM is correct. */
-    ctx->src_format         = &fmts[1];
+    ctx->num_server_formats = (UINT16)nfmt;
+    /* src_format = the format we DELIVER samples in at the SendSamples API
+     * (always PCM; compressed frames go via SendSamples2). */
+    ctx->src_format         = &fmts[pcmIdx];
     /* Latency hint to FreeRDP's WAVE PDU pacer. Smaller = less server
      * buffering. Most of the user-observed audio lag is in mstsc's
      * PCM jitter buffer (~300-500ms) which is out of our control; an
@@ -563,6 +701,7 @@ static void try_open_rdpsnd(struct macrdp_session *s) {
     ctx->latency            = 20;
     ctx->data               = s;
     ctx->Activated          = rdpsnd_activated_cb;
+    ctx->ConfirmBlock       = rdpsnd_confirm_block_cb;
     /* Use the *static* virtual channel (always available post-activation).
      * DVC would be lower-overhead but requires DRDYNVC == READY, which is
      * not guaranteed by the time we want to start audio. */
@@ -1200,6 +1339,16 @@ int32_t macrdp_session_create(int fd,
     atomic_init(&s->audio_selected_format, MACRDP_AUDIO_FORMAT_PCM);
     atomic_init(&s->audio_selected_format_no, 0);
     atomic_init(&s->audio_total_samples, 0);
+    atomic_init(&s->audio_last_sent_ts, 0);
+    atomic_init(&s->audio_confirmed_ts, 0);
+    atomic_init(&s->audio_confirmed_block, 0);
+    atomic_init(&s->audio_have_confirm, 0);
+    atomic_init(&s->audio_lag_log_ms, 0);
+    atomic_init(&s->audio_short_floor_ms, 0);
+    atomic_init(&s->audio_drift_ms, 0);
+    s->audio_lag_head = 0;
+    s->audio_lag_count = 0;
+    s->audio_lag_bucket_t0 = 0;
     atomic_init(&s->cliprdr_ready, false);
     atomic_init(&s->cliprdr_outbound_request_id, 0);
     atomic_init(&s->outstanding_frames, 0);
@@ -2021,6 +2170,8 @@ int32_t macrdp_session_send_audio_pcm(macrdp_session_t s,
      * multi-second jitter buffer. */
     uint64_t elapsed = now_ms() - atomic_load(&s->audio_start_ms);
     UINT16 wTimestamp = (UINT16)(elapsed & 0xFFFFu);
+    /* Bound buffered latency: skip if the client has fallen too far behind. */
+    if (rdpsnd_should_drop(s, wTimestamp)) return MACRDP_E_FRAME_DROPPED;
     UINT rc = s->rdpsnd->SendSamples(s->rdpsnd, pcm, nframes, wTimestamp);
     if (rc == CHANNEL_RC_OK) {
         atomic_fetch_add(&s->audio_total_samples, (uint32_t)nframes);
@@ -2053,6 +2204,8 @@ int32_t macrdp_session_send_audio_aac(macrdp_session_t s,
      *     unboundedly. */
     uint64_t elapsed = now_ms() - atomic_load(&s->audio_start_ms);
     UINT16 wTimestamp = (UINT16)(elapsed & 0xFFFFu);
+    /* Bound buffered latency: skip if the client has fallen too far behind. */
+    if (rdpsnd_should_drop(s, wTimestamp)) return MACRDP_E_FRAME_DROPPED;
     UINT16 formatNo   = (UINT16)atomic_load(&s->audio_selected_format_no);
     UINT32 audioTS    = (UINT32)(elapsed & 0xFFFFFFFFu);
     (void)pcm_sample_count;  /* still incremented for diagnostic purposes */
