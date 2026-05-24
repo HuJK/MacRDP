@@ -244,38 +244,17 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let typesDump = types.map { $0.rawValue }.joined(separator: ", ")
         Log.clip.info("Mac pasteboard changed (cc=\(cc, privacy: .public)) types=[\(typesDump, privacy: .public)]")
 
-        // Plain text — always include as a fallback if any text is on the
-        // pasteboard, even if richer formats are also there.
-        if config.clipboard.text, hasText(pb) {
-            formats.append((CFFormat.unicodeText.rawValue, nil))
-            formats.append((CFFormat.text.rawValue, nil))
-        }
-
-        // HTML. Different source apps publish HTML under different UTIs
-        // (modern public.html, legacy "Apple HTML pasteboard type",
-        // Office-flavored "com.microsoft.html-format"). Pick the first
-        // type whose raw name conforms to public.html or whose data
-        // looks like an HTML document.
-        if config.clipboard.text, Self.findHTMLData(pb) != nil {
-            let id = assignOutboundCustomID(for: CFFormatName.htmlFormat.rawValue)
-            formats.append((id, CFFormatName.htmlFormat.rawValue))
-        }
-
-        // RTF.
-        if config.clipboard.text, pb.data(forType: .rtf) != nil {
-            let id = assignOutboundCustomID(for: CFFormatName.richTextFormat.rawValue)
-            formats.append((id, CFFormatName.richTextFormat.rawValue))
-        }
-
-        // Image.
-        if config.clipboard.image, hasImage(pb) {
-            formats.append((CFFormat.dib.rawValue, nil))
-        }
-
-        // Files / folders — recurse folders into a flat descriptor list
-        // and advertise FileGroupDescriptorW + FileContents. We don't
-        // also publish CF_HDROP: modern Windows clients prefer the
+        // Files / folders take precedence and are EXCLUSIVE. A Finder file
+        // copy also carries a text rep (the path) and an icon
+        // (public.tiff / com.apple.icns), but CLIPRDR file copies must
+        // advertise ONLY FileGroupDescriptorW + FileContents — mixing in
+        // text/image formats makes the Windows clipboard flail (it
+        // re-requests the descriptor repeatedly and grabs the stray text,
+        // which shows up as a long spinner before the paste). So if there
+        // are files, advertise just the file formats and skip the rest.
+        // We don't also publish CF_HDROP: modern Windows clients prefer the
         // descriptor-based path, and CF_HDROP can't carry folder trees.
+        var advertisedFiles = false
         if config.clipboard.files {
             let urls = Self.fileURLs(on: pb)
             if !urls.isEmpty,
@@ -293,6 +272,37 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 formats.append((descID, CFFormatName.fileGroupDescriptorW.rawValue))
                 formats.append((contID, CFFormatName.fileContents.rawValue))
                 Log.clip.info("Advertising \(entries.count, privacy: .public) file/folder entry(ies)")
+                advertisedFiles = true
+            }
+        }
+
+        if !advertisedFiles {
+            // Plain text — always include as a fallback if any text is on
+            // the pasteboard, even if richer formats are also there.
+            if config.clipboard.text, hasText(pb) {
+                formats.append((CFFormat.unicodeText.rawValue, nil))
+                formats.append((CFFormat.text.rawValue, nil))
+            }
+
+            // HTML. Different source apps publish HTML under different UTIs
+            // (modern public.html, legacy "Apple HTML pasteboard type",
+            // Office-flavored "com.microsoft.html-format"). Pick the first
+            // type whose raw name conforms to public.html or whose data
+            // looks like an HTML document.
+            if config.clipboard.text, Self.findHTMLData(pb) != nil {
+                let id = assignOutboundCustomID(for: CFFormatName.htmlFormat.rawValue)
+                formats.append((id, CFFormatName.htmlFormat.rawValue))
+            }
+
+            // RTF.
+            if config.clipboard.text, pb.data(forType: .rtf) != nil {
+                let id = assignOutboundCustomID(for: CFFormatName.richTextFormat.rawValue)
+                formats.append((id, CFFormatName.richTextFormat.rawValue))
+            }
+
+            // Image.
+            if config.clipboard.image, hasImage(pb) {
+                formats.append((CFFormat.dib.rawValue, nil))
             }
         }
 
@@ -954,6 +964,11 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let FD_ATTRIBUTES: UInt32 = 0x00000004
         let FD_FILESIZE:   UInt32 = 0x00000040
         let FD_WRITESTIME: UInt32 = 0x00000020
+        // Tells the Windows shell to show a copy PROGRESS indicator for
+        // this transfer (treat it as a potentially slow copy). Windows
+        // clipboard servers set this on their descriptors; without it
+        // Explorer shows only a spinner even for large files.
+        let FD_PROGRESSUI: UInt32 = 0x00004000
         let FILE_ATTRIBUTE_DIRECTORY: UInt32 = 0x00000010
         let FILE_ATTRIBUTE_NORMAL:    UInt32 = 0x00000080
 
@@ -976,7 +991,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     for i in 0..<8 { fd[offset + i] = src[i] }
                 }
             }
-            var flags = FD_ATTRIBUTES
+            var flags = FD_ATTRIBUTES | FD_PROGRESSUI
             if !e.isDirectory { flags |= FD_FILESIZE }
             if e.modTime != nil { flags |= FD_WRITESTIME }
             put32(flags, at: 0)
@@ -1030,6 +1045,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         }
 
         if wantSize {
+            Log.clip.info("FileContentsRequest SIZE listIndex=\(listIndex, privacy: .public) → \(entry.size, privacy: .public) bytes")
             var size = entry.size.littleEndian
             let data = withUnsafeBytes(of: &size) { Data($0) }
             sendFileContentsResponse?(streamID, true, data)
@@ -1048,6 +1064,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
 
             try handle?.seek(toOffset: offset)
             let bytes = handle?.readData(ofLength: Int(length)) ?? Data()
+            Log.clip.info("FileContentsRequest RANGE listIndex=\(listIndex, privacy: .public) off=\(offset, privacy: .public) want=\(length, privacy: .public) → \(bytes.count, privacy: .public) bytes")
             sendFileContentsResponse?(streamID, true, bytes)
         } catch {
             Log.clip.error("FileContentsRequest read failed: \(String(describing: error), privacy: .public)")
