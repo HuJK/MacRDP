@@ -126,6 +126,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let relativePath: String   // "MyFolder/sub/file.txt"
         let isDirectory: Bool
         let size: UInt64
+        let modificationMs: Int64? // from FGDW ftLastWriteTime (nil if absent)
     }
     private var inFiles: [InFileEntry] = []
     /// Client→Mac: in-flight file-contents fetches, keyed by streamId.
@@ -209,6 +210,13 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         outOpenHandles.removeAll()
         outFiles.removeAll()
         pendingLock.unlock()
+
+        // Client disconnect: the byte fetcher is dead, so no paste can
+        // complete. End and free every clipboard event now rather than
+        // leaking them in the store until app exit.
+        CopyEventStore.shared.endAll(
+            domainSubdir: AppDelegate.sharedClipboardInbox.subdir,
+            reason: .clientDisconnected)
     }
 
     /// Called by RDPSession once the CLIPRDR channel handshake completes.
@@ -468,12 +476,21 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         if config.clipboard.files, let descID, let contID {
             inFileGroupDescID = descID
             inFileContentsID  = contID
-            let mode = (config.clipboard.fileFetchMode ?? "eager").lowercased()
-            if mode == "lazy" {
-                claimPasteboardLazyAsync(descriptorFormatID: descID)
-            } else {
-                claimPasteboardWithFilePromisesAsync(descriptorFormatID: descID)
-            }
+            // Clear stale pasteboard contents the instant a Windows file
+            // copy arrives — BEFORE the (possibly slow) FGDW fetch. Else a
+            // user who copies on Windows and immediately pastes on the Mac
+            // gets the PREVIOUS clipboard contents; eager mode can spend
+            // ~10s fetching the descriptor for a large folder. eager
+            // refills with real names on resolve, lazy writes its
+            // placeholder shortly after — either way the stale window is
+            // gone (the cost is a brief empty clipboard, which the user
+            // already chose over pasting the wrong thing).
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            selfWroteChangeCount = pb.changeCount
+            lastChangeCount      = pb.changeCount
+            let eager = (config.clipboard.fileFetchMode ?? "eager").lowercased() != "lazy"
+            beginFileCopy(descriptorFormatID: descID, eager: eager)
             return
         }
 
@@ -500,259 +517,110 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         Log.clip.info("Client copied → claimed pasteboard with \(typeMap.count, privacy: .public) type(s): \(summary, privacy: .public)")
     }
 
-    /// When the client copies files, Finder needs real `file://` URLs
-    /// on the pasteboard to enable Paste. We eagerly fetch every file's
-    /// bytes, publish a manifest into our FileProvider domain, then
-    /// put the domain's user-visible URLs on the pasteboard. Finder
-    /// (and any other app) copies through the extension — works
-    /// system-wide.
+    // MARK: - Files: Client → Mac (unified copy event)
+    //
+    // One Windows clipboard copy → one mode-agnostic `CopyEvent`. The
+    // event owns the file tree + byte fetcher + resolver. Eager vs lazy
+    // is purely *this* layer's choice:
+    //   eager — call `resolve()` up front, then bind the REAL top-level
+    //           names to the pasteboard (no `MacRDP_<uuid>` wrapper).
+    //   lazy  — bind the placeholder folder URL now; `resolve()` fires
+    //           later, when Finder enumerates the placeholder (paste).
+    // Both share the same `create()` + resolver + fetcher.
+
     @MainActor
-    private func claimPasteboardWithFilePromisesAsync(descriptorFormatID: UInt32) {
+    private func beginFileCopy(descriptorFormatID: UInt32, eager: Bool) {
         let inbox = AppDelegate.sharedClipboardInbox
-        Log.clip.info("Lazy file list incoming for FileProvider domain '\(inbox.domainIdentifier.rawValue, privacy: .public)'")
+        let sessionID = UUID().uuidString
+        let placeholderName = "MacRDP_" + sessionID
+        Log.clip.info("File copy begin: session=\(sessionID, privacy: .public) mode=\(eager ? "eager" : "lazy", privacy: .public) placeholder='\(placeholderName, privacy: .public)'")
 
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            // Timing markers: where does the wall-clock between "user
-            // pressed Ctrl+C in mstsc" and "Paste menu enabled in Finder"
-            // actually go? Large folder copies (35k+ items) were taking
-            // ~10s on first observation; the markers let us bisect FGDW
-            // fetch vs parse vs FileProvider publish vs URL resolve.
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            let raw = self.awaitClientFormatData(formatID: descriptorFormatID, timeoutMs: 5_000)
-            let t1 = DispatchTime.now().uptimeNanoseconds
-            let entries = ClipboardBridge.parseFileGroupDescriptorW(raw)
-            let t2 = DispatchTime.now().uptimeNanoseconds
-            guard !entries.isEmpty else {
-                let reason = "The Windows session returned an empty file list."
-                Log.clip.error("Client file list empty — nothing to paste")
-                // Eager mode hasn't registered a session yet; fire just
-                // the system notification so the user knows the copy
-                // they triggered on Windows didn't reach the Mac.
-                CopyProgressTracker.notifyPasteFailed(reason: reason)
-                return
-            }
-            self.pendingLock.lock()
-            self.inFiles = entries
-            self.claimedTypeMap = [:]
-            self.pendingLock.unlock()
+        // LOCK_CLIPDATA so mstsc preserves THIS event's FGDW snapshot even
+        // if the Windows clipboard changes again before paste.
+        let clipDataIDValue = self.allocClipDataID()
+        self.sendClipLock?(clipDataIDValue)
+        let clipDataID: UInt32? = clipDataIDValue
+        let unlockCb = self.sendClipUnlock
 
-            // Stable UUIDs + parent links. Building parentID via a
-            // path→id dictionary instead of an O(N²) inner scan —
-            // 40k-file folder copies (a typical SDK / source tree)
-            // were spending minutes inside this loop, long enough for
-            // Finder's right-click "Paste" to never even appear.
-            var ids = [String](repeating: "", count: entries.count)
-            var pathToID: [String: String] = [:]
-            pathToID.reserveCapacity(entries.count)
-            for i in 0..<entries.count {
-                ids[i] = UUID().uuidString
-                pathToID[entries[i].relativePath] = ids[i]
-            }
-            func parentID(of i: Int) -> String? {
-                let path = entries[i].relativePath
-                guard let lastSlash = path.lastIndex(of: "/") else { return nil }
-                return pathToID[String(path[..<lastSlash])]
-            }
-            // Map id → listIndex so the XPC fetcher can route to the
-            // right CLIPRDR slot when the extension asks for bytes.
-            var idToListIndex: [String: Int] = [:]
-            idToListIndex.reserveCapacity(entries.count)
-            var items: [FileProviderInbox.PublishItem] = []
-            items.reserveCapacity(entries.count)
-            for (idx, e) in entries.enumerated() {
-                let filename = (e.relativePath as NSString).lastPathComponent
-                items.append(.init(id: ids[idx],
-                                   filename: filename,
-                                   parentID: parentID(of: idx),
-                                   isDirectory: e.isDirectory,
-                                   size: Int64(e.size),
-                                   modificationMs: nil))
-                idToListIndex[ids[idx]] = idx
-            }
-            Log.clip.info("Publishing metadata for \(items.count, privacy: .public) item(s) — bytes lazy via XPC")
+        let fetcher = self.makeFileFetcher(clipDataID: clipDataID)
+        let resolver = self.makeFileResolver(descID: descriptorFormatID,
+                                             placeholderName: placeholderName)
 
-            // Allocate the session id and wrap this copy in a session
-            // FOLDER so multiple concurrent sessions are visible /
-            // distinguishable in Finder. Layout becomes:
-            //   MacRDP-MacRDPClipboard/
-            //     ├── "Copy 19:55:54"/        ← session folder
-            //     │   └── <original top-level items>
-            //     └── "Copy 19:56:00"/
-            //         └── <original top-level items>
-            // Session folder name = the session UUID. Uniform across
-            // every case (1 file, 1 folder, multi, mixed) so the layout
-            // is predictable to look at and trivial to reason about.
-            let sessionID = UUID().uuidString
-            let sessionRootItem = FileProviderInbox.PublishItem(
-                id: sessionID,
-                filename: sessionID,
-                parentID: nil,
-                isDirectory: true,
-                size: 0,
-                modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+        let placeholderManifest = ManifestItem(
+            id: sessionID,
+            filename: placeholderName,
+            size: 0,
+            parentID: nil,
+            isDirectory: true,
+            modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
 
-            // Rewrite every original top-level item to point at the
-            // session folder as its parent.
-            let rewrittenItems: [FileProviderInbox.PublishItem] = items.map {
-                guard $0.parentID == nil else { return $0 }
-                return FileProviderInbox.PublishItem(
-                    id: $0.id,
-                    filename: $0.filename,
-                    parentID: sessionID,
-                    isDirectory: $0.isDirectory,
-                    size: $0.size,
-                    modificationMs: $0.modificationMs)
+        CopyEventStore.shared.create(
+            domainSubdir: inbox.subdir,
+            sessionID: sessionID,
+            placeholderItem: placeholderManifest,
+            fetcher: fetcher,
+            resolver: resolver,
+            onCleanup: { if let cid = clipDataID { unlockCb?(cid) } })
+
+        if eager {
+            // Resolve now (blocking FGDW fetch on a background task), then
+            // publish the real tree + bind real top-level URLs.
+            Task.detached(priority: .userInitiated) { [weak self] in
+                CopyEventStore.shared.resolve(sessionID: sessionID)
+                await self?.publishResolvedAndBindRealURLs(
+                    sessionID: sessionID,
+                    placeholderName: placeholderName)
             }
-
-            // Authoritative tree includes the synthetic session folder
-            // plus every (re-parented) original item.
-            let allManifestItems: [ManifestItem] =
-                ([sessionRootItem] + rewrittenItems).map {
-                    ManifestItem(id: $0.id,
-                                  filename: $0.filename,
-                                  size: $0.size,
-                                  parentID: $0.parentID,
-                                  isDirectory: $0.isDirectory,
-                                  modificationMs: $0.modificationMs)
+        } else {
+            // Lazy: publish the placeholder + bind its URL now. resolve()
+            // fires later via the FileProvider enumerator (on paste).
+            Task { @MainActor in
+                do {
+                    try await inbox.publish([
+                        FileProviderInbox.PublishItem(
+                            id: sessionID,
+                            filename: placeholderName,
+                            parentID: nil,
+                            isDirectory: true,
+                            size: 0,
+                            modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
+                    ])
+                } catch {
+                    Log.clip.error("Lazy publish failed: \(String(describing: error), privacy: .public)")
+                    return
                 }
-            // Eagerly push to the extension: session folder + its
-            // immediate children (= the originals' new top-level).
-            // Deeper subtrees are still lazy via enumerateChildren.
-            let publishedItems: [FileProviderInbox.PublishItem] =
-                [sessionRootItem] +
-                rewrittenItems.filter { $0.parentID == sessionID }
-
-            let t3 = DispatchTime.now().uptimeNanoseconds
-
-            // Hop to MainActor: publish manifest, register XPC fetcher,
-            // resolve URLs for the pasteboard.
-            await MainActor.run {
-                // LOCK_CLIPDATA enabled on FreeRDP master HEAD.
-                // Allocate a clipDataID, send CB_LOCK_CLIPDATA, stamp
-                // every FILECONTENTS_REQUEST so mstsc routes against
-                // the pinned FGDW snapshot for this session.
-                let clipDataIDValue = self.allocClipDataID()
-                self.sendClipLock?(clipDataIDValue)
-                let clipDataID: UInt32? = clipDataIDValue
-                // Register items with the copy-progress UI BEFORE the
-                // fetcher closure can fire. Tracker drives the Win-style
-                // multi-session progress dialog once chunks start landing.
-                CopyProgressTracker.shared.registerItems(
-                    sessionID: sessionID,
-                    title: sessionID,
-                    entries: items.map {
-                        (id: $0.id, name: $0.filename,
-                         size: $0.size, isDirectory: $0.isDirectory)
-                    })
-                // Per-session fetcher. The closure captures the
-                // session's listIndex map by value — when a *new*
-                // clipboard event happens, this closure still serves
-                // bytes for the OLD session because Windows preserves
-                // the old FGDW while a paste is using it.
-                let perSessionIdToListIndex = idToListIndex
-                let unlockCb = self.sendClipUnlock
-                FileProviderXPCService.shared.registerSession(
-                    domainSubdir: inbox.subdir,
-                    sessionID: sessionID,
-                    items: allManifestItems,
-                    fetcher: { [weak self] itemID, offset, length in
-                    guard let self else {
-                        return (nil, NSError(domain: "MacRDP.clip", code: 99,
-                            userInfo: [NSLocalizedDescriptionKey: "bridge gone"]))
-                    }
-                    guard let listIndex = perSessionIdToListIndex[itemID] else {
-                        return (nil, NSError(domain: "MacRDP.clip", code: 404,
-                            userInfo: [NSLocalizedDescriptionKey: "unknown item id \(itemID)"]))
-                    }
-                    let data = self.awaitFileContents(
-                        listIndex: UInt32(listIndex),
-                        offset: UInt64(offset),
-                        length: UInt32(length),
-                        timeoutMs: 30_000,
-                        clipDataID: clipDataID)
-                    if data.isEmpty {
-                        return (nil, NSError(domain: "MacRDP.clip", code: 504,
-                            userInfo: [NSLocalizedDescriptionKey: "RDP fetch timed out / FAIL"]))
-                    }
-                    return (data, nil)
-                },
-                onCleanup: {
-                    // No-op: LOCK is disabled so nothing to unlock.
-                    if let cid = clipDataID {
-                        unlockCb?(cid)
-                    }
-                })
-
-                Task { @MainActor in
-                    let tPubStart = DispatchTime.now().uptimeNanoseconds
-                    do {
-                        // Push session folder + its immediate children
-                        // so the framework can index them up front;
-                        // deeper levels stay lazy via enumerateChildren.
-                        try await inbox.publish(publishedItems)
-                    } catch {
-                        Log.clip.error("FileProvider publish failed: \(String(describing: error), privacy: .public)")
-                        return
-                    }
-                    let tPubEnd = DispatchTime.now().uptimeNanoseconds
-                    // Pasteboard URLs point to the original items
-                    // (now under the session folder). Finder strips the
-                    // parent path when pasting, so the user lands with
-                    // just the file/folder — no session-folder prefix.
-                    let pasteboardItems = rewrittenItems.filter {
-                        $0.parentID == sessionID
-                    }
-                    await self.resolveAndWriteFileURLs(inbox: inbox, items: pasteboardItems)
-                    let tDone = DispatchTime.now().uptimeNanoseconds
-                    let ms: (UInt64, UInt64) -> UInt64 = { (a, b) in (b - a) / 1_000_000 }
-                    Log.clip.info("FGDW pipeline timings (count=\(entries.count, privacy: .public)): fetch=\(ms(t0, t1), privacy: .public)ms parse=\(ms(t1, t2), privacy: .public)ms build=\(ms(t2, t3), privacy: .public)ms publish=\(ms(tPubStart, tPubEnd), privacy: .public)ms urls=\(ms(tPubEnd, tDone), privacy: .public)ms total=\(ms(t0, tDone), privacy: .public)ms")
+                if let url = await inbox.userVisibleURL(itemID: sessionID, filename: placeholderName) {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.writeObjects([url as NSURL])
+                    self.selfWroteChangeCount = pb.changeCount
+                    self.lastChangeCount      = pb.changeCount
+                    Log.clip.info("Lazy-mode pasteboard claimed: \(url.path, privacy: .public)")
+                } else {
+                    Log.clip.error("Lazy-mode URL resolution failed for placeholder \(placeholderName, privacy: .public)")
                 }
             }
         }
     }
 
-    /// Lazy variant. Pasteboard is claimed instantly with a placeholder
-    /// folder URL on `CB_FORMAT_LIST` arrival; the `CB_FORMAT_DATA_REQUEST`
-    /// is deferred until Finder enumerates the placeholder's children
-    /// (the moment the user actually pastes). At that point the lazy
-    /// resolver (registered with `FileProviderXPCService`) fires
-    /// synchronously, fetches the FGDW, builds the tree, and the
-    /// enumerator returns the now-populated children to Finder.
-    ///
-    /// UX trade-off vs eager:
-    ///   - Pasted destination always shows `MacRDP_<UUID>/...` (single-
-    ///     file copies are wrapped, same as multi-item copies).
-    ///   - Windows-side `Ctrl+C` activity never reaches mstsc's
-    ///     directory enumeration unless the user pastes on the Mac.
-    ///   - "Paste" appears in Finder immediately (no enumeration wait).
-    @MainActor
-    private func claimPasteboardLazyAsync(descriptorFormatID: UInt32) {
-        let inbox = AppDelegate.sharedClipboardInbox
-        let sessionID = UUID().uuidString
-        let placeholderName = "MacRDP_" + sessionID
-        Log.clip.info("Lazy-mode claim: session=\(sessionID, privacy: .public) placeholder='\(placeholderName, privacy: .public)' — FGDW fetch deferred until paste")
-
-        // LOCK_CLIPDATA so mstsc preserves THIS session's FGDW snapshot
-        // even if the Windows clipboard changes again before paste.
-        let clipDataIDValue = self.allocClipDataID()
-        self.sendClipLock?(clipDataIDValue)
-        let clipDataID: UInt32? = clipDataIDValue
-        let unlockCb = self.sendClipUnlock
-        let descID = descriptorFormatID
-
-        // Byte fetcher reads listIndex from session via the service
-        // (rather than capturing a pre-built map). Pre-resolution the
-        // map is empty; Finder won't reach this path before the
-        // enumerator triggers the resolver, but guard regardless.
-        let fetcher: (String, Int64, Int64) async -> (Data?, NSError?) = { [weak self] itemID, offset, length in
+    /// Per-event byte fetcher. Reads the FGDW listIndex from the store
+    /// (populated by the resolver) so it works before *and* after
+    /// resolution without rebuilding the closure.
+    private func makeFileFetcher(clipDataID: UInt32?)
+        -> (String, Int64, Int64) async -> (Data?, NSError?) {
+        return { [weak self] itemID, offset, length in
             guard let self else {
                 return (nil, NSError(domain: "MacRDP.clip", code: 99,
                     userInfo: [NSLocalizedDescriptionKey: "bridge gone"]))
             }
-            guard let listIndex = FileProviderXPCService.shared.listIndex(for: itemID) else {
-                return (nil, NSError(domain: "MacRDP.clip", code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "unknown item id \(itemID) — lazy not yet resolved?"]))
+            guard let listIndex = CopyEventStore.shared.listIndex(for: itemID) else {
+                // No FGDW index — this is the resolver's `broken.bin` stub
+                // (resolve failed). Return a POSIX I/O error so Finder
+                // reports "couldn't read some data" and CLEANS UP the
+                // destination folder it created, rather than leaving an
+                // empty stub behind.
+                return (nil, NSError(domain: NSPOSIXErrorDomain, code: Int(EIO),
+                    userInfo: [NSLocalizedDescriptionKey: "Could not read file from the Windows session."]))
             }
             let data = self.awaitFileContents(
                 listIndex: UInt32(listIndex),
@@ -766,75 +634,63 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             }
             return (data, nil)
         }
+    }
 
-        // Lazy resolver: fires synchronously on the first
-        // enumerateChildren for the placeholder folder. Must populate
-        // session.tree + session.idToListIndex + call
-        // bindItemsToSession before returning. Re-entrancy from
-        // multiple enumerator threads is guarded by lazyLock in the
-        // service.
-        let resolver: (FileProviderXPCService.SessionState) -> Void = { [weak self] session in
+    /// The resolver: fetches the FGDW (cancellable — no timeout, polls the
+    /// event's cancel flag), parses it, builds the placeholder-rooted tree,
+    /// and populates the event. Shared by eager and lazy; the store runs
+    /// it exactly once. Tree root = the placeholder folder; its children
+    /// are the real top-level items.
+    private func makeFileResolver(descID: UInt32, placeholderName: String)
+        -> (CopyEvent) -> Void {
+        return { [weak self] event in
             guard let self else { return }
-            Log.clip.info("Lazy resolver firing for session=\(session.id, privacy: .public) — sending FormatDataRequest now")
+            Log.clip.info("Resolver firing for event=\(event.id, privacy: .public) — sending FormatDataRequest")
+            // NOTE: progress UI is registered AFTER the tree is built (via
+            // `registerItems`, which does NOT force the window open — it
+            // appears 500ms after the first byte chunk). Marquee-while-
+            // resolving is reintroduced in Stage 3, driven by the event's
+            // `.marquee` state, so it shows for an in-flight paste but not
+            // for eager's proactive pre-paste resolve.
 
-            // Surface the "resolving" UI immediately so the user sees
-            // a marquee bar while mstsc enumerates. Hop to MainActor
-            // since CopyProgressTracker is MainActor-bound.
-            let resolveTitle = placeholderName
-            Task { @MainActor in
-                CopyProgressTracker.shared.registerResolvingSession(
-                    sessionID: session.id, title: resolveTitle)
-            }
-
-            let sessionIDForCancel = session.id
-            let t0 = DispatchTime.now().uptimeNanoseconds
             let raw = self.awaitClientFormatDataCancellable(
                 formatID: descID,
                 isCancelled: {
-                    FileProviderXPCService.shared.isSessionCancelled(
-                        sessionID: sessionIDForCancel)
+                    CopyEventStore.shared.isSessionCancelled(sessionID: event.id)
                 })
-            let t1 = DispatchTime.now().uptimeNanoseconds
             let entries = ClipboardBridge.parseFileGroupDescriptorW(raw)
-            let t2 = DispatchTime.now().uptimeNanoseconds
             guard !entries.isEmpty else {
-                let wasCancelled = FileProviderXPCService.shared
-                    .isSessionCancelled(sessionID: session.id)
-                let failedSessionID = session.id
-                if wasCancelled {
-                    // User-initiated abort. The progress row is
-                    // already in the cancelled state via tracker.cancel
-                    // from the row's Cancel button — don't fire a
-                    // notification (the user knows; they pressed it).
-                    // Just mark the session resolve-failed so the
-                    // enumerator returns an error instead of empty.
-                    let reason = "Paste cancelled by user."
-                    Log.clip.notice("Lazy resolver: \(reason, privacy: .public)")
-                    FileProviderXPCService.shared.markResolveFailed(
-                        sessionID: failedSessionID, reason: reason)
-                } else {
-                    // Real empty FGDW (e.g. Windows clipboard owner
-                    // changed between FormatList and our request, or
-                    // the source app returned an explicit empty list).
-                    // Surface a notification AND the failure row.
-                    let reason = "The Windows session returned an empty file list."
-                    Log.clip.error("Lazy resolver: \(reason, privacy: .public) — placeholder stays empty")
-                    FileProviderXPCService.shared.markResolveFailed(
-                        sessionID: failedSessionID, reason: reason)
-                    Task { @MainActor in
-                        CopyProgressTracker.shared.failed(
-                            sessionID: failedSessionID,
-                            reason: reason)
-                    }
+                let failedID = event.id
+                let cancelled = CopyEventStore.shared.isSessionCancelled(sessionID: failedID)
+                Log.clip.error("Resolver: no file list (\(cancelled ? "cancelled" : "empty FGDW", privacy: .public)) — serving broken.bin so Finder cleans up the destination")
+                // An EMPTY/error enumerate leaves an empty folder at the
+                // paste destination (Finder already created the dest dir and
+                // doesn't roll it back). A FILE read error, on the other
+                // hand, makes Finder clean the whole dest up. So instead of
+                // failing the enumerate, give the placeholder a single
+                // unreadable `broken.bin`: Finder creates the dest, tries to
+                // read broken.bin, fails, and removes the dest. We then drop
+                // the event + its source placeholder shortly after.
+                let brokenID = UUID().uuidString
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                let brokenTree: [ManifestItem] = [
+                    ManifestItem(id: failedID, filename: placeholderName, size: 0,
+                                 parentID: nil, isDirectory: true, modificationMs: nowMs),
+                    ManifestItem(id: brokenID, filename: "broken.bin", size: 1024,
+                                 parentID: failedID, isDirectory: false, modificationMs: nil),
+                ]
+                event.tree.replaceItems(brokenTree)
+                // brokenID gets NO listIndex → its byte fetch returns an
+                // error → Finder's "couldn't read" cleanup kicks in.
+                CopyEventStore.shared.bindItemsToEvent(brokenTree, sessionID: failedID)
+                CopyEventStore.shared.serveBrokenPlaceholder(sessionID: failedID)
+                // Give Finder a few seconds to enumerate + fail-read + clean
+                // up, then drop the event and its source placeholder.
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    CopyEventStore.shared.dropEvent(sessionID: failedID)
+                    await AppDelegate.sharedClipboardInbox.unpublishItem(id: failedID)
                 }
-                // Drop the placeholder from the FileProvider manifest
-                // so subsequent `item(for: placeholderID)` calls
-                // return noSuchItem. Together with the enumerator
-                // error this nudges Finder to clean up the
-                // partially-created destination folder rather than
-                // leaving an empty wrapper.
-                let inbox = AppDelegate.sharedClipboardInbox
-                Task { await inbox.unpublishItem(id: failedSessionID) }
                 return
             }
 
@@ -842,8 +698,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             self.inFiles = entries
             self.pendingLock.unlock()
 
-            // Build manifest items. Top-level entries become children of
-            // the placeholder folder; deeper entries link via path lookup.
+            // Stable UUIDs + parent links via a path→id dictionary.
             var ids = [String](repeating: "", count: entries.count)
             var pathToID: [String: String] = [:]
             pathToID.reserveCapacity(entries.count)
@@ -857,28 +712,21 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
 
             var manifest: [ManifestItem] = []
             manifest.reserveCapacity(entries.count + 1)
-            // Re-publish placeholder as tree root so it survives the
-            // replaceItems call below.
+            // Placeholder as tree root (survives replaceItems).
             manifest.append(ManifestItem(
-                id: session.id,
+                id: event.id,
                 filename: placeholderName,
                 size: 0,
                 parentID: nil,
                 isDirectory: true,
                 modificationMs: Int64(Date().timeIntervalSince1970 * 1000)))
-            // Mirror entries into the progress-tracker shape (id, name,
-            // size, isDirectory) — only the originals; the synthetic
-            // placeholder root is excluded so the tracker shows the
-            // real file count.
-            var trackerEntries: [(id: String, name: String, size: Int64, isDirectory: Bool)] = []
-            trackerEntries.reserveCapacity(entries.count)
             for (idx, e) in entries.enumerated() {
                 let filename = (e.relativePath as NSString).lastPathComponent
                 let parentInTree: String
                 if let lastSlash = e.relativePath.lastIndex(of: "/") {
-                    parentInTree = pathToID[String(e.relativePath[..<lastSlash])] ?? session.id
+                    parentInTree = pathToID[String(e.relativePath[..<lastSlash])] ?? event.id
                 } else {
-                    parentInTree = session.id
+                    parentInTree = event.id
                 }
                 manifest.append(ManifestItem(
                     id: ids[idx],
@@ -886,82 +734,51 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     size: Int64(e.size),
                     parentID: parentInTree,
                     isDirectory: e.isDirectory,
-                    modificationMs: nil))
+                    modificationMs: e.modificationMs))
                 newIdToListIndex[ids[idx]] = idx
-                trackerEntries.append((id: ids[idx], name: filename,
-                                       size: Int64(e.size),
-                                       isDirectory: e.isDirectory))
             }
 
-            session.tree.replaceItems(manifest)
-            session.idToListIndex = newIdToListIndex
-            FileProviderXPCService.shared.bindItemsToSession(manifest, sessionID: session.id)
-
-            let sessionIDCaptured = session.id
-            Task { @MainActor in
-                CopyProgressTracker.shared.resolved(
-                    sessionID: sessionIDCaptured,
-                    entries: trackerEntries)
-            }
-
-            let t3 = DispatchTime.now().uptimeNanoseconds
-            let ms: (UInt64, UInt64) -> UInt64 = { (a, b) in (b - a) / 1_000_000 }
-            Log.clip.info("Lazy resolver done: count=\(entries.count, privacy: .public) fetch=\(ms(t0, t1), privacy: .public)ms parse=\(ms(t1, t2), privacy: .public)ms build=\(ms(t2, t3), privacy: .public)ms")
-        }
-
-        // Synthetic placeholder folder. The session tree starts with
-        // just this one item; the lazy resolver replaces it with the
-        // full tree when triggered.
-        let placeholderManifest = ManifestItem(
-            id: sessionID,
-            filename: placeholderName,
-            size: 0,
-            parentID: nil,
-            isDirectory: true,
-            modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
-
-        FileProviderXPCService.shared.registerLazySession(
-            domainSubdir: inbox.subdir,
-            sessionID: sessionID,
-            placeholderItem: placeholderManifest,
-            fetcher: fetcher,
-            lazyResolver: resolver,
-            onCleanup: {
-                if let cid = clipDataID {
-                    unlockCb?(cid)
-                }
-            })
-
-        // Publish the placeholder to the FileProvider extension +
-        // claim pasteboard with the placeholder's user-visible URL.
-        Task { @MainActor in
-            do {
-                try await inbox.publish([
-                    FileProviderInbox.PublishItem(
-                        id: sessionID,
-                        filename: placeholderName,
-                        parentID: nil,
-                        isDirectory: true,
-                        size: 0,
-                        modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
-                ])
-            } catch {
-                Log.clip.error("Lazy publish failed: \(String(describing: error), privacy: .public)")
-                return
-            }
-            if let url = await inbox.userVisibleURL(itemID: sessionID, filename: placeholderName) {
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.writeObjects([url as NSURL])
-                self.selfWroteChangeCount = pb.changeCount
-                self.lastChangeCount      = pb.changeCount
-                Log.clip.info("Lazy-mode pasteboard claimed: \(url.path, privacy: .public)")
-            } else {
-                Log.clip.error("Lazy-mode URL resolution failed for placeholder \(placeholderName, privacy: .public)")
-            }
+            event.tree.replaceItems(manifest)
+            event.idToListIndex = newIdToListIndex
+            CopyEventStore.shared.bindItemsToEvent(manifest, sessionID: event.id)
+            // No UI calls here — the store drives the progress UI from the
+            // event's state (.marquee on paste, .transferring on the first
+            // byte burst). The resolver is now pure data.
         }
     }
 
+    /// Eager post-resolve: publish the placeholder + its real children and
+    /// bind the children's URLs to the pasteboard, so Finder pastes with
+    /// real names (no `MacRDP_<uuid>` wrapper). No-op if resolution failed
+    /// (the resolver already notified + unpublished the placeholder).
+    @MainActor
+    private func publishResolvedAndBindRealURLs(sessionID: String,
+                                                placeholderName: String) async {
+        let inbox = AppDelegate.sharedClipboardInbox
+        guard let resolved = CopyEventStore.shared.resolvedTopLevel(sessionID: sessionID) else {
+            Log.clip.notice("Eager: nothing to bind (resolve failed or event gone) for \(sessionID, privacy: .public)")
+            return
+        }
+        func toPublish(_ m: ManifestItem) -> FileProviderInbox.PublishItem {
+            FileProviderInbox.PublishItem(
+                id: m.id, filename: m.filename, parentID: m.parentID,
+                isDirectory: m.isDirectory, size: m.size,
+                modificationMs: m.modificationMs)
+        }
+        // Publish placeholder (root) + immediate children so the framework
+        // indexes them; deeper subtrees stay lazy via enumerateChildren.
+        let publishItems = [toPublish(resolved.placeholder)] + resolved.children.map(toPublish)
+        do {
+            try await inbox.publish(publishItems)
+        } catch {
+            Log.clip.error("Eager publish failed: \(String(describing: error), privacy: .public)")
+            return
+        }
+        // Bind the children (real top-level) URLs — Finder strips the
+        // placeholder parent path on paste, so real names land.
+        await self.resolveAndWriteFileURLs(inbox: inbox,
+                                           items: resolved.children.map(toPublish))
+    }
 
     @MainActor
     private func resolveAndWriteFileURLs(inbox: FileProviderInbox,
@@ -1250,6 +1067,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     fileprivate static func parseFileGroupDescriptorW(_ data: Data) -> [InFileEntry] {
         guard data.count >= 4 else { return [] }
         let FILE_ATTRIBUTE_DIRECTORY: UInt32 = 0x10
+        let FD_WRITESTIME: UInt32 = 0x00000020   // ftLastWriteTime is valid
         return data.withUnsafeBytes { raw -> [InFileEntry] in
             guard let base = raw.baseAddress else { return [] }
             let count = base.load(fromByteOffset: 0, as: UInt32.self).littleEndian
@@ -1260,10 +1078,26 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             nameUnits.reserveCapacity(260)
             for i in 0..<Int(count) {
                 let entry = base.advanced(by: 4 + i * 592)
+                let flags  = entry.load(fromByteOffset: 0, as: UInt32.self).littleEndian
                 let attr   = entry.load(fromByteOffset: 36, as: UInt32.self).littleEndian
                 let sizeHi = entry.load(fromByteOffset: 64, as: UInt32.self).littleEndian
                 let sizeLo = entry.load(fromByteOffset: 68, as: UInt32.self).littleEndian
                 let size = (UInt64(sizeHi) << 32) | UInt64(sizeLo)
+                // ftLastWriteTime @56 (FILETIME: 100-ns ticks since
+                // 1601-01-01 UTC). Read as two UInt32 (offset 56 is only
+                // 4-aligned, not 8 — a UInt64 load would trap). Convert to
+                // unix-epoch ms when present.
+                var modMs: Int64? = nil
+                if (flags & FD_WRITESTIME) != 0 {
+                    let ftLow  = entry.load(fromByteOffset: 56, as: UInt32.self).littleEndian
+                    let ftHigh = entry.load(fromByteOffset: 60, as: UInt32.self).littleEndian
+                    let ft = (UInt64(ftHigh) << 32) | UInt64(ftLow)
+                    if ft != 0 {
+                        // 11644473600 = seconds between 1601 and 1970.
+                        let ms = Int64(ft / 10_000) - 11_644_473_600_000
+                        if ms > 0 { modMs = ms }
+                    }
+                }
                 // Decode cFileName: UTF-16LE up to first NUL, max 260 chars.
                 nameUnits.removeAll(keepingCapacity: true)
                 let nameBase = entry.advanced(by: 72)
@@ -1284,7 +1118,8 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 let isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0
                 out.append(InFileEntry(relativePath: normalized,
                                        isDirectory: isDir,
-                                       size: size))
+                                       size: size,
+                                       modificationMs: modMs))
             }
             return out
         }

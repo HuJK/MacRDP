@@ -6,7 +6,7 @@
 import Foundation
 import os
 
-enum Log {
+nonisolated enum Log {
     static let subsystem = "com.macrdp.server"
 
     static let server   = Logger(subsystem: subsystem, category: "server")

@@ -217,6 +217,10 @@ struct Config: Codable, Sendable {
         /// Optional in JSON so older config files without the field
         /// keep working — nil is treated as "eager".
         var fileFetchMode: String?
+        /// Window (seconds) over which the copy-progress "realtime speed"
+        /// is averaged. Larger = smoother (small/fast files won't spike
+        /// the number); smaller = more responsive. nil → 4s.
+        var speedStatsWindowSec: Double?
     }
 
     /// Device redirection (MS-RDPEFS / RDPDR). Phase 1 of this feature
@@ -259,7 +263,7 @@ struct Config: Codable, Sendable {
             audioIn: .init(enabled: true, outputDeviceUID: nil),
             clipboard: .init(text: true, image: true, files: true,
                              maxFileSizeMiB: 4096, pollIntervalMs: 200,
-                             fileFetchMode: nil),
+                             fileFetchMode: "lazy"),
             rdpdr: .init(enabled: true)
         )
     }

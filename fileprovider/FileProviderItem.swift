@@ -49,12 +49,20 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return Date(timeIntervalSince1970: Double(ms) / 1000.0)
     }
 
-    /// Read-only domain: users can copy out (allowsReading) but not
-    /// modify, rename, or delete from Finder.
+    /// Include `.allowsWriting` even though the domain is conceptually
+    /// read-only. Without it, fileproviderd materializes each item as
+    /// IMMUTABLE (the `uchg` / Finder "Locked" flag), and a Finder paste
+    /// PRESERVES that flag into the destination — so every pasted file
+    /// lands locked. Advertising writability drops the immutable flag so
+    /// the copied-out file is a normal, editable file. (We don't actually
+    /// support writing back INTO the domain — but the clipboard staging
+    /// folder is only ever copied OUT of, so no modify path is exercised.)
     var capabilities: NSFileProviderItemCapabilities {
         return entry.isDirectory
-            ? [.allowsReading, .allowsContentEnumerating]
-            : [.allowsReading]
+            ? [.allowsReading, .allowsContentEnumerating, .allowsWriting,
+               .allowsDeleting, .allowsRenaming, .allowsTrashing]
+            : [.allowsReading, .allowsWriting,
+               .allowsDeleting, .allowsRenaming, .allowsTrashing]
     }
 
     /// Surface the item to Finder as a normal user-readable AND
@@ -71,12 +79,23 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return [.userReadable, .userWritable]
     }
 
-    /// Tying both contentVersion and metadataVersion to the manifest's
-    /// sessionID means: any time we publish a new manifest, Finder sees
-    /// the items as "changed" and re-fetches.
+    /// Version is STABLE for the lifetime of one copy event. The item id
+    /// is a per-event UUID and the bytes are an immutable Windows
+    /// snapshot, so neither content nor metadata ever changes once the
+    /// item is published. Keeping the version stable lets fileproviderd
+    /// serve repeat pastes (and concurrent pastes to multiple
+    /// destinations) from its local replica instead of re-fetching from
+    /// Windows — i.e. "files already pulled aren't re-transferred."
+    ///
+    /// A NEW copy event mints fresh item ids → fresh versions → a clean
+    /// re-fetch, which is exactly what we want. (Previously this was tied
+    /// to the manifest's per-publish random sessionID, which forced a
+    /// re-fetch of everything on every publish.)
     var itemVersion: NSFileProviderItemVersion {
-        let v = manifestSessionID.data(using: .utf8) ?? Data([1])
-        return NSFileProviderItemVersion(contentVersion: v, metadataVersion: v)
+        let content = "\(entry.id):\(entry.size)".data(using: .utf8) ?? Data([1])
+        let meta = "\(entry.id):\(entry.filename):\(entry.size):\(entry.modificationMs ?? 0)"
+            .data(using: .utf8) ?? Data([1])
+        return NSFileProviderItemVersion(contentVersion: content, metadataVersion: meta)
     }
 }
 
@@ -91,7 +110,7 @@ final class RootFileProviderItem: NSObject, NSFileProviderItem {
     var filename: String { displayName }
     var contentType: UTType { .folder }
     var capabilities: NSFileProviderItemCapabilities {
-        [.allowsReading, .allowsContentEnumerating]
+        [.allowsReading, .allowsContentEnumerating  , .allowsWriting]
     }
     var fileSystemFlags: NSFileProviderFileSystemFlags {
         [.userReadable, .userWritable, .userExecutable]

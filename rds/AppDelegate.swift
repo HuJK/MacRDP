@@ -139,10 +139,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // NSFileProviderService connection opened on first publish;
             // no Mach service listener to start up front.
             await AppDelegate.sharedClipboardInbox.register()
-            // DEV: publish a synthetic 1 MiB test file so we can
-            // verify the FP + XPC pipeline end-to-end before bringing
-            // RDP into the picture.
-            await AppDelegate.sharedClipboardInbox.publishTestFile()
+            // Wire the copy-progress UI: it polls CopyEventStore for
+            // progress snapshots (the store wakes it when work starts).
+            CopyProgressTracker.shared.configure(
+                domainSubdir: AppDelegate.sharedClipboardInbox.subdir,
+                speedWindowSec: config.clipboard.speedStatsWindowSec ?? 4)
             self.finishStartup(config: config)
         }
     }

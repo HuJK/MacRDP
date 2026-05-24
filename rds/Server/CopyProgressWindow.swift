@@ -18,7 +18,6 @@
 
 import AppKit
 import os
-import UserNotifications
 
 @MainActor
 final class CopyProgressTracker {
@@ -26,371 +25,63 @@ final class CopyProgressTracker {
     static let shared = CopyProgressTracker()
     private init() {}
 
-    // MARK: - Session model
-
-    fileprivate struct TrackedItem {
-        let id: String
-        let name: String
-        let size: Int64
-        let isDirectory: Bool
-        var bytesSeen: Int64 = 0
-        var weight: Int64 { isDirectory ? 4096 : (size + 4096) }
-        var contributedWeight: Int64 {
-            if isDirectory { return weight }
-            let seen = max(bytesSeen, 0)
-            if seen >= size { return weight }
-            return seen
-        }
-        var contributedReal: Int64 {
-            isDirectory ? 0 : min(size, max(bytesSeen, 0))
-        }
-    }
-
-    /// Per-session UX phase. Eager-mode sessions go straight to
-    /// `.transferring` since `registerItems` has the full file list.
-    /// Lazy-mode sessions start in `.resolving` (marquee bar while
-    /// FGDW is fetched on paste demand), then transition to
-    /// `.transferring` once `resolved(..)` populates the real items.
-    fileprivate enum Phase {
-        case resolving
-        case transferring
-    }
-
-    /// One per Windows-clipboard event the user copied.
-    fileprivate final class Session {
-        let id: String
-        let title: String
-        var items: [String: TrackedItem] = [:]
-        var totalWeight: Int64 = 0
-        var totalRealBytes: Int64 = 0
-        var startedAt: Date? = nil
-        var lastChunkAt: Date = Date()
-        var lastSampleAt: Date? = nil
-        var lastSampleBytes: Int64 = 0
-        var cancelled: Bool = false
-        var completedNotifiedAt: Date? = nil
-        var phase: Phase = .transferring
-        /// Set by `failed(..)` when the resolver couldn't produce an
-        /// item list (timeout, FAIL, or empty FGDW). The row shows
-        /// an error treatment and the bar stops animating.
-        var failureReason: String? = nil
-        /// Per-session sample buffer for the expandable line chart.
-        var speedSamples: [(pct: Double, bps: Double)] = []
-        init(id: String, title: String) {
-            self.id = id
-            self.title = title
-        }
-    }
-
-    /// Live sessions, oldest-first (UUID lex order is good enough).
-    private var sessions: [Session] = []
-    /// itemID → sessionID; populated by `registerItems`.
-    private var itemToSession: [String: String] = [:]
-
     private var windowController: CopyProgressWindowController?
-    /// Independent ~500ms timer for speed sampling across all sessions.
-    private var sampleTimer: Timer?
-    /// Auto-close after this much idle time once every session is
-    /// either done or cancelled.
-    private static let idleHideAfter: TimeInterval = 1.5
-    private var hideTimer: Timer?
-    /// Per-session deferred "show window" timer. Window only appears
-    /// 500 ms after first chunk for a session — instant transfers
-    /// don't flash a UI element.
-    private var showTimers: [String: Timer] = [:]
+    private var pollTimer: Timer?
+    private var domainSubdir = ""
+    /// Consecutive empty polls before stopping the timer — a brief gap
+    /// between transfers shouldn't tear the poller down mid-paste.
+    private var emptyPolls = 0
+    private static let pollInterval: TimeInterval = 0.25   // smoother bar + snappier UI
+    private static let stopAfterEmptyPolls = 12            // ~3s idle → stop polling
 
-    // MARK: - Registration
-
-    /// Called from ClipboardBridge right before its host XPC fetcher
-    /// closure can fire. Adds a new session; existing sessions are
-    /// preserved (this is multi-copy aware).
-    func registerItems(sessionID: String,
-                       title: String,
-                       entries: [(id: String,
-                                   name: String,
-                                   size: Int64,
-                                   isDirectory: Bool)]) {
-        let s = Session(id: sessionID, title: title)
-        for e in entries {
-            let it = TrackedItem(id: e.id, name: e.name,
-                                 size: e.size, isDirectory: e.isDirectory)
-            s.items[it.id] = it
-            s.totalWeight += it.weight
-            if !it.isDirectory { s.totalRealBytes += it.size }
-            itemToSession[it.id] = sessionID
-        }
-        sessions.append(s)
-        // NO `ensureWindow()` here — we only register the session.
-        // The window appears 500 ms after the first chunk lands for
-        // this session (see `_chunkDelivered`). Pure copy events
-        // shouldn't produce any visible UI.
-    }
-
-    /// Lazy-mode: announce that an FGDW fetch is in flight for this
-    /// session, so the UI can show a "Resolving file list…" marquee
-    /// bar BEFORE any byte transfers begin. The window appears
-    /// immediately (no 500 ms defer) because the resolving phase
-    /// itself can take several seconds for large folders.
-    func registerResolvingSession(sessionID: String, title: String) {
-        // If a session already exists (paranoia — same UUID used
-        // twice), upgrade it to resolving rather than creating a dup.
-        if let existing = sessions.first(where: { $0.id == sessionID }) {
-            existing.phase = .resolving
-            existing.startedAt = existing.startedAt ?? Date()
-            ensureWindow()
-            windowController?.reloadRows(
-                sessions: sessions.filter { $0.startedAt != nil },
-                tracker: self)
-            windowController?.refreshRow(sessionID: sessionID,
-                                          snapshot: snapshot(existing))
-            return
-        }
-        let s = Session(id: sessionID, title: title)
-        s.phase = .resolving
-        s.startedAt = Date()
-        sessions.append(s)
-        ensureWindow()
-        windowController?.reloadRows(
-            sessions: sessions.filter { $0.startedAt != nil },
-            tracker: self)
-        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
-    }
-
-    /// Lazy-mode: the resolver couldn't produce a useful file list
-    /// (timeout, CB_RESPONSE_FAIL, or an empty FGDW). Marks the row
-    /// as failed, shows a system notification, and clears the
-    /// pasteboard claim so the user isn't left holding a dead URL.
-    func failed(sessionID: String, reason: String) {
-        guard let s = sessions.first(where: { $0.id == sessionID }) else {
-            // No session was registered yet — still show a system
-            // notification so the user sees *something*.
-            Self.postSystemNotification(
-                title: "Paste from Windows failed",
-                body: reason)
-            return
-        }
-        s.failureReason = reason
-        // Ensure the window is visible — most failure cases happen
-        // BEFORE the user sees the resolving row, so we have to nudge
-        // it onto screen explicitly.
-        ensureWindow()
-        windowController?.reloadRows(
-            sessions: sessions.filter { $0.startedAt != nil },
-            tracker: self)
-        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
-        Self.postSystemNotification(
-            title: "Paste from Windows failed",
-            body: "\(s.title): \(reason)")
-        rescheduleHideIfAllDone()
-    }
-
-    /// Fire just a system notification, without touching the progress
-    /// window. Used when a copy failure happens BEFORE any session is
-    /// registered (eager mode: empty FGDW arrives before we'd publish
-    /// items or a row). Keeps the "Paste from Windows failed"
-    /// notification a single source of truth for end-user-visible
-    /// alerts about clipboard failures.
-    nonisolated static func notifyPasteFailed(reason: String) {
-        postSystemNotification(
-            title: "Paste from Windows failed",
-            body: reason)
-    }
-
-    /// Best-effort system notification. Uses UNUserNotificationCenter;
-    /// silently no-ops if authorization is denied / not configured.
-    nonisolated private static func postSystemNotification(title: String,
-                                                            body: String) {
-        // UserNotifications requires authorization. Request the first
-        // time; subsequent calls hit the cached grant. If the user has
-        // denied it, the request returns success=false and the post
-        // call just silently fails — which is fine.
-        let center = UNUserNotificationCenter.current()
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            content.sound = .default
-            let req = UNNotificationRequest(
-                identifier: UUID().uuidString,
-                content: content,
-                trigger: nil)
-            center.add(req) { _ in }
-        }
-    }
-
-    /// Lazy-mode: the FGDW fetch has completed; transition the
-    /// session from resolving to transferring and populate the
-    /// real item list. Same semantics as `registerItems` but
-    /// applied in-place to an existing session.
-    func resolved(sessionID: String,
-                  entries: [(id: String, name: String, size: Int64, isDirectory: Bool)]) {
-        guard let s = sessions.first(where: { $0.id == sessionID }) else {
-            // Race: resolver finished before registerResolvingSession
-            // got scheduled, or the session was cleaned up. Fall back
-            // to standard registration so byte progress still tracks.
-            registerItems(sessionID: sessionID, title: sessionID, entries: entries)
-            return
-        }
-        s.phase = .transferring
-        // Reset accumulators so the new entries are the only truth.
-        for it in s.items.values { itemToSession.removeValue(forKey: it.id) }
-        s.items.removeAll(keepingCapacity: false)
-        s.totalWeight = 0
-        s.totalRealBytes = 0
-        for e in entries {
-            let it = TrackedItem(id: e.id, name: e.name,
-                                 size: e.size, isDirectory: e.isDirectory)
-            s.items[it.id] = it
-            s.totalWeight += it.weight
-            if !it.isDirectory { s.totalRealBytes += it.size }
-            itemToSession[it.id] = sessionID
-        }
-        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(s))
-    }
-
-    // MARK: - Chunk firehose
-
-    nonisolated func chunkDelivered(itemID: String,
-                                    offset: Int64,
-                                    length: Int64) {
-        Task { @MainActor in self._chunkDelivered(itemID: itemID, offset: offset, length: length) }
-    }
-
-    private func _chunkDelivered(itemID: String, offset: Int64, length: Int64) {
-        guard let sid = itemToSession[itemID] else { return }
-        guard let session = sessions.first(where: { $0.id == sid }) else { return }
-        guard var item = session.items[itemID] else { return }
-        item.bytesSeen = max(item.bytesSeen, offset + length)
-        session.items[itemID] = item
-        let isFirstChunk = (session.startedAt == nil)
-        if isFirstChunk {
-            session.startedAt = Date()
-            session.lastSampleAt = session.startedAt
-            session.lastSampleBytes = 0
-            startSamplerIfNeeded()
-            // Defer the window by 500 ms — small / instant transfers
-            // (e.g. the synthetic test file or tiny pastes) complete
-            // before the timer fires and never produce visible UI.
-            let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.showRowIfStillTransferring(sid: sid) }
+    /// Wire up at startup: feed the speed window from config, point at the
+    /// clipboard domain, and let the store wake us when work starts (so no
+    /// perpetual timer runs while idle).
+    func configure(domainSubdir: String, speedWindowSec: TimeInterval) {
+        self.domainSubdir = domainSubdir
+        CopyEventStore.shared.speedWindowSec = speedWindowSec
+        CopyEventStore.shared.setActivityWake {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { CopyProgressTracker.shared.startPolling() }
             }
-            showTimers[sid] = timer
         }
-        session.lastChunkAt = Date()
-        windowController?.refreshRow(sessionID: sid, snapshot: snapshot(session))
-        rescheduleHideIfAllDone()
     }
 
-    private func showRowIfStillTransferring(sid: String) {
-        showTimers.removeValue(forKey: sid)
-        guard let session = sessions.first(where: { $0.id == sid }) else { return }
-        // If the transfer already finished, skip showing the window.
-        let weighted = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-        if !session.cancelled,
-           weighted >= session.totalWeight, session.totalWeight > 0 { return }
-        ensureWindow()
-        // Show only rows for sessions that have actually started.
-        let active = sessions.filter { $0.startedAt != nil }
-        windowController?.reloadRows(sessions: active, tracker: self)
-        windowController?.refreshRow(sessionID: sid, snapshot: snapshot(session))
-    }
-
-    // MARK: - User cancel
-
-    /// Called from the row's ✕ button.
+    /// Row's ✕ button — cancel the current transfer (event stays alive).
     func cancel(sessionID: String) {
-        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
-        session.cancelled = true
-        FileProviderXPCService.shared.cancelSession(sessionID: sessionID)
-        windowController?.refreshRow(sessionID: sessionID, snapshot: snapshot(session))
-        rescheduleHideIfAllDone()
+        CopyEventStore.shared.cancelSession(sessionID: sessionID)
+        poll()   // reflect the cancelled state now, not on the next tick
     }
 
-    // MARK: - Sampling
+    // MARK: - Poll loop
 
-    private func startSamplerIfNeeded() {
-        guard sampleTimer == nil else { return }
-        sampleTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tickSamples() }
+    private func startPolling() {
+        guard pollTimer == nil else { return }
+        emptyPolls = 0
+        pollTimer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
         }
+        poll()   // render immediately, don't wait for the first tick
     }
 
-    private func tickSamples() {
-        let now = Date()
-        for session in sessions {
-            guard session.startedAt != nil else { continue }
-            let nowReal = session.items.values.reduce(0) { $0 + $1.contributedReal }
-            let deltaT = session.lastSampleAt.map { now.timeIntervalSince($0) } ?? 0
-            let bps = deltaT > 0
-                ? Double(nowReal - session.lastSampleBytes) / deltaT
-                : 0
-            session.lastSampleAt = now
-            session.lastSampleBytes = nowReal
-            let weighted = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-            let frac = session.totalWeight > 0
-                ? Double(weighted) / Double(session.totalWeight) : 0
-            // De-dup near-identical X to avoid vertical stripes.
-            if let last = session.speedSamples.last,
-               abs(last.pct - frac) < 0.001 {
-                session.speedSamples[session.speedSamples.count - 1] =
-                    (frac, (last.bps + max(0, bps)) / 2)
-            } else {
-                session.speedSamples.append((frac, max(0, bps)))
+    private func poll() {
+        // Single consistent read of all rows. The store ages each event's
+        // speed window by "now" inside this call (the stall-decay tick,
+        // folded into the poll — there is no separate timer).
+        let snaps = CopyEventStore.shared.progressSnapshots(domainSubdir: domainSubdir)
+
+        if snaps.isEmpty {
+            emptyPolls += 1
+            windowController?.render([], tracker: self)
+            if emptyPolls >= Self.stopAfterEmptyPolls {
+                pollTimer?.invalidate(); pollTimer = nil
+                windowController?.close(); windowController = nil
             }
-            windowController?.refreshRow(sessionID: session.id, snapshot: snapshot(session))
+            return
         }
-    }
-
-    // MARK: - Snapshots / window plumbing
-
-    struct Snapshot {
-        let id: String
-        let title: String
-        let fileCount: Int
-        let progressFraction: Double
-        let completedRealBytes: Int64
-        let totalRealBytes: Int64
-        let bytesPerSec: Double
-        let etaSeconds: TimeInterval
-        let filesCompleted: Int
-        let filesTotal: Int
-        let currentName: String
-        let cancelled: Bool
-        let isComplete: Bool
-        let isResolving: Bool
-        let failureReason: String?
-        let speedSamples: [(pct: Double, bps: Double)]
-    }
-
-    fileprivate func snapshot(_ session: Session) -> Snapshot {
-        let weighted = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-        let real = session.items.values.reduce(0) { $0 + $1.contributedReal }
-        let frac = session.totalWeight > 0
-            ? Double(weighted) / Double(session.totalWeight) : 0
-        let elapsed = session.startedAt.map { max(Date().timeIntervalSince($0), 0.001) } ?? 0.001
-        let bps = Double(real) / elapsed
-        let eta = frac > 0 && frac < 1 ? elapsed * (1.0 / frac - 1.0) : 0
-        let files = session.items.values.filter { !$0.isDirectory }
-        let done = files.filter { $0.bytesSeen >= $0.size && $0.size > 0 }.count
-        let current = session.items.values.first { $0.bytesSeen > 0 && $0.bytesSeen < $0.size }
-            ?? session.items.values.first { !$0.isDirectory }
-        return Snapshot(
-            id: session.id,
-            title: session.title,
-            fileCount: files.count,
-            progressFraction: frac,
-            completedRealBytes: real,
-            totalRealBytes: session.totalRealBytes,
-            bytesPerSec: bps,
-            etaSeconds: eta,
-            filesCompleted: done,
-            filesTotal: files.count,
-            currentName: current?.name ?? "—",
-            cancelled: session.cancelled,
-            isComplete: !session.cancelled && weighted >= session.totalWeight && session.totalWeight > 0,
-            isResolving: session.phase == .resolving && session.failureReason == nil,
-            failureReason: session.failureReason,
-            speedSamples: session.speedSamples)
+        emptyPolls = 0
+        ensureWindow()
+        windowController?.render(snaps, tracker: self)
     }
 
     private func ensureWindow() {
@@ -398,49 +89,6 @@ final class CopyProgressTracker {
             windowController = CopyProgressWindowController(tracker: self)
         }
         windowController?.showWindow(nil)
-    }
-
-    private func rescheduleHideIfAllDone() {
-        // Hide only when EVERY active (= ever-transferred) session is
-        // done, cancelled, or failed. Idle copy events that never
-        // received a chunk don't count.
-        let activeSessions = sessions.filter { $0.startedAt != nil }
-        guard !activeSessions.isEmpty else { return }
-        let allDone = activeSessions.allSatisfy { session in
-            let w = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-            return session.cancelled
-                || session.failureReason != nil
-                || (w >= session.totalWeight && session.totalWeight > 0)
-        }
-        hideTimer?.invalidate()
-        guard allDone else { return }
-        // Failed rows are sticky for a bit so the user can read the
-        // reason — extend the idle period when any session failed.
-        let anyFailed = activeSessions.contains { $0.failureReason != nil }
-        let delay = anyFailed ? 8.0 : Self.idleHideAfter
-        hideTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.closeWindowIfStillIdle() }
-        }
-    }
-
-    private func closeWindowIfStillIdle() {
-        let activeSessions = sessions.filter { $0.startedAt != nil }
-        let allDone = activeSessions.allSatisfy { session in
-            let w = session.items.values.reduce(0) { $0 + $1.contributedWeight }
-            return session.cancelled
-                || session.failureReason != nil
-                || (w >= session.totalWeight && session.totalWeight > 0)
-        }
-        guard allDone else { return }
-        // Keep registered-but-never-started sessions around — they
-        // may be triggered by a paste later. But drop the active ones.
-        sessions.removeAll { $0.startedAt != nil }
-        // Best-effort: also drop their item mappings.
-        let liveItemIDs = Set(sessions.flatMap { $0.items.keys })
-        itemToSession = itemToSession.filter { liveItemIDs.contains($0.key) }
-        sampleTimer?.invalidate(); sampleTimer = nil
-        windowController?.close()
-        windowController = nil
     }
 }
 
@@ -507,11 +155,10 @@ private final class CopyProgressWindowController: NSWindowController {
         ])
     }
 
-    func reloadRows(sessions: [CopyProgressTracker.Session],
-                    tracker: CopyProgressTracker) {
-        // Snapshot the desired ordered ids; add any missing, remove any
-        // stale, keep existing rows intact.
-        let desired = sessions.map { $0.id }
+    /// Reconcile the displayed rows with the polled snapshots: add new,
+    /// drop gone, apply each.
+    func render(_ snapshots: [ClipProgressSnapshot], tracker: CopyProgressTracker) {
+        let desired = snapshots.map { $0.id }
         let desiredSet = Set(desired)
 
         for sid in orderedRowIDs where !desiredSet.contains(sid) {
@@ -524,17 +171,14 @@ private final class CopyProgressWindowController: NSWindowController {
             let row = SessionRowView(sessionID: sid) { [weak tracker] in
                 tracker?.cancel(sessionID: sid)
             }
+            row.onLayoutChange = { [weak self] in self?.relayoutForRowCount() }
             rows[sid] = row
             orderedRowIDs.append(sid)
             stack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: stack.widthAnchor,
                                         constant: -32).isActive = true
         }
-        relayoutForRowCount()
-    }
-
-    func refreshRow(sessionID: String, snapshot: CopyProgressTracker.Snapshot) {
-        rows[sessionID]?.apply(snapshot)
+        for s in snapshots { rows[s.id]?.apply(s) }
         relayoutForRowCount()
     }
 
@@ -561,6 +205,10 @@ private final class SessionRowView: NSView {
 
     private let sessionID: String
     private let onCancel: () -> Void
+    /// Called when the row's height changes (expand/collapse) so the
+    /// controller can resize the window IMMEDIATELY instead of waiting for
+    /// the next poll tick.
+    var onLayoutChange: () -> Void = {}
 
     private let header = NSTextField(labelWithString: "")
     private let bar = NSProgressIndicator()
@@ -639,19 +287,16 @@ private final class SessionRowView: NSView {
         chart.translatesAutoresizingMaskIntoConstraints = false
         chart.heightAnchor.constraint(equalToConstant: 70).isActive = true
 
-        // Header row: title + cancel button on the right.
-        let headerRow = NSStackView(views: [header, cancelButton])
+        // Header row: title + percent + cancel button on the right. Percent
+        // lives here (not next to the bar) so the bar can span the full
+        // width and line up exactly with the chart below.
+        let headerRow = NSStackView(views: [header, percent, cancelButton])
         headerRow.orientation = .horizontal
         headerRow.alignment = .centerY
         headerRow.distribution = .fill
         cancelButton.setContentHuggingPriority(.required, for: .horizontal)
-        header.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        // Bar row: bar + percent on the right.
-        let barRow = NSStackView(views: [bar, percent])
-        barRow.orientation = .horizontal
-        barRow.alignment = .centerY
         percent.setContentHuggingPriority(.required, for: .horizontal)
+        header.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let outer = NSStackView()
         outer.orientation = .vertical
@@ -659,9 +304,9 @@ private final class SessionRowView: NSView {
         outer.spacing = 4
         outer.translatesAutoresizingMaskIntoConstraints = false
         outer.addArrangedSubview(headerRow)
-        outer.addArrangedSubview(barRow)
+        outer.addArrangedSubview(bar)            // full width, aligns with chart
+        outer.addArrangedSubview(detailsBlock)   // expanded content ABOVE the toggle
         outer.addArrangedSubview(detailsToggle)
-        outer.addArrangedSubview(detailsBlock)
 
         addSubview(outer)
         NSLayoutConstraint.activate([
@@ -670,8 +315,8 @@ private final class SessionRowView: NSView {
             outer.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             outer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
             headerRow.widthAnchor.constraint(equalTo: outer.widthAnchor),
-            barRow.widthAnchor.constraint(equalTo: outer.widthAnchor),
-            bar.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
+            // bar and chart share the SAME width and leading edge → aligned.
+            bar.widthAnchor.constraint(equalTo: outer.widthAnchor),
             detailsBlock.widthAnchor.constraint(equalTo: outer.widthAnchor),
             chart.widthAnchor.constraint(equalTo: detailsBlock.widthAnchor),
         ])
@@ -685,39 +330,16 @@ private final class SessionRowView: NSView {
         detailsBlock.isHidden = !detailsExpanded
         detailsToggle.title = detailsExpanded ? "Fewer details ⌃" : "More details ⌄"
         needsLayout = true
+        layoutSubtreeIfNeeded()
+        onLayoutChange()   // resize the window NOW, don't wait for a poll
     }
 
-    func apply(_ s: CopyProgressTracker.Snapshot) {
-        // Failed: the lazy resolver couldn't get a file list. Stop
-        // any marquee animation, show an error treatment, and let
-        // the user know via system notification (fired separately).
-        if let reason = s.failureReason {
-            if bar.isIndeterminate {
-                bar.stopAnimation(nil)
-                bar.isIndeterminate = false
-            }
-            bar.doubleValue = 0
-            header.stringValue =
-                "Failed to resolve file list  ·  id=\(s.id.prefix(8))"
-            percent.stringValue = ""
-            chart.setSamples([], currentBps: 0)
-            speedLabel.stringValue = "Reason: \(reason)"
-            nameLabel.stringValue  = "Name: —"
-            etaLabel.stringValue   = "Time remaining: —"
-            itemsLabel.stringValue = "Items remaining: —"
-            cancelButton.isHidden = true
-            return
-        }
-        // Resolving phase: FGDW fetch in flight, no item list yet.
-        // Bar is indeterminate (marquee), header explains state,
-        // detail labels are placeholders.
-        if s.isResolving && !s.cancelled {
-            if !bar.isIndeterminate {
-                bar.isIndeterminate = true
-            }
+    func apply(_ s: ClipProgressSnapshot) {
+        switch s.kind {
+        case .resolving:
+            if !bar.isIndeterminate { bar.isIndeterminate = true }
             bar.startAnimation(nil)
-            header.stringValue =
-                "Resolving file list…  ·  id=\(s.id.prefix(8))"
+            header.stringValue = "Resolving file list…  ·  id=\(s.id.prefix(8))"
             percent.stringValue = ""
             chart.setSamples([], currentBps: 0)
             speedLabel.stringValue = "Speed: —"
@@ -725,38 +347,31 @@ private final class SessionRowView: NSView {
             etaLabel.stringValue   = "Time remaining: calculating…"
             itemsLabel.stringValue = "Items remaining: —"
             cancelButton.isHidden = false
-            return
-        }
-        // Transferring phase (the default). Stop any marquee animation
-        // started during a prior resolving phase, then render
-        // determinate progress like before.
-        if bar.isIndeterminate {
-            bar.stopAnimation(nil)
-            bar.isIndeterminate = false
-        }
-        let pctInt = Int((s.progressFraction * 100).rounded())
-        bar.doubleValue = s.progressFraction
-        let stateTag: String
-        if s.cancelled { stateTag = " — cancelled" }
-        else if s.isComplete { stateTag = " — done" }
-        else { stateTag = "" }
-        let fileWord = s.fileCount == 1 ? "file" : "files"
-        header.stringValue =
-            "Copying \(formatCount(s.fileCount)) \(fileWord)\(stateTag)  ·  id=\(s.id.prefix(8))"
-        percent.stringValue = "\(pctInt)%"
 
-        if s.cancelled || s.isComplete {
-            cancelButton.isHidden = true
+        case .transferring:
+            if bar.isIndeterminate { bar.stopAnimation(nil); bar.isIndeterminate = false }
+            let pctInt = Int((s.progressFraction * 100).rounded())
+            bar.doubleValue = s.progressFraction
+            let stateTag = s.cancelled ? " — cancelled" : (s.isComplete ? " — done" : "")
+            let fileWord = s.filesTotal == 1 ? "file" : "files"
+            header.stringValue =
+                "Copying \(formatCount(s.filesTotal)) \(fileWord)\(stateTag)  ·  id=\(s.id.prefix(8))"
+            percent.stringValue = "\(pctInt)%"
+            cancelButton.isHidden = (s.cancelled || s.isComplete)
+            let remainingBytes = max(0, s.totalRealBytes - s.completedRealBytes)
+            chart.setSamples(s.chart, currentBps: s.bytesPerSec)
+            speedLabel.stringValue = "Speed: \(formatNetworkSpeed(s.bytesPerSec))"
+            nameLabel.stringValue  = "Name: \(s.currentName)"
+            // Resolved but no bytes yet → "waiting for transfer" instead of
+            // a misleading "less than a second".
+            let waiting = s.completedRealBytes == 0 && !s.isComplete
+            etaLabel.stringValue = waiting
+                ? "Time remaining: waiting for transfer"
+                : "Time remaining: \(formatDuration(s.etaSeconds, finished: s.isComplete))"
+            itemsLabel.stringValue =
+                "Items remaining: \(formatCount(s.filesTotal - s.filesCompleted)) "
+                + "(\(formatBytes(remainingBytes)))"
         }
-
-        let remainingBytes = max(0, s.totalRealBytes - s.completedRealBytes)
-        chart.setSamples(s.speedSamples, currentBps: s.bytesPerSec)
-        speedLabel.stringValue = "Speed: \(formatNetworkSpeed(s.bytesPerSec))"
-        nameLabel.stringValue  = "Name: \(s.currentName)"
-        etaLabel.stringValue   = "Time remaining: \(formatDuration(s.etaSeconds, finished: s.isComplete))"
-        itemsLabel.stringValue =
-            "Items remaining: \(formatCount(s.filesTotal - s.filesCompleted)) "
-            + "(\(formatBytes(remainingBytes)))"
     }
 
     // Formatters (kept here to make the row self-contained).
@@ -799,10 +414,10 @@ private final class SessionRowView: NSView {
 @MainActor
 private final class SpeedChartView: NSView {
 
-    private var samples: [(pct: Double, bps: Double)] = []
+    private var samples: [ChartPoint] = []
     private var currentBps: Double = 0
 
-    func setSamples(_ s: [(pct: Double, bps: Double)], currentBps: Double) {
+    func setSamples(_ s: [ChartPoint], currentBps: Double) {
         self.samples = s
         self.currentBps = currentBps
         needsDisplay = true

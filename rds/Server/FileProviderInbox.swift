@@ -343,62 +343,6 @@ final class FileProviderInbox {
         }
     }
 
-    /// Publish a deterministic 1 MiB test file and register a fetcher
-    /// that synthesizes its bytes on demand. No RDP involvement —
-    /// purely exercises the FileProvider + XPC plumbing.
-    /// Call once at app start. Pasting `~/Library/CloudStorage/<dom>/test1MB.bin`
-    /// in Finder should produce a real 1 MiB file via our extension.
-    func publishTestFile() async {
-        let testID = "test1MB-fixed-id"
-        let testFilename = "test1MB.bin"
-        let testSize: Int64 = 1024 * 1024
-
-        // Synthetic fetcher: returns `length` bytes of a repeating
-        // pattern, starting at `offset`. Pure CPU; no network, no RDP.
-        let testItem = ManifestItem(
-            id: testID,
-            filename: testFilename,
-            size: testSize,
-            parentID: nil,
-            isDirectory: false,
-            modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
-        FileProviderXPCService.shared.registerSession(
-            domainSubdir: subdir,
-            sessionID: "synthetic-test-file",
-            items: [testItem]
-        ) { itemID, offset, length in
-            guard itemID == testID else {
-                return (nil, NSError(domain: "MacRDP.testFile", code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "no item \(itemID)"]))
-            }
-            // 1 MiB of incrementing bytes (0,1,2,…,255,0,1,…).
-            // Easy to verify by hex-dumping the copied file.
-            let want = max(0, min(length, testSize - offset))
-            if want == 0 { return (Data(), nil) }
-            var data = Data(count: Int(want))
-            data.withUnsafeMutableBytes { raw in
-                guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                for i in 0..<Int(want) {
-                    base[i] = UInt8(truncatingIfNeeded: offset + Int64(i))
-                }
-            }
-            return (data, nil)
-        }
-
-        do {
-            try await publish([PublishItem(
-                id: testID,
-                filename: testFilename,
-                parentID: nil,
-                isDirectory: false,
-                size: testSize,
-                modificationMs: Int64(Date().timeIntervalSince1970 * 1000))])
-            Log.clip.info("Test file published: \(testFilename, privacy: .public) (\(testSize, privacy: .public)B)")
-        } catch {
-            Log.clip.error("Test file publish failed: \(String(describing: error), privacy: .public)")
-        }
-    }
-
     /// User-visible URL for an item in this domain. Retries while the
     /// framework ingests the just-published item — `getUserVisibleURL`
     /// returns nil for an item the framework hasn't picked up via its

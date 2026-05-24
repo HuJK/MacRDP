@@ -120,6 +120,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension((entry.filename as NSString).pathExtension)
         FileManager.default.createFile(atPath: tempURL.path, contents: nil, attributes: nil)
+        // Belt-and-suspenders: make sure the materialized file is mutable
+        // and NOT immutable, so a Finder paste doesn't land a locked
+        // (uchg) / read-only file at the destination.
+        try? FileManager.default.setAttributes(
+            [.immutable: false, .posixPermissions: 0o644],
+            ofItemAtPath: tempURL.path)
         guard let handle = try? FileHandle(forWritingTo: tempURL) else {
             completionHandler(nil, nil, NSError(domain: NSFileProviderErrorDomain,
                                                  code: NSFileProviderError.serverUnreachable.rawValue))
