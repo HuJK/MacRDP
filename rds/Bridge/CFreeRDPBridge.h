@@ -210,6 +210,13 @@ typedef void (*macrdp_on_audio_in_frame_fn)(
 typedef void (*macrdp_on_audio_format_selected_fn)(
     void *ctx, int32_t format /* MACRDP_AUDIO_FORMAT_* */);
 
+/* Login gate (only when `auth_gate` is set, i.e. NLA off): validate the
+ * client-submitted credentials at PostConnect. Return 1 to accept, 0 to
+ * reject (the connection is dropped). Fires on the peer event-loop thread;
+ * the implementation may block briefly (e.g. an SSH verification). */
+typedef int32_t (*macrdp_on_verify_password_fn)(
+    void *ctx, const char *username, const char *domain, const char *password);
+
 /* Aggregate */
 typedef struct macrdp_callbacks {
     macrdp_on_activated_fn                       on_activated;
@@ -229,6 +236,7 @@ typedef struct macrdp_callbacks {
     macrdp_on_audio_in_frame_fn                  on_audio_in_frame;
     macrdp_on_suppress_output_fn                 on_suppress_output;
     macrdp_on_audio_format_selected_fn           on_audio_format_selected;
+    macrdp_on_verify_password_fn                 on_verify_password;
     macrdp_on_rdpdr_device_added_fn              on_rdpdr_device_added;
     macrdp_on_rdpdr_device_removed_fn            on_rdpdr_device_removed;
     macrdp_on_rdpdr_dir_entry_fn                 on_rdpdr_dir_entry;
@@ -247,7 +255,15 @@ typedef struct macrdp_session_config {
     /* TLS */
     const char *tls_cert_pem_path;     /* nullable: bridge auto-generates */
     const char *tls_key_pem_path;
-    int32_t     require_nla;           /* 0/1 */
+    /* Network Level Authentication. When enabled, the server validates the
+     * client's NTLM proof against the NT-hash in `ntlm_sam_file_path` (a WinPR
+     * SAM file). When disabled, no authentication (open). */
+    int32_t     enable_nla;            /* 0/1 */
+    const char *ntlm_sam_file_path;    /* required when enable_nla; nullable otherwise */
+    /* When set (and NLA off), the bridge calls on_verify_password at
+     * PostConnect with the client's submitted credentials and drops the
+     * connection unless it returns 1. Used by the "ssh" login policy. */
+    int32_t     auth_gate;             /* 0/1 */
 
     /* H.264 / GFX defaults */
     int32_t     default_bitrate_kbps;

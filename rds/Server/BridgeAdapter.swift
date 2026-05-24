@@ -61,6 +61,9 @@ final class BridgePeer: @unchecked Sendable {
         var onClipFileContentsResponse: (_ streamID: UInt32, _ data: Data) -> Void = { _,_ in }
         var onAudioInFrame: (_ pcm: Data, _ sampleRate: Int, _ channels: Int) -> Void = { _,_,_ in }
         var onAudioFormatSelected: (_ format: AudioFormat) -> Void = { _ in }
+        /// Login gate (ssh policy): verify client-submitted creds. Defaults to
+        /// reject, so a gate with no verifier fails closed.
+        var onVerifyPassword: (_ user: String, _ domain: String, _ password: String) -> Bool = { _,_,_ in false }
         var onSuppressOutput: (_ allow: Bool) -> Void = { _ in }
         var onRdpdrDeviceAdded: (_ deviceID: UInt32, _ deviceType: UInt32,
                                  _ dosName: String) -> Void = { _,_,_ in }
@@ -83,6 +86,8 @@ final class BridgePeer: @unchecked Sendable {
 
     private var session: macrdp_session_t?
     let sinks: Sinks
+    /// Temp WinPR SAM file (NT-hash) backing NLA; deleted on teardown.
+    private var samFilePath: String?
 
     /// Serializes every `macrdp_session_send_clip_*` call. FreeRDP's
     /// server-side cliprdr send path (`cliprdr_server_packet_send`)
@@ -119,6 +124,7 @@ final class BridgePeer: @unchecked Sendable {
         cbs.on_clip_file_contents_response = Self.cbClipFileContentsResponse
         cbs.on_audio_in_frame            = Self.cbAudioInFrame
         cbs.on_audio_format_selected     = Self.cbAudioFormatSelected
+        cbs.on_verify_password           = Self.cbVerifyPassword
         cbs.on_suppress_output           = Self.cbSuppressOutput
         cbs.on_rdpdr_device_added        = Self.cbRdpdrDeviceAdded
         cbs.on_rdpdr_device_removed      = Self.cbRdpdrDeviceRemoved
@@ -130,7 +136,23 @@ final class BridgePeer: @unchecked Sendable {
         cbs.on_rdpdr_simple_complete     = Self.cbRdpdrSimpleComplete
 
         var cfg = macrdp_session_config()
-        cfg.require_nla              = config.auth.requireNLA ? 1 : 0
+        // Resolve the login policy into an NLA setup. Fail closed: a
+        // misconfigured/unsupported policy refuses the session rather than
+        // silently accepting connections.
+        switch AuthProvisioner.resolve(config.auth) {
+        case .noAuth:
+            cfg.enable_nla = 0
+        case .nla(let samPath):
+            cfg.enable_nla = 1
+            self.samFilePath = samPath
+        case .gate:
+            // NLA off; the bridge calls on_verify_password at PostConnect.
+            cfg.enable_nla = 0
+            cfg.auth_gate = 1
+        case .deny(let reason):
+            Log.server.error("Login policy refused: \(reason, privacy: .public)")
+            throw MacRDPError.bridgeFailed(rc: MACRDP_E_NLA_FAILED)
+        }
         cfg.default_bitrate_kbps     = Int32(config.video.bitrateKbps)
         cfg.default_max_fps          = Int32(config.video.maxFps)
         cfg.prefer_avc444            = config.video.preferAVC444 ? 1 : 0
@@ -164,27 +186,37 @@ final class BridgePeer: @unchecked Sendable {
         // freerdp_key_new_from_file_enc reads the file immediately so we
         // don't need to keep them alive after macrdp_session_create
         // returns.
+        // FreeRDP copies the SAM path string (set_string) at create, but reads
+        // the FILE later during NLA — so the file must persist for the session
+        // (deleted in deinit). The path string only needs to be valid here.
         let certPath = config.auth.certificateFile ?? ""
         let keyPath  = config.auth.privateKeyFile  ?? ""
+        let samPath  = self.samFilePath ?? ""
         let rc: Int32 = certPath.withCString { cPtr -> Int32 in
             keyPath.withCString { kPtr -> Int32 in
-                if !certPath.isEmpty { cfg.tls_cert_pem_path = cPtr }
-                if !keyPath.isEmpty  { cfg.tls_key_pem_path  = kPtr }
-                var session: macrdp_session_t?
-                let r = macrdp_session_create(fd, self.ctx, &cbs, &cfg, &session)
-                if r == MACRDP_OK, let s = session {
-                    self.session = s
+                samPath.withCString { sPtr -> Int32 in
+                    if !certPath.isEmpty { cfg.tls_cert_pem_path = cPtr }
+                    if !keyPath.isEmpty  { cfg.tls_key_pem_path  = kPtr }
+                    if !samPath.isEmpty  { cfg.ntlm_sam_file_path = sPtr }
+                    var session: macrdp_session_t?
+                    let r = macrdp_session_create(fd, self.ctx, &cbs, &cfg, &session)
+                    if r == MACRDP_OK, let s = session {
+                        self.session = s
+                    }
+                    return r
                 }
-                return r
             }
         }
         guard rc == MACRDP_OK, session != nil else {
+            if let p = samFilePath { try? FileManager.default.removeItem(atPath: p) }
             throw MacRDPError.bridgeFailed(rc: rc)
         }
     }
 
     deinit {
         if let s = session { macrdp_session_destroy(s) }
+        // Remove the NT-hash SAM file (sensitive) once the session is gone.
+        if let p = samFilePath { try? FileManager.default.removeItem(atPath: p) }
     }
 
     func runLoop() -> Int32 {
@@ -614,6 +646,13 @@ final class BridgePeer: @unchecked Sendable {
     private static let cbAudioFormatSelected: macrdp_on_audio_format_selected_fn = { ctx, fmt in
         let f = AudioFormat(rawValue: fmt) ?? .pcm
         unmanagedSelf(ctx)?.sinks.onAudioFormatSelected(f)
+    }
+    private static let cbVerifyPassword: macrdp_on_verify_password_fn = { ctx, user, domain, pass in
+        let u = user.map { String(cString: $0) } ?? ""
+        let d = domain.map { String(cString: $0) } ?? ""
+        let p = pass.map { String(cString: $0) } ?? ""
+        let ok = unmanagedSelf(ctx)?.sinks.onVerifyPassword(u, d, p) ?? false
+        return ok ? 1 : 0
     }
     private static let cbSuppressOutput: macrdp_on_suppress_output_fn = { ctx, allow in
         unmanagedSelf(ctx)?.sinks.onSuppressOutput(allow != 0)

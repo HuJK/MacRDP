@@ -72,6 +72,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // nthash subcommand — turn a plaintext password into the NT-hash for
+        // the "nthash" login policy, so no plaintext lives in config.
+        // Reads the password without echo from the terminal, or from stdin
+        // when piped.
+        if allArgs.count >= 2 && allArgs[1] == "nthash" {
+            let pw: String
+            if isatty(0) != 0, let c = getpass("Password: ") {
+                pw = String(cString: c)
+            } else {
+                pw = readLine(strippingNewline: true) ?? ""
+            }
+            print(AuthProvisioner.ntHashHex(pw))
+            NSApp.terminate(nil); return
+        }
+
         // Normal server mode.
         let opts = CLIOptions.parse(allArgs)
         if opts.showHelp {

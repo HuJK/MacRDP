@@ -32,9 +32,34 @@ struct Config: Codable, Sendable {
     }
 
     struct AuthConfig: Codable, Sendable {
-        var requireNLA: Bool
-        var credentialsFile: String?    // path to credentials.json
-        var certificateFile: String?    // PEM, auto-generated if nil
+        /// How clients authenticate. Secure by default — passwordless must be
+        /// chosen explicitly.
+        ///   "none"   — accept anyone (NLA off). DANGEROUS; explicit opt-in.
+        ///   "serial" — NLA against the Mac's serial number (default). Log in
+        ///              with the serial as the password.
+        ///   "nthash" — NLA against a configured NT-hash (`ntHash`). Generate
+        ///              it with `rds nthash` so no plaintext lives in config.
+        ///   "ssh"    — verify the password against an SSH server (the real
+        ///              macOS account password); caches the NT-hash for NLA.
+        var loginPolicy: String
+
+        /// Login username. nil → the current macOS user (`NSUserName()`).
+        var username: String?
+        /// NLA domain. nil → empty (log in with a bare username, no domain).
+        var domain: String?
+        /// NT-hash hex (32 chars) for `loginPolicy == "nthash"`. Produce with
+        /// `rds nthash`.
+        var ntHash: String?
+
+        // --- "ssh" policy ---
+        var sshHost: String?            // default 127.0.0.1
+        var sshPort: Int?               // default 22
+        /// Cache the verified NT-hash this long to allow NLA on subsequent
+        /// logins (0 = never cache → always SSH-verify, no NLA).
+        var sshCacheTTLSeconds: Int
+
+        // --- TLS server certificate (auto-generated if files are nil) ---
+        var certificateFile: String?
         var privateKeyFile: String?
         var certificateValidityDays: Int
         var rsaKeyBits: Int
@@ -460,7 +485,9 @@ struct Config: Codable, Sendable {
     static var `default`: Config {
         Config(
             listen: .init(host: "0.0.0.0", port: 3389),
-            auth: .init(requireNLA: true, credentialsFile: nil,
+            auth: .init(loginPolicy: "serial", username: nil, domain: nil,
+                        ntHash: nil, sshHost: nil, sshPort: nil,
+                        sshCacheTTLSeconds: 3600,
                         certificateFile: nil, privateKeyFile: nil,
                         certificateValidityDays: 3650,
                         rsaKeyBits: 2048),

@@ -152,6 +152,21 @@ final class RDPSession {
             .ensureCertificate(config: config)
 
         var sinks = BridgePeer.Sinks()
+        // "ssh" login policy gate: verify the client's password against the
+        // SSH server (the real macOS account), then cache its NT-hash so the
+        // next connection can use NLA. Fires on the bridge thread.
+        sinks.onVerifyPassword = { [config = self.config] user, _, password in
+            let host = config.auth.sshHost ?? "127.0.0.1"
+            let port = config.auth.sshPort ?? 22
+            guard SSHVerifier.verify(username: user, password: password,
+                                     host: host, port: port) else { return false }
+            SSHAuthCache.shared.store(
+                user: user,
+                ntHashHex: AuthProvisioner.ntHashHex(password),
+                ttlSeconds: config.auth.sshCacheTTLSeconds,
+                pwLastSet: AccountPolicy.passwordLastSetTime(user: user))
+            return true
+        }
         sinks.onActivated = { [weak self] w, h, bpp, connType, audioMode in
             Task { @MainActor [weak self] in
                 self?.onActivated(width: w, height: h,

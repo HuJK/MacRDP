@@ -1154,6 +1154,25 @@ static BOOL bridge_peer_post_connect(freerdp_peer *peer) {
            freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight),
            freerdp_settings_get_uint32(s, FreeRDP_ColorDepth),
            (int)freerdp_settings_get_bool(s, FreeRDP_SupportGraphicsPipeline));
+
+    /* Login gate (NLA off): validate the client-submitted credentials. */
+    struct macrdp_session *sess = session_from_peer(peer);
+    if (sess && sess->cfg.auth_gate && sess->cbs.on_verify_password) {
+        const char *user = freerdp_settings_get_string(s, FreeRDP_Username);
+        const char *domain = freerdp_settings_get_string(s, FreeRDP_Domain);
+        const char *pass = freerdp_settings_get_string(s, FreeRDP_Password);
+        if (!user || !pass) {
+            os_log(bridge_log(), "login gate: client sent no username/password; rejecting");
+            return FALSE;
+        }
+        int32_t ok = sess->cbs.on_verify_password(sess->swift_ctx, user,
+                                                  domain ? domain : "", pass);
+        if (!ok) {
+            os_log(bridge_log(), "login gate: password verification failed for user '%s'", user);
+            return FALSE;
+        }
+        os_log(bridge_log(), "login gate: verified user '%s'", user);
+    }
     return TRUE;
 }
 
@@ -1266,7 +1285,15 @@ static BOOL configure_settings(rdpSettings *s,
     }
     if (!freerdp_settings_set_bool(s, FreeRDP_RdpSecurity, TRUE))   return FALSE;
     if (!freerdp_settings_set_bool(s, FreeRDP_TlsSecurity, TRUE))   return FALSE;
-    if (!freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, FALSE))  return FALSE;
+    /* NLA: validate the client's NTLM proof against the NT-hash in our SAM
+     * file. Off → no authentication (open). */
+    if (cfg->enable_nla && cfg->ntlm_sam_file_path) {
+        if (!freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, TRUE)) return FALSE;
+        if (!freerdp_settings_set_string(s, FreeRDP_NtlmSamFile, cfg->ntlm_sam_file_path))
+            return FALSE;
+    } else {
+        if (!freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, FALSE)) return FALSE;
+    }
     if (!freerdp_settings_set_uint32(s, FreeRDP_EncryptionLevel,
                                      ENCRYPTION_LEVEL_CLIENT_COMPATIBLE)) return FALSE;
     if (!freerdp_settings_set_uint32(s, FreeRDP_ColorDepth, 32))     return FALSE;
