@@ -50,8 +50,11 @@ enum AuthProvisioner {
     }
 
     static func effectiveUsername(_ auth: Config.AuthConfig) -> String {
-        if let u = auth.username, !u.isEmpty { return u }
-        return NSUserName()
+        if auth.authUserPolicy.lowercased() == "fixed",
+           let u = auth.username, !u.isEmpty {
+            return u
+        }
+        return NSUserName()   // "self" (default)
     }
 
     static func effectiveDomain(_ auth: Config.AuthConfig) -> String {
@@ -63,7 +66,7 @@ enum AuthProvisioner {
     static func resolve(_ auth: Config.AuthConfig) -> AuthResolution {
         let user = effectiveUsername(auth)
         let domain = effectiveDomain(auth)
-        switch auth.loginPolicy.lowercased() {
+        switch auth.passwordPolicy.lowercased() {
         case "none":
             Log.server.warning("Auth policy \"none\": ANY client may connect with no password")
             return .noAuth
@@ -90,7 +93,7 @@ enum AuthProvisioner {
             return .gate
 
         default:
-            return .deny(reason: "unknown loginPolicy \"\(auth.loginPolicy)\"")
+            return .deny(reason: "unknown passwordPolicy \"\(auth.passwordPolicy)\"")
         }
     }
 

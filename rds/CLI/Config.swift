@@ -32,8 +32,16 @@ struct Config: Codable, Sendable {
     }
 
     struct AuthConfig: Codable, Sendable {
-        /// How clients authenticate. Secure by default — passwordless must be
-        /// chosen explicitly.
+        /// Which OS identity a login is for (the username clients authenticate
+        /// as). Independent of how the password is checked (`passwordPolicy`).
+        ///   "self"  — the user MacRDP runs as, i.e. `NSUserName()` (default).
+        ///   "fixed" — the configured `username`.
+        var authUserPolicy: String
+        /// Username for `authUserPolicy == "fixed"` (ignored for "self").
+        var username: String?
+
+        /// How the password is verified. Secure by default — passwordless must
+        /// be chosen explicitly.
         ///   "none"   — accept anyone (NLA off). DANGEROUS; explicit opt-in.
         ///   "serial" — NLA against the Mac's serial number (default). Log in
         ///              with the serial as the password.
@@ -41,22 +49,22 @@ struct Config: Codable, Sendable {
         ///              it with `rds nthash` so no plaintext lives in config.
         ///   "ssh"    — verify the password against an SSH server (the real
         ///              macOS account password); caches the NT-hash for NLA.
-        var loginPolicy: String
+        var passwordPolicy: String
 
-        /// Login username. nil → the current macOS user (`NSUserName()`).
-        var username: String?
         /// NLA domain. nil → empty (log in with a bare username, no domain).
         var domain: String?
-        /// NT-hash hex (32 chars) for `loginPolicy == "nthash"`. Produce with
-        /// `rds nthash`.
+        /// NT-hash hex (32 chars) for `passwordPolicy == "nthash"`. Produce
+        /// with `rds nthash`.
         var ntHash: String?
 
         // --- "ssh" policy ---
+        // First login is SSH-verified; the resulting NT-hash is cached so later
+        // connections use NLA. The cache stays valid exactly while the account's
+        // passwordLastSetTime is unchanged (no expiry). If that time can't be
+        // read (a different user, needs root) the hash isn't cached and every
+        // connection re-verifies via SSH.
         var sshHost: String?            // default 127.0.0.1
         var sshPort: Int?               // default 22
-        /// Cache the verified NT-hash this long to allow NLA on subsequent
-        /// logins (0 = never cache → always SSH-verify, no NLA).
-        var sshCacheTTLSeconds: Int
 
         // --- TLS server certificate (auto-generated if files are nil) ---
         var certificateFile: String?
@@ -485,9 +493,9 @@ struct Config: Codable, Sendable {
     static var `default`: Config {
         Config(
             listen: .init(host: "0.0.0.0", port: 3389),
-            auth: .init(loginPolicy: "serial", username: nil, domain: nil,
+            auth: .init(authUserPolicy: "self", username: nil,
+                        passwordPolicy: "serial", domain: nil,
                         ntHash: nil, sshHost: nil, sshPort: nil,
-                        sshCacheTTLSeconds: 3600,
                         certificateFile: nil, privateKeyFile: nil,
                         certificateValidityDays: 3650,
                         rsaKeyBits: 2048),

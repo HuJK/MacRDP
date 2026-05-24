@@ -163,7 +163,6 @@ final class RDPSession {
             SSHAuthCache.shared.store(
                 user: user,
                 ntHashHex: AuthProvisioner.ntHashHex(password),
-                ttlSeconds: config.auth.sshCacheTTLSeconds,
                 pwLastSet: AccountPolicy.passwordLastSetTime(user: user))
             return true
         }
