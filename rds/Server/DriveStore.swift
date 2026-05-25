@@ -154,9 +154,19 @@ nonisolated final class DriveStore: @unchecked Sendable {
     // MARK: - Drive lifecycle (called from RDPSession sinks)
 
     func addDrive(adapter: BridgePeer, deviceID: UInt32, dosName: String) {
-        let trimmed = dosName.trimmingCharacters(in: CharacterSet(charactersIn: " \0"))
+        // DOS names arrive as e.g. "D:" — strip the trailing colon (and any
+        // NUL padding). A literal ":" in the display name is rendered by
+        // Finder as "/", because macOS swaps ':' and '/' at the Carbon layer.
+        let trimmed = dosName.trimmingCharacters(in: CharacterSet(charactersIn: " \0:"))
         let label = trimmed.isEmpty ? "Drive" : trimmed
-        let driveKey = UUID().uuidString
+        // STABLE key derived from the drive name, NOT a per-mount UUID. The
+        // key is the prefix of every FileProvider item id under this drive;
+        // a fresh UUID each mount made all ids go stale after a reconnect, so
+        // resolve() failed and delete/rename silently no-op'd on Windows while
+        // Finder optimistically updated. The drive letter is stable across
+        // reconnects, so ids stay valid. (Must be backslash-free — it is: the
+        // label has had any ':' stripped and DOS names carry no '\'.)
+        let driveKey = label
         lock.lock(); drives[driveKey] = Drive(adapter: adapter, deviceID: deviceID, label: label); lock.unlock()
         Log.session.notice("RDPDR mounting drive '\(label, privacy: .public)' id=\(deviceID, privacy: .public) key=\(driveKey, privacy: .public)")
         Task { @MainActor in await DriveDomains.shared.addFolder(driveKey: driveKey, label: label) }
@@ -176,6 +186,16 @@ nonisolated final class DriveStore: @unchecked Sendable {
         for (key, _) in victims { drives[key] = nil }
         // Drop write sessions belonging to removed drives.
         for (sid, s) in writeSessions where victims[s.driveKey] != nil { writeSessions[sid] = nil }
+        // If no drives remain (e.g. the RDP session dropped), wake every
+        // in-flight IRP waiter with a failure so blocked XPC calls return an
+        // error immediately instead of hanging for `ioTimeout`. Otherwise a
+        // disconnect mid-operation looks like a silent stall to Finder.
+        if drives.isEmpty {
+            for (_, p) in pending {
+                p.ioStatus = 0xC0000120   // STATUS_CANCELLED
+                p.sem.signal()
+            }
+        }
         lock.unlock()
         for (key, d) in victims {
             for (_, fid) in d.openFiles {   // fire-and-forget close (token 0 = no pending)

@@ -64,6 +64,7 @@ final class BridgePeer: @unchecked Sendable {
         /// Login gate (ssh policy): verify client-submitted creds. Defaults to
         /// reject, so a gate with no verifier fails closed.
         var onVerifyPassword: (_ user: String, _ domain: String, _ password: String) -> Bool = { _,_,_ in false }
+        var onAuthenticatedUser: (_ user: String) -> Void = { _ in }
         var onSuppressOutput: (_ allow: Bool) -> Void = { _ in }
         var onRdpdrDeviceAdded: (_ deviceID: UInt32, _ deviceType: UInt32,
                                  _ dosName: String) -> Void = { _,_,_ in }
@@ -125,6 +126,7 @@ final class BridgePeer: @unchecked Sendable {
         cbs.on_audio_in_frame            = Self.cbAudioInFrame
         cbs.on_audio_format_selected     = Self.cbAudioFormatSelected
         cbs.on_verify_password           = Self.cbVerifyPassword
+        cbs.on_authenticated_user        = Self.cbAuthenticatedUser
         cbs.on_suppress_output           = Self.cbSuppressOutput
         cbs.on_rdpdr_device_added        = Self.cbRdpdrDeviceAdded
         cbs.on_rdpdr_device_removed      = Self.cbRdpdrDeviceRemoved
@@ -653,6 +655,10 @@ final class BridgePeer: @unchecked Sendable {
         let p = pass.map { String(cString: $0) } ?? ""
         let ok = unmanagedSelf(ctx)?.sinks.onVerifyPassword(u, d, p) ?? false
         return ok ? 1 : 0
+    }
+    private static let cbAuthenticatedUser: macrdp_on_authenticated_user_fn = { ctx, user in
+        let u = user.map { String(cString: $0) } ?? ""
+        unmanagedSelf(ctx)?.sinks.onAuthenticatedUser(u)
     }
     private static let cbSuppressOutput: macrdp_on_suppress_output_fn = { ctx, allow in
         unmanagedSelf(ctx)?.sinks.onSuppressOutput(allow != 0)

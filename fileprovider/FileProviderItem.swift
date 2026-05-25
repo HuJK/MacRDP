@@ -62,6 +62,15 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// support writing back INTO the domain — but the clipboard staging
     /// folder is only ever copied OUT of, so no modify path is exercised.)
     var capabilities: NSFileProviderItemCapabilities {
+        // A drive-root mount point (top-level folder in a writable drive
+        // domain — parentID nil) carries no Windows path: its identifier is
+        // the bare driveKey UUID. It must NOT be renamable/deletable/movable,
+        // or Finder's modifyItem would derive a name from that UUID path and
+        // corrupt the folder's name into the UUID. Allow only browse + add.
+        if isWritable && entry.isDirectory && entry.parentID == nil {
+            return [.allowsReading, .allowsContentEnumerating,
+                    .allowsWriting, .allowsAddingSubItems]
+        }
         var caps: NSFileProviderItemCapabilities = entry.isDirectory
             ? [.allowsReading, .allowsContentEnumerating, .allowsWriting,
                .allowsDeleting, .allowsRenaming, .allowsTrashing]

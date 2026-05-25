@@ -76,20 +76,29 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             completionHandler(RootFileProviderItem(displayName: "Trash"), nil)
             return Progress()
         }
-        // Ask the host whether the item has a lazy resolver that
-        // needs to run. The call blocks until the resolver has
-        // finished (or returns immediately for non-lazy items).
-        // After it returns, the manifest cache is authoritative:
+        // If we already know this item, return it WITHOUT running the lazy
+        // resolver. item(for:) is queried for metadata on COPY too (the
+        // working set enumerates the freshly-published placeholder, and
+        // binding its userVisibleURL resolves it) — running the resolver here
+        // would fetch the FileGroupDescriptorW from the client at copy time
+        // (the client must walk the whole copied tree), which blocks this
+        // call and surfaces a "Copying…" progress window before any paste.
+        // The resolver still runs when the placeholder's CONTENTS are
+        // enumerated (handleEnumerateChildren = the actual paste).
+        if let manifest = ManifestCache.shared.manifest(domainSubdir: domainSubdir),
+           let entry = manifest.items.first(where: { $0.id == identifier.rawValue }) {
+            completionHandler(FileProviderItem(entry, manifestSessionID: manifest.sessionID,
+                                               isWritable: isWritable), nil)
+            return Progress()
+        }
+        // Unknown item → ask the host whether a lazy resolver needs to run.
+        // The call blocks until the resolver has finished (or returns
+        // immediately for non-lazy items).
         //   - exists=true  → item is in cache (or about to be);
         //                    proceed with normal lookup.
         //   - exists=false → resolver failed; return noSuchItem
         //                    so Finder aborts the paste and
         //                    (best-effort) cleans up the dest dir.
-        // The blocking is required to make the "Finder created an
-        // empty MacRDP_<UUID> wrapper at the paste destination"
-        // outcome avoidable: by the time we say "this item is a
-        // folder", we already know whether its contents will
-        // materialise.
         let exists = HostLazyResolver.resolveSync(
             source: serviceSource,
             domainSubdir: domainSubdir,
@@ -272,6 +281,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         guard isWritable else {
             completionHandler(nil, [], false, Self.unsupported()); return Progress()
         }
+        // Drive-root mount points (bare driveKey, no backslash) have no
+        // Windows path — never rename/write them. Returning the item
+        // unchanged avoids deriving the UUID as the folder's name.
+        if !item.itemIdentifier.rawValue.contains("\\") {
+            completionHandler(item, [], false, nil); return Progress()
+        }
         let oldPath = item.itemIdentifier.rawValue
         let parentPath = drivePath(forParent: item.parentItemIdentifier)
         let newPath = parentPath + "\\" + item.filename
@@ -285,6 +300,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         let finalPath = doRename ? newPath : oldPath
         let finalName = driveName(ofPath: finalPath)
         let subdir = domainSubdir, source = serviceSource, writable = isWritable
+        let dom = domain, parentID = item.parentItemIdentifier
         log.info("modifyItem '\(oldPath, privacy: .public)' rename=\(wantsRename, privacy: .public) content=\(wantsContent, privacy: .public)")
         Task.detached {
             do {
@@ -302,6 +318,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                                          isDirectory: isDir,
                                          modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
                 ManifestCache.shared.merge(items: [entry], domainSubdir: subdir)
+                // A rename changes the item's id (id == Windows path). Evict
+                // the old id and force the parent to re-enumerate, otherwise
+                // the renamed-away item lingers in Finder alongside the new one.
+                if doRename {
+                    ManifestCache.shared.remove(ids: [oldPath], domainSubdir: subdir)
+                    Self.signalContainers([parentID, .workingSet], domain: dom)
+                }
                 completionHandler(FileProviderItem(entry, manifestSessionID: "drive",
                                                    isWritable: writable), [], false, nil)
             } catch {
@@ -317,21 +340,45 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     request: NSFileProviderRequest,
                     completionHandler: @escaping (Error?) -> Void) -> Progress {
         guard isWritable else { completionHandler(Self.unsupported()); return Progress() }
+        // Refuse to delete a drive-root mount point (bare driveKey, no
+        // backslash) — that would issue a delete on the drive's Windows root.
+        if !identifier.rawValue.contains("\\") {
+            completionHandler(Self.unsupported()); return Progress()
+        }
         let path = identifier.rawValue
         let isDir = ManifestCache.shared.items(domainSubdir: domainSubdir)
             .first { $0.id == path }?.isDirectory ?? false
         let subdir = domainSubdir, source = serviceSource
+        let dom = domain, parentID = parentIdentifier(ofItemID: path)
         log.info("deleteItem '\(path, privacy: .public)' dir=\(isDir, privacy: .public)")
         Task.detached {
             do {
                 try await HostWriteOps.delete(source: source, domainSubdir: subdir,
                                               path: path, isDirectory: isDir)
+                // Evict from the cache and re-enumerate the parent so the
+                // deleted item disappears from Finder.
+                ManifestCache.shared.remove(ids: [path], domainSubdir: subdir)
+                Self.signalContainers([parentID, .workingSet], domain: dom)
                 completionHandler(nil)
             } catch {
                 completionHandler(error as NSError)
             }
         }
         return Progress()
+    }
+
+    /// Parent container of a drive item id ("driveKey\a\b" → "driveKey\a";
+    /// "driveKey\a" → "driveKey"; bare driveKey → root).
+    private func parentIdentifier(ofItemID id: String) -> NSFileProviderItemIdentifier {
+        guard let r = id.range(of: "\\", options: .backwards) else { return .rootContainer }
+        return NSFileProviderItemIdentifier(String(id[..<r.lowerBound]))
+    }
+
+    /// Ask the framework to re-enumerate the given containers (best effort).
+    private static func signalContainers(_ ids: [NSFileProviderItemIdentifier],
+                                         domain: NSFileProviderDomain) {
+        guard let mgr = NSFileProviderManager(for: domain) else { return }
+        for id in ids { mgr.signalEnumerator(for: id) { _ in } }
     }
 
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier,

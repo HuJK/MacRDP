@@ -1173,6 +1173,12 @@ static BOOL bridge_peer_post_connect(freerdp_peer *peer) {
         }
         os_log(bridge_log(), "login gate: verified user '%s'", user);
     }
+
+    /* Surface the authenticated username for the UI (NLA or info-PDU). */
+    if (sess && sess->cbs.on_authenticated_user) {
+        const char *u = freerdp_settings_get_string(s, FreeRDP_Username);
+        sess->cbs.on_authenticated_user(sess->swift_ctx, u ? u : "");
+    }
     return TRUE;
 }
 

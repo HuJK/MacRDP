@@ -69,6 +69,19 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             observer.finishEnumeratingChanges(upTo: current, moreComing: false)
             return
         }
+        // A removal (rename/delete) bumps the removal generation. We don't
+        // keep per-item tombstones, so a generation change means "items may
+        // have vanished" — expire the anchor to force the framework to re-run
+        // a full enumeration, which drops stale items from its replica.
+        // (Additive-only changes, e.g. the host's pushManifest, keep the
+        // generation and fall through to the incremental didUpdate below.)
+        if Self.removalGen(of: anchor) != ManifestCache.shared.removalGeneration(domainSubdir: domainSubdir) {
+            elog.info("enumerateChanges: removal-gen changed → syncAnchorExpired (full re-enumerate)")
+            observer.finishEnumeratingWithError(NSError(
+                domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.syncAnchorExpired.rawValue))
+            return
+        }
         let items = itemsFor(container: containerID)
         let sessionID = ManifestCache.shared.manifest(domainSubdir: domainSubdir)?.sessionID ?? "lazy"
         let writable = domainSubdir.hasPrefix(AppGroupShared.driveDomainPrefix)
@@ -127,6 +140,16 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
     private func currentAnchorValue() -> NSFileProviderSyncAnchor {
         let sid = ManifestCache.shared.manifest(domainSubdir: domainSubdir)?.sessionID ?? "empty"
-        return NSFileProviderSyncAnchor(sid.data(using: .utf8) ?? Data([0]))
+        let gen = ManifestCache.shared.removalGeneration(domainSubdir: domainSubdir)
+        // sessionID never contains '#', so the suffix parses back cleanly.
+        return NSFileProviderSyncAnchor("\(sid)#\(gen)".data(using: .utf8) ?? Data([0]))
+    }
+
+    /// Extract the removal-generation suffix encoded in an anchor.
+    private static func removalGen(of anchor: NSFileProviderSyncAnchor) -> UInt64 {
+        guard let s = String(data: anchor.rawValue, encoding: .utf8),
+              let suffix = s.split(separator: "#").last,
+              let v = UInt64(suffix) else { return 0 }
+        return v
     }
 }

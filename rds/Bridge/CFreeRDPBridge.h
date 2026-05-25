@@ -217,6 +217,11 @@ typedef void (*macrdp_on_audio_format_selected_fn)(
 typedef int32_t (*macrdp_on_verify_password_fn)(
     void *ctx, const char *username, const char *domain, const char *password);
 
+/* Fired at PostConnect with the authenticated client username (from NLA or the
+ * client info PDU). Used to label the session in the UI. */
+typedef void (*macrdp_on_authenticated_user_fn)(
+    void *ctx, const char *username);
+
 /* Aggregate */
 typedef struct macrdp_callbacks {
     macrdp_on_activated_fn                       on_activated;
@@ -237,6 +242,7 @@ typedef struct macrdp_callbacks {
     macrdp_on_suppress_output_fn                 on_suppress_output;
     macrdp_on_audio_format_selected_fn           on_audio_format_selected;
     macrdp_on_verify_password_fn                 on_verify_password;
+    macrdp_on_authenticated_user_fn              on_authenticated_user;
     macrdp_on_rdpdr_device_added_fn              on_rdpdr_device_added;
     macrdp_on_rdpdr_device_removed_fn            on_rdpdr_device_removed;
     macrdp_on_rdpdr_dir_entry_fn                 on_rdpdr_dir_entry;

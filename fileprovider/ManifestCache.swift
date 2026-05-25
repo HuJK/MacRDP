@@ -23,6 +23,11 @@ final class ManifestCache {
 
     private let lock = NSLock()
     private var storage: [String: Data] = [:]
+    /// Bumped whenever items are REMOVED (rename/delete). The enumerator
+    /// folds this into its sync anchor; a mismatch forces a full
+    /// re-enumeration so vanished items drop out of the framework's replica
+    /// (we don't keep per-item tombstones).
+    private var removalGen: [String: UInt64] = [:]
     /// Cached decoded form — without this, every enumerator /
     /// item(for:) call re-decodes the full JSON (e.g. 6 MB for a
     /// 39 k-file folder copy), which dominates the framework's
@@ -90,6 +95,29 @@ final class ManifestCache {
                                      items: Array(byID.values))
         decodedCache[domainSubdir] = current
         lock.unlock()
+    }
+
+    /// Drop items by id (after a Windows-side rename/delete) and bump the
+    /// removal generation so the enumerator forces a full re-enumeration.
+    func remove(ids: [String], domainSubdir: String) {
+        guard !ids.isEmpty else { return }
+        let drop = Set(ids)
+        lock.lock()
+        if let cur = decodedCache[domainSubdir] {
+            let kept = cur.items.filter { !drop.contains($0.id) }
+            decodedCache[domainSubdir] = ClipboardManifest(version: cur.version,
+                                                           sessionID: cur.sessionID,
+                                                           items: kept)
+        }
+        removalGen[domainSubdir, default: 0] &+= 1
+        lock.unlock()
+        log.info("ManifestCache removed \(ids.count, privacy: .public) item(s), gen→\(self.removalGen[domainSubdir] ?? 0, privacy: .public)")
+    }
+
+    /// Monotonic counter of removal events for a domain (see `removalGen`).
+    func removalGeneration(domainSubdir: String) -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return removalGen[domainSubdir] ?? 0
     }
 
     /// All items currently known by the extension for this domain.
