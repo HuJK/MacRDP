@@ -165,6 +165,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             CopyProgressTracker.shared.configure(
                 domainSubdir: AppDelegate.sharedClipboardInbox.subdir,
                 speedWindowSec: config.clipboard.speedStatsWindowSec ?? 4)
+            CopyEventStore.shared.cancelReleaseSec =
+                Double(config.clipboard.cancelReleaseMs ?? 3000) / 1000.0
             self.finishStartup(config: config)
         }
     }

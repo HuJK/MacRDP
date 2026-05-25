@@ -46,6 +46,10 @@ nonisolated final class CopyEvent: @unchecked Sendable {
     ///   ended     — terminal; being reaped
     enum State {
         case idle, marquee, resolved, transfer, ended
+        /// User cancelled the in-progress paste. The NEXT fetch fails (so
+        /// Finder aborts), then the state returns to `.resolved` — keeping the
+        /// clipboard valid so a later paste (here or elsewhere) runs normally.
+        case cancelled
     }
 
     /// Why an event ended. Stage 2 uses this to decide notification vs
@@ -80,16 +84,6 @@ nonisolated final class CopyEvent: @unchecked Sendable {
     var inFlight: Int = 0
     var lastActivityAt: Date = Date()
 
-    // MARK: Per-burst cancel (transferGeneration)
-    /// A "burst" is one paste's run of byte fetches — it begins when
-    /// `inFlight` rises 0→1 and ends when it drains back to 0. Each burst
-    /// gets a new generation so that cancelling one paste doesn't poison
-    /// the next: the event stays alive and re-pasteable.
-    var transferGeneration: Int = 0
-    /// Set to the current `transferGeneration` when the user cancels.
-    /// Fetches whose burst generation matches are rejected; the next
-    /// burst bumps the generation and is allowed again.
-    var cancelledGeneration: Int?
     /// Per-file fetch count over the event's whole life. Drives the
     /// progress denominator: fetchCount == 0 → never fetched → seeded into
     /// a new transfer's denominator (so the first paste seeds the whole
@@ -415,6 +409,10 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
 
     /// Realtime-speed averaging window (seconds). Set once from config.
     var speedWindowSec: TimeInterval = 4
+    /// After Cancel, keep failing fetches until the cancelled paste has been
+    /// quiet this long — then a fresh request counts as a NEW paste and is
+    /// allowed. Set once from config (clipboard.cancelReleaseMs).
+    var cancelReleaseSec: TimeInterval = 3
     /// One-shot "activity started" wake so the UI can begin polling
     /// without a perpetual timer. Set by the UI at startup; called when a
     /// transfer or a paste-triggered resolve begins.
@@ -555,8 +553,7 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
     func isSessionCancelled(sessionID: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard let e = events[sessionID] else { return true }   // reaped → abandon
-        if e.state == .ended || e.dismissed { return true }    // ended/superseded
-        if let cg = e.cancelledGeneration, cg == e.transferGeneration { return true }
+        if e.state == .ended || e.state == .cancelled || e.dismissed { return true }
         return false
     }
 
@@ -583,18 +580,15 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
         cleanup?()
     }
 
-    /// User clicked Cancel in the progress UI. Cancels only the CURRENT
-    /// transfer burst — the event is NOT ended (the clipboard is still
-    /// valid, so the user can paste it again later).
+    /// User clicked Cancel in the progress UI. Move the event to `.cancelled`:
+    /// the next fetch fails (Finder aborts the paste) and the state returns to
+    /// `.resolved`, so the event stays alive and re-pasteable — a later paste
+    /// (here or elsewhere) transfers normally.
     func cancelSession(sessionID: String) {
         lock.lock()
         if let e = events[sessionID] {
-            // Cancel only the CURRENT transfer burst — the event stays
-            // alive and re-pasteable (the clipboard is unchanged). In-
-            // flight fetches of this burst are rejected; a later paste
-            // starts a new transfer that runs normally.
-            e.cancelledGeneration = e.transferGeneration
-            e.transferCancelled = true   // reflected in the snapshot until reset
+            e.state = .cancelled
+            e.transferCancelled = true   // snapshot shows cancelled until the row drops
         }
         lock.unlock()
         Log.clip.notice("Event '\(sessionID, privacy: .public)' transfer cancelled by user (event kept)")
@@ -821,23 +815,35 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
                                    userInfo: [NSLocalizedDescriptionKey: "Copy event ended"]))
                 return
             }
-            // resolved/marquee → transfer. Bumping the generation first
-            // means a cancel of a PRIOR burst no longer matches → this one
-            // runs. (Progress accounting reset is decoupled — it lives in
-            // `event.ingest`, keyed on finished-and-idle, so a mid-paste
-            // lull that flaps state doesn't reset the bar.)
-            if event.state != .transfer {
-                event.transferGeneration += 1
-                event.state = .transfer
-                startedTransfer = true
+            // User cancelled: keep failing every request (Finder retries the
+            // materialization; one error doesn't make it give up) until the
+            // cancelled paste stops asking for `cancelReleaseSec`. Only then
+            // is a fresh request a NEW paste — drop back to .resolved and let
+            // it transfer. The clipboard stays valid the whole time (event
+            // kept), so a later paste here or elsewhere works.
+            if event.state == .cancelled {
+                let now = Date()
+                if now.timeIntervalSince(event.lastActivityAt) <= cancelReleaseSec {
+                    event.lastActivityAt = now   // still being retried → keep failing
+                    lock.unlock()
+                    // Use the SAME read-error the broken.bin path uses: Finder
+                    // gives up a copy on a POSIX read error (EIO) but NOT on
+                    // NSUserCancelledError (it just retries / keeps going).
+                    reply(nil, NSError(domain: NSPOSIXErrorDomain, code: Int(EIO),
+                                       userInfo: [NSLocalizedDescriptionKey: "Copy cancelled"]))
+                    return
+                }
+                // Quiet long enough → the cancelled paste was abandoned.
+                event.state = .resolved
+                event.transferCancelled = false
+                // fall through to the normal resolved → transfer path
             }
-            // Current burst cancelled by the user → reject without serving.
-            if event.cancelledGeneration == event.transferGeneration {
-                lock.unlock()
-                reply(nil, NSError(domain: NSCocoaErrorDomain,
-                                   code: NSUserCancelledError,
-                                   userInfo: [NSLocalizedDescriptionKey: "User cancelled"]))
-                return
+            // resolved/marquee → transfer. A new burst clears the cancelled
+            // flag (carried only for the snapshot until the row drops).
+            if event.state != .transfer {
+                event.state = .transfer
+                event.transferCancelled = false
+                startedTransfer = true
             }
             event.finderEngaged = true   // bytes being copied → pasted
             event.inFlight += 1

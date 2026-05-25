@@ -509,6 +509,11 @@ struct Config: Codable, Sendable {
         /// lists arriving within this window of a local change are ignored as
         /// echoes. nil → 500.
         var echoSuppressMs: Int?
+        /// After the user cancels a Win→Mac paste, keep failing the client's
+        /// retries until it has been quiet this long; then a fresh request is
+        /// treated as a NEW paste and allowed (so the clipboard stays
+        /// re-pasteable). nil → 3000.
+        var cancelReleaseMs: Int?
     }
 
     /// Device redirection (MS-RDPEFS / RDPDR). Phase 1 of this feature
