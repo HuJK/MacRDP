@@ -96,6 +96,12 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     /// request when a Mac app pastes. Guarded by `pendingLock`.
     private var claimedTypeMap: [NSPasteboard.PasteboardType: UInt32] = [:]
 
+    /// Uptime (ms) of the last LOCAL Mac pasteboard change we detected (a copy
+    /// the user made, not our own write). Client format lists arriving within
+    /// `clipboard.echoSuppressMs` of this are ignored as echoes of the
+    /// clipboard we just advertised. MainActor-only.
+    private var lastLocalChangeUptimeMs: UInt64?
+
     // MARK: - File state
 
     /// One entry per file/folder advertised in the current FileGroupDescriptorW.
@@ -103,7 +109,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     /// top-level item's name (so the first entry of a single-file copy is
     /// just "myfile.txt"; a folder copy starts with the folder name).
     /// Guarded by `pendingLock`.
-    fileprivate struct OutFileEntry {
+    struct OutFileEntry: Sendable {
         let url: URL              // absolute Mac path
         let relativePath: String  // "MyFolder\\sub\\file.txt"
         let isDirectory: Bool
@@ -111,6 +117,12 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let modTime: Date?
     }
     private var outFiles: [OutFileEntry] = []
+    /// Root URLs of the current Mac→Win file copy, recorded at copy time.
+    /// The full tree under them is walked LAZILY into `outFiles` only when the
+    /// client requests FileGroupDescriptorW (and off the main actor), so a
+    /// copy of a huge folder doesn't block the poll/main thread. Guarded by
+    /// `pendingLock`.
+    private var outFileRoots: [URL] = []
     /// Cached open file handles for in-progress chunked reads, keyed by
     /// the listIndex into outFiles. Closed when the session ends.
     private var outOpenHandles: [Int: FileHandle] = [:]
@@ -230,6 +242,11 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     // MARK: - Mac → Client
 
     @MainActor
+    /// Monotonic uptime in milliseconds (immune to wall-clock changes).
+    private func nowUptimeMs() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds / 1_000_000
+    }
+
     private func poll() {
         guard channelReady else { return }
         let pb = NSPasteboard.general
@@ -238,6 +255,10 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         lastChangeCount = cc
 
         if cc == selfWroteChangeCount { return }
+
+        // A genuine local copy: start the echo-suppression window so the
+        // client's echo of this clipboard doesn't clobber it.
+        lastLocalChangeUptimeMs = nowUptimeMs()
 
         var formats: [(id: UInt32, name: String?)] = []
         let types = pb.types ?? []
@@ -257,10 +278,15 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         var advertisedFiles = false
         if config.clipboard.files {
             let urls = Self.fileURLs(on: pb)
-            if !urls.isEmpty,
-               let entries = expandFileURLs(urls, limitMiB: config.clipboard.maxFileSizeMiB) {
+            if !urls.isEmpty {
+                // Lazy: record the roots only — do NOT walk the tree here (it
+                // can take seconds for a large folder and would block this
+                // poll/main thread on every copy). The descriptor is built
+                // off-main when the client actually requests it (see the
+                // FileGroupDescriptorW case in serveFormatDataRequest).
                 pendingLock.lock()
-                outFiles = entries
+                outFileRoots = urls
+                outFiles = []
                 // Close any leftover handles from a previous copy.
                 for (_, h) in outOpenHandles { try? h.close() }
                 outOpenHandles.removeAll()
@@ -271,7 +297,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 outFileGroupDescID = descID
                 formats.append((descID, CFFormatName.fileGroupDescriptorW.rawValue))
                 formats.append((contID, CFFormatName.fileContents.rawValue))
-                Log.clip.info("Advertising \(entries.count, privacy: .public) file/folder entry(ies)")
+                Log.clip.info("Advertising file copy (\(urls.count, privacy: .public) root(s); descriptor built on request)")
                 advertisedFiles = true
             }
         }
@@ -406,10 +432,32 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     }
                 case CFFormatName.fileGroupDescriptorW.rawValue:
                     pendingLock.lock()
-                    let entries = outFiles
+                    let cached = outFiles
+                    let roots = outFileRoots
                     pendingLock.unlock()
-                    payload = Self.encodeFileGroupDescriptorW(entries)
-                    Log.clip.info("Encoded FILEGROUPDESCRIPTORW: \(entries.count, privacy: .public) entries → \(payload.count, privacy: .public) bytes")
+                    if !cached.isEmpty || roots.isEmpty {
+                        payload = Self.encodeFileGroupDescriptorW(cached)
+                        Log.clip.info("Encoded FILEGROUPDESCRIPTORW (cached): \(cached.count, privacy: .public) entries → \(payload.count, privacy: .public) bytes")
+                    } else {
+                        // Build the descriptor off the main actor (the tree
+                        // walk can be slow), cache it for the FileContents
+                        // requests that follow, then send the response from
+                        // the task — so we don't block here.
+                        let limitMiB = config.clipboard.maxFileSizeMiB
+                        let send = sendFormatDataResponse
+                        let fid = formatID
+                        Task.detached { [weak self] in
+                            guard let self else { return }
+                            let entries = self.expandFileURLs(roots, limitMiB: limitMiB) ?? []
+                            self.pendingLock.lock()
+                            self.outFiles = entries
+                            self.pendingLock.unlock()
+                            let blob = Self.encodeFileGroupDescriptorW(entries)
+                            Log.clip.info("Encoded FILEGROUPDESCRIPTORW (lazy): \(entries.count, privacy: .public) entries → \(blob.count, privacy: .public) bytes")
+                            send?(fid, blob)
+                        }
+                        return   // response delivered asynchronously above
+                    }
                 case CFFormatName.fileContents.rawValue:
                     // File bytes never travel through FormatDataResponse;
                     // they come via CB_FILECONTENTS_REQUEST. Respond with
@@ -446,6 +494,19 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             return "\(f.id)"
         }.joined(separator: ", ")
         Log.clip.info("Client offered \(formats.count, privacy: .public) format(s): [\(dump, privacy: .public)]")
+
+        // Echo suppression: a local Mac copy is advertised to the client,
+        // which then echoes that same clipboard straight back as a format
+        // list. Acting on it would clear + round-trip the user's own copy
+        // (Finder loses "Paste"). Ignore client format lists that arrive
+        // within `echoSuppressMs` of a local pasteboard change.
+        if let changedAt = lastLocalChangeUptimeMs {
+            let windowMs = UInt64(max(0, config.clipboard.echoSuppressMs ?? 500))
+            if nowUptimeMs() &- changedAt < windowMs {
+                Log.clip.info("Ignoring client format list within \(windowMs, privacy: .public)ms of a local copy (echo)")
+                return
+            }
+        }
 
         let ids = Dictionary(uniqueKeysWithValues:
             formats.compactMap { f -> (UInt32, String?)? in (f.id, f.name) })
@@ -897,9 +958,9 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     /// Recursively expand the given roots into a flat list of entries
     /// with Windows-style relative paths. Folders are listed before
     /// their children. Returns nil if any single file exceeds the
-    /// max-file-size cap from config.
-    @MainActor
-    private func expandFileURLs(_ roots: [URL], limitMiB: Int) -> [OutFileEntry]? {
+    /// max-file-size cap from config. `nonisolated` so the (potentially slow)
+    /// tree walk can run off the main actor in a detached task.
+    nonisolated func expandFileURLs(_ roots: [URL], limitMiB: Int) -> [OutFileEntry]? {
         let fm = FileManager.default
         var out: [OutFileEntry] = []
         let limit = UInt64(limitMiB) * 1024 * 1024

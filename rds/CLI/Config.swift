@@ -26,6 +26,10 @@ struct Config: Codable, Sendable {
     /// Cursor config with defaults filled in.
     var effectiveCursor: CursorConfig { cursor ?? .default }
 
+    /// Menu-bar status item. Optional for older config files.
+    var tray: TrayConfig?
+    var effectiveTray: TrayConfig { tray ?? .default }
+
     struct ListenConfig: Codable, Sendable {
         var host: String
         var port: UInt16
@@ -158,8 +162,6 @@ struct Config: Codable, Sendable {
         var analysisFrameInterval: Int
         /// Floor between two analyses, milliseconds (rate limit under load).
         var analysisMinIntervalMs: Int
-        /// Pixel subsample stride inside a tile (1 = every pixel).
-        var spatialSampleStride: Int
 
         // --- change detection (temporal) ---
         // Classification is driven by the *character of the change*, not static
@@ -167,43 +169,48 @@ struct Config: Codable, Sendable {
         // the first classifier whose data requirements are met; if every
         // classifier in the chain needs dirtyRects and they're unavailable, the
         // chain is exhausted and the server exits (telling you to fix the chain).
-        //   "region"          — connected-component AREA of changed tiles
-        //                        (large region → H.264, small → Progressive).
-        //                        Needs dirtyRects.
-        //   "coverageHistory" — per-tile: over the last `coverageHistoryFrames`
-        //                        analyses, the fraction whose change-coverage
-        //                        exceeded `coverageHighThreshold`; ≥
-        //                        `coverageVideoFraction` → H.264. Captures
-        //                        "video = repeatedly changes a large FRACTION
-        //                        of the tile (small magnitude ok); UI = changes
-        //                        a small fraction (large magnitude ok)".
-        //                        Needs dirtyRects.
-        //   "luma"            — same coverage-history rule but coverage comes
-        //                        from per-pixel luma deltas. Needs NO dirtyRects
-        //                        (good as a last-resort fallback).
+        // Naming: "DR" suffix = signal from dirtyRects (changed *rectangles*,
+        // region-level, no per-pixel magnitude); no suffix = from a true
+        // per-pixel comparison. "Blob" = connected-component area rule.
+        //   "blobDR"      — connected-component AREA of touched tiles
+        //                   (large blob → H.264, small → Progressive).
+        //                   Needs dirtyRects.
+        //   "dirtyFreqDR" — per-tile: over the last `coverageHistoryFrames`
+        //                   analyses, the FREQUENCY the tile was touched by any
+        //                   dirty rect (boolean per frame). Through the
+        //                   videoFractionEnter/Exit band → H.264. Captures
+        //                   "video = touched nearly every frame; UI = touched
+        //                   only occasionally". Needs dirtyRects.
+        //   "pixelRate"   — SAME windowed-fraction + Schmitt band, but the
+        //                   per-frame bit is "real changed-pixel coverage >
+        //                   coverageHighThreshold" from a full-frame vectorized
+        //                   RGB comparison. Needs NO dirtyRects (last-resort
+        //                   fallback).
         var classifiers: [String]
 
-        /// Per-pixel |Δluma| above which a sampled pixel counts as changed.
-        /// Filters compression shimmer / gradient banding.
-        var pixelNoiseThreshold: Double
         /// Fraction of a tile's sampled pixels that must be changed for the
         /// tile to count as "active" (i.e. it gets sent at all, vs skipped).
         var tileActiveCoverage: Double
 
-        // -- "region" classifier --
+        // -- "blobDR" classifier --
         /// Connected changed-tile blobs with area (in tiles) ≥ this go to
         /// H.264; smaller blobs go to Progressive.
         var largeRegionTiles: Int
 
-        // -- "coverageHistory" classifier --
-        /// Window length (analyses) of the per-tile coverage history.
+        // -- "dirtyFreqDR" / "pixelRate" classifiers (shared rate rule) --
+        /// Window length (analyses) of the per-tile bit history.
         var coverageHistoryFrames: Int
-        /// Per-frame change-coverage above which a tile's frame counts as
-        /// "high-change" (fraction 0–1).
+        /// pixelRate ONLY: per-frame changed-pixel coverage above which the
+        /// tile's frame counts as "high-change" (fraction 0–1). Unused by
+        /// dirtyFreqDR, whose per-frame bit is a plain touched/not boolean.
         var coverageHighThreshold: Double
-        /// Fraction (0–1) of the windowed frames that must be "high-change"
-        /// for the tile to be classified video → H.264.
-        var coverageVideoFraction: Double
+        /// Schmitt-trigger band on the windowed set-bit fraction (anti-flicker).
+        /// A tile flips to video → H.264 once the fraction reaches
+        /// `videoFractionEnter`, and back to Progressive only once it drops
+        /// below `videoFractionExit`; in between it holds its last decision.
+        /// Require enter > exit.
+        var videoFractionEnter: Double
+        var videoFractionExit: Double
 
         /// A tile only adopts a *new* codec after the new decision persists
         /// this many consecutive analyses (anti-flap at region edges).
@@ -212,6 +219,13 @@ struct Config: Codable, Sendable {
         /// Progressive (crisp re-render) before going idle — keeps text sharp
         /// after a window drag / video stops.
         var settleRepaint: Bool
+
+        /// Convert the hybrid H.264 input to full-range YUV so its whites/blacks
+        /// match the Progressive tiles (see NV12Converter). Turn OFF to feed
+        /// BGRA straight to VideoToolbox (limited range): H.264 tiles then
+        /// render visibly darker — a handy DEBUG view of which tiles use which
+        /// codec, since brightness reveals the codec map at a glance.
+        var fullRangeVideo: Bool
 
         // --- H.264 bit-waste masking ---
         /// Paint non-video tiles a flat colour before VT encode so the
@@ -239,16 +253,16 @@ struct Config: Codable, Sendable {
                 tileSize: 64,
                 analysisFrameInterval: 2,
                 analysisMinIntervalMs: 33,
-                spatialSampleStride: 4,
-                classifiers: ["coverageHistory", "luma"],
-                pixelNoiseThreshold: 8.0,
+                classifiers: ["dirtyFreqDR"],
                 tileActiveCoverage: 0.02,
                 largeRegionTiles: 12,
-                coverageHistoryFrames: 5,
-                coverageHighThreshold: 0.4,
-                coverageVideoFraction: 0.2,
+                coverageHistoryFrames: 10,
+                coverageHighThreshold: 0.1,
+                videoFractionEnter: 0.9,
+                videoFractionExit: 0.4,
                 codecSwitchHysteresisFrames: 3,
                 settleRepaint: true,
+                fullRangeVideo: true,
                 maskNonVideoTiles: false,
                 maskColorBGRA: 0xFF00_0000,
                 maskHaloTiles: 2,
@@ -358,6 +372,13 @@ struct Config: Codable, Sendable {
     }
 
     /// Hardware-cursor (RDP pointer channel) settings.
+    /// macOS menu-bar status item (the top-right area where VPN/Wi-Fi icons
+    /// live), showing connected sessions + restart/quit controls.
+    struct TrayConfig: Codable, Sendable {
+        var enabled: Bool
+        static var `default`: TrayConfig { TrayConfig(enabled: true) }
+    }
+
     struct CursorConfig: Codable, Sendable {
         /// When true, capture with `showsCursor=false` and send the cursor's
         /// position + shape out-of-band via RDP pointer updates so the client
@@ -481,6 +502,13 @@ struct Config: Codable, Sendable {
         /// never needs to browse, so it's hidden by default (registered +
         /// functional, just not user-visible). nil → false (hidden).
         var showInFinder: Bool?
+        /// Echo-suppression window (milliseconds). After the Mac pasteboard
+        /// changes locally we advertise it to the client; the client then
+        /// echoes that same clipboard back as a format list, which would
+        /// clobber the user's own copy (Finder loses "Paste"). Client format
+        /// lists arriving within this window of a local change are ignored as
+        /// echoes. nil → 500.
+        var echoSuppressMs: Int?
     }
 
     /// Device redirection (MS-RDPEFS / RDPDR). Phase 1 of this feature
@@ -494,7 +522,7 @@ struct Config: Codable, Sendable {
         Config(
             listen: .init(host: "0.0.0.0", port: 3389),
             auth: .init(authUserPolicy: "self", username: nil,
-                        passwordPolicy: "serial", domain: nil,
+                        passwordPolicy: "none", domain: nil,
                         ntHash: nil, sshHost: nil, sshPort: nil,
                         certificateFile: nil, privateKeyFile: nil,
                         certificateValidityDays: 3650,
@@ -533,7 +561,8 @@ struct Config: Codable, Sendable {
                              maxFileSizeMiB: 4096, pollIntervalMs: 200,
                              fileFetchMode: "lazy", showInFinder: false),
             rdpdr: .init(enabled: true),
-            cursor: .default
+            cursor: .default,
+            tray: .default
         )
     }
 }
