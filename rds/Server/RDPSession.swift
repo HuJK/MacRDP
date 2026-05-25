@@ -17,6 +17,20 @@ import os
 final class RDPSession {
     private let fd: Int32
     private let config: Config
+    /// Connecting client's IP (from accept), for the menu-bar session list.
+    let clientIP: String
+    /// Role — only `.control` is created today; `.viewer` is reserved for
+    /// future multi-session.
+    let role: SessionRole
+    /// Authenticated username, set once the peer connects.
+    private(set) var clientUsername: String?
+
+    /// Snapshot for the menu-bar UI.
+    func info() -> SessionInfo {
+        SessionInfo(id: ObjectIdentifier(self),
+                    username: clientUsername ?? "authenticating…",
+                    ip: clientIP, role: role)
+    }
 
     #if MACRDP_BRIDGE_AVAILABLE
     private var bridge: BridgePeer?
@@ -95,9 +109,11 @@ final class RDPSession {
 
     var onTerminated: (() -> Void)?
 
-    init(fd: Int32, config: Config) {
+    init(fd: Int32, config: Config, clientIP: String = "", role: SessionRole = .control) {
         self.fd = fd
         self.config = config
+        self.clientIP = clientIP
+        self.role = role
     }
 
     func start() {
@@ -152,6 +168,11 @@ final class RDPSession {
             .ensureCertificate(config: config)
 
         var sinks = BridgePeer.Sinks()
+        sinks.onAuthenticatedUser = { [weak self] user in
+            Task { @MainActor [weak self] in
+                self?.clientUsername = user.isEmpty ? nil : user
+            }
+        }
         // "ssh" login policy gate: verify the client's password against the
         // SSH server (the real macOS account), then cache its NT-hash so the
         // next connection can use NLA. Fires on the bridge thread.

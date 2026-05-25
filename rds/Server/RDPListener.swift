@@ -116,20 +116,48 @@ final class RDPListener {
             _ = setsockopt(client, SOL_SOCKET, SO_SNDBUF,
                            &sndBuf, socklen_t(MemoryLayout<Int32>.size))
 
+            let ip = Self.peerIPString(&addr, len)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let owner else {
                         close(client)
                         return
                     }
-                    owner.handleAccepted(fd: client)
+                    owner.handleAccepted(fd: client, peerIP: ip)
                 }
             }
         }
     }
 
-    private func handleAccepted(fd: Int32) {
-        let session = RDPSession(fd: fd, config: config)
+    private nonisolated static func peerIPString(_ addr: inout sockaddr_storage,
+                                                 _ len: socklen_t) -> String {
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let rc = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                getnameinfo(sa, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            }
+        }
+        guard rc == 0 else { return "?" }
+        var s = String(cString: host)
+        // Unwrap IPv4-mapped IPv6 (::ffff:1.2.3.4 → 1.2.3.4) for readability.
+        if let r = s.range(of: "::ffff:", options: [.caseInsensitive, .anchored]) {
+            s.removeSubrange(r)
+        }
+        return s
+    }
+
+    private func handleAccepted(fd: Int32, peerIP: String) {
+        // Single-session model: a new control connection replaces any existing
+        // control session. Structured to allow multiple viewers later — only
+        // control sessions kick each other.
+        let newRole: SessionRole = .control
+        for (sid, s) in sessions where s.role == .control {
+            Log.listener.notice("New control session from \(peerIP, privacy: .public) — kicking previous (\(s.clientIP, privacy: .public))")
+            s.shutdown()
+            sessions.removeValue(forKey: sid)
+        }
+
+        let session = RDPSession(fd: fd, config: config, clientIP: peerIP, role: newRole)
         let id = ObjectIdentifier(session)
         sessions[id] = session
         session.onTerminated = { [weak self] in
@@ -137,7 +165,20 @@ final class RDPListener {
                 self?.sessions.removeValue(forKey: id)
             }
         }
-        Log.listener.info("Accepted client fd=\(fd, privacy: .public)")
+        Log.listener.info("Accepted client fd=\(fd, privacy: .public) ip=\(peerIP, privacy: .public)")
         session.start()
+    }
+
+    // MARK: - Session control (menu bar)
+
+    func activeSessions() -> [SessionInfo] {
+        sessions.values.map { $0.info() }.sorted { $0.ip < $1.ip }
+    }
+
+    func kick(id: ObjectIdentifier) {
+        guard let s = sessions[id] else { return }
+        Log.listener.notice("Kicking session \(s.clientIP, privacy: .public)")
+        s.shutdown()
+        sessions.removeValue(forKey: id)
     }
 }

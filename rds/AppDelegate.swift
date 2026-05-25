@@ -23,11 +23,14 @@ import os
 
 @MainActor
 @main
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var listener: RDPListener?
     private var signalSources: [DispatchSourceSignal] = []
     private var permissionPrompt: PermissionPromptWindow?
+    /// Menu-bar status item + the session snapshot backing its Sessions list.
+    private var statusItem: NSStatusItem?
+    private var menuSessions: [SessionInfo] = []
     /// Snapshot of parsed CLI args, kept alive so we can resume bootstrap
     /// after the permission prompt closes.
     private var pendingConfig: Config?
@@ -222,6 +225,83 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         installSignalHandler(SIGINT)
         installSignalHandler(SIGTERM)
+
+        if (pendingConfig?.effectiveTray.enabled ?? true) {
+            setupMenuBar()
+        }
+    }
+
+    // MARK: - Menu bar (NSStatusItem)
+
+    private func setupMenuBar() {
+        guard statusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "display",
+                                     accessibilityDescription: "MacRDP")
+        item.button?.image?.isTemplate = true
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        self.statusItem = item
+        Log.server.info("Menu-bar status item installed")
+    }
+
+    /// Rebuild the menu each time it opens so the session list is current.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        let header = NSMenuItem(title: "MacRDP", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(.separator())
+
+        let sessionsTitle = NSMenuItem(title: "Sessions", action: nil, keyEquivalent: "")
+        sessionsTitle.isEnabled = false
+        menu.addItem(sessionsTitle)
+
+        menuSessions = listener?.activeSessions() ?? []
+        if menuSessions.isEmpty {
+            let none = NSMenuItem(title: "  No active sessions", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
+        } else {
+            for (i, s) in menuSessions.enumerated() {
+                let title = "  \(s.username) @ \(s.ip)  (\(s.role.rawValue)) — Disconnect"
+                let mi = NSMenuItem(title: title, action: #selector(kickSession(_:)), keyEquivalent: "")
+                mi.target = self
+                mi.tag = i
+                menu.addItem(mi)
+            }
+        }
+
+        menu.addItem(.separator())
+        let restart = NSMenuItem(title: "Restart Service", action: #selector(restartService(_:)), keyEquivalent: "")
+        restart.target = self
+        menu.addItem(restart)
+        let off = NSMenuItem(title: "Turn Off Service", action: #selector(quitService(_:)), keyEquivalent: "")
+        off.target = self
+        menu.addItem(off)
+    }
+
+    @objc private func kickSession(_ sender: NSMenuItem) {
+        let i = sender.tag
+        guard i >= 0, i < menuSessions.count else { return }
+        listener?.kick(id: menuSessions[i].id)
+    }
+
+    @objc private func restartService(_ sender: NSMenuItem) {
+        guard let cfg = pendingConfig else { return }
+        Log.server.notice("Restarting service from menu bar")
+        listener?.stop()
+        listener = nil
+        let l = RDPListener(config: cfg)
+        self.listener = l
+        do { try l.start() }
+        catch { Log.server.error("Restart failed: \(String(describing: error), privacy: .public)") }
+    }
+
+    @objc private func quitService(_ sender: NSMenuItem) {
+        NSApp.terminate(nil)
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
