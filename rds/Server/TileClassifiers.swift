@@ -9,13 +9,24 @@
 //  Classifiers declare whether they require ScreenCaptureKit's dirtyRects.
 //  There is NO silent fallback: if a dirtyRects-requiring classifier is
 //  selected but the data is unavailable, the engine notifies and exits so the
-//  user switches to a classifier that doesn't need it (e.g. "luma").
+//  user switches to a classifier that doesn't need it (e.g. "pixelRate").
 //
-//    "region"          — dirtyRects coverage → connected-component AREA.
-//    "coverageHistory" — dirtyRects coverage → fraction of recent frames whose
-//                        coverage was high.
-//    "luma"            — per-pixel luma-delta coverage → same coverage-history
-//                        rule, but needs no dirtyRects.
+//  Naming: the "DR" suffix means the change signal comes from dirtyRects (a set
+//  of changed *rectangles* per frame — region-level, no per-pixel magnitude); no
+//  suffix means a true per-pixel comparison.
+//
+//    "blobDR"      — dirtyRects → connected-component AREA of touched tiles
+//                    (large blob → video).
+//    "dirtyFreqDR" — dirtyRects → per tile, the FREQUENCY over recent frames
+//                    that the tile was touched by any dirty rect (boolean per
+//                    frame, no area magnitude — that would be bogus since a
+//                    dirty rect is only a bounding box). High frequency =
+//                    continuously updating = video.
+//    "pixelRate"   — full-frame per-pixel RGB comparison → per tile, the
+//                    fraction of recent frames whose *real* changed-pixel
+//                    coverage was high. Per-pixel coverage is a true magnitude,
+//                    so the coverage-rate rule is meaningful here. Needs no
+//                    dirtyRects.
 //
 
 import Foundation
@@ -38,10 +49,10 @@ protocol TileClassifier: AnyObject {
 /// Build one classifier by name, or nil if the name is unknown.
 func makeTileClassifier(named name: String, cfg: Config.HybridConfig) -> TileClassifier? {
     switch name.lowercased() {
-    case "region":          return RegionClassifier(cfg: cfg)
-    case "coveragehistory": return CoverageHistoryClassifier(cfg: cfg)
-    case "luma":            return LumaClassifier(cfg: cfg)
-    default:                return nil
+    case "blobdr":      return BlobDRClassifier(cfg: cfg)
+    case "dirtyfreqdr": return DirtyFreqDRClassifier(cfg: cfg)
+    case "pixelrate":   return PixelRateClassifier(cfg: cfg)
+    default:            return nil
     }
 }
 
@@ -88,23 +99,65 @@ private func activeMask(_ coverage: [Double], primed: Bool, threshold: Double) -
     coverage.map { primed ? ($0 >= threshold) : true }
 }
 
-/// Rolling per-tile "high-coverage" bit history → coverage-history decision.
-private final class CoverageHistory {
-    private var hist: [UInt32] = []
-    func reset(_ n: Int) { hist = [UInt32](repeating: 0, count: max(0, n)) }
-    func push(_ coverage: [Double], highThreshold: Double) {
-        if hist.count != coverage.count { hist = [UInt32](repeating: 0, count: coverage.count) }
-        for i in coverage.indices {
-            hist[i] = (hist[i] << 1) | (coverage[i] > highThreshold ? 1 : 0)
+/// Per-tile boolean: was the tile overlapped by ANY dirty rect (≥1 pixel)?
+/// Region-level only — no area magnitude (a dirty rect is just a bounding box).
+private func tilesTouched(by rects: [CGRect], grid g: TileGrid) -> [Bool] {
+    let cols = g.cols, rows = g.rows, ts = g.tileSize, w = g.width, h = g.height
+    var touched = [Bool](repeating: false, count: max(0, cols * rows))
+    guard cols > 0, rows > 0 else { return touched }
+    for rect in rects {
+        let x0 = max(0, Int(rect.minX.rounded(.down)))
+        let y0 = max(0, Int(rect.minY.rounded(.down)))
+        let x1 = min(w, Int(rect.maxX.rounded(.up)))
+        let y1 = min(h, Int(rect.maxY.rounded(.up)))
+        if x1 <= x0 || y1 <= y0 { continue }
+        for tr in (y0 / ts)...((y1 - 1) / ts) {
+            for tc in (x0 / ts)...((x1 - 1) / ts) {
+                touched[tr * cols + tc] = true
+            }
         }
     }
-    func desired(active: [Bool], windowFrames: Int, videoFraction: Double) -> [UInt8] {
+    return touched
+}
+
+/// Rolling per-tile bit history → windowed set-bit fraction, turned into a
+/// codec decision via a Schmitt trigger (dual threshold). dirtyFreqDR feeds
+/// "tile was touched this frame"; pixelRate feeds "real pixel-coverage was
+/// high this frame". The set-bit fraction over the recent window is the video
+/// signal; the enter/exit band stops it flickering when the fraction hovers
+/// around a single cutoff (e.g. bouncing 0.3↔0.5 around 0.4).
+private final class BitHistory {
+    private var hist: [UInt32] = []
+    private var videoState: [Bool] = []     // last Schmitt decision per tile
+    func reset(_ n: Int) {
+        hist = [UInt32](repeating: 0, count: max(0, n))
+        videoState = [Bool](repeating: false, count: max(0, n))
+    }
+    func push(_ bits: [Bool]) {
+        if hist.count != bits.count { hist = [UInt32](repeating: 0, count: bits.count) }
+        for i in bits.indices {
+            hist[i] = (hist[i] << 1) | (bits[i] ? 1 : 0)
+        }
+    }
+    /// `enterFraction` > `exitFraction`. A tile becomes video once its windowed
+    /// set-bit fraction reaches `enterFraction`, and reverts to non-video only
+    /// once it drops below `exitFraction`; in between it holds its last state.
+    func desired(active: [Bool], windowFrames: Int,
+                 enterFraction: Double, exitFraction: Double) -> [UInt8] {
         let window = min(32, max(1, windowFrames))
         let mask: UInt32 = window >= 32 ? .max : ((1 << UInt32(window)) - 1)
+        if videoState.count != hist.count { videoState = [Bool](repeating: false, count: hist.count) }
         var out = [UInt8](repeating: TileCodec.progressive.rawValue, count: hist.count)
-        for i in hist.indices where i < active.count && active[i] {
-            let frac = Double((hist[i] & mask).nonzeroBitCount) / Double(window)
-            out[i] = frac >= videoFraction ? TileCodec.h264.rawValue : TileCodec.progressive.rawValue
+        for i in hist.indices {
+            if i < active.count && active[i] {
+                let frac = Double((hist[i] & mask).nonzeroBitCount) / Double(window)
+                if videoState[i] {
+                    if frac < exitFraction { videoState[i] = false }
+                } else if frac >= enterFraction {
+                    videoState[i] = true
+                }
+            }
+            out[i] = videoState[i] ? TileCodec.h264.rawValue : TileCodec.progressive.rawValue
         }
         return out
     }
@@ -134,10 +187,10 @@ private func classifyByRegionArea(active: [Bool], grid g: TileGrid,
     }
 }
 
-// MARK: - region
+// MARK: - blobDR (dirtyRects → connected-component blob area)
 
-final class RegionClassifier: TileClassifier {
-    let name = "region"
+final class BlobDRClassifier: TileClassifier {
+    let name = "blobDR"
     let requiresDirtyRects = true
     private let cfg: Config.HybridConfig
     init(cfg: Config.HybridConfig) { self.cfg = cfg }
@@ -153,100 +206,155 @@ final class RegionClassifier: TileClassifier {
     }
 }
 
-// MARK: - coverageHistory
+// MARK: - dirtyFreqDR (dirtyRects → per-tile touch-frequency over recent frames)
 
-final class CoverageHistoryClassifier: TileClassifier {
-    let name = "coverageHistory"
+final class DirtyFreqDRClassifier: TileClassifier {
+    let name = "dirtyFreqDR"
     let requiresDirtyRects = true
     private let cfg: Config.HybridConfig
-    private let history = CoverageHistory()
+    private let history = BitHistory()
     init(cfg: Config.HybridConfig) { self.cfg = cfg }
     func reset(grid: TileGrid) { history.reset(grid.tileCount) }
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
         -> (active: [Bool], desired: [UInt8]) {
-        let coverage = coverageFromDirtyRects(dirtyRects ?? [], grid: grid)
-        let active = activeMask(coverage, primed: primed, threshold: cfg.tileActiveCoverage)
-        history.push(coverage, highThreshold: cfg.coverageHighThreshold)
+        // Boolean "touched this frame" per tile — no area magnitude. A tile is
+        // active (worth sending) iff it was touched; first frame = full repaint.
+        let touched = tilesTouched(by: dirtyRects ?? [], grid: grid)
+        let active = primed ? touched : [Bool](repeating: true, count: grid.tileCount)
+        history.push(touched)
         let desired = history.desired(active: active,
                                       windowFrames: cfg.coverageHistoryFrames,
-                                      videoFraction: cfg.coverageVideoFraction)
+                                      enterFraction: cfg.videoFractionEnter,
+                                      exitFraction: cfg.videoFractionExit)
         return (active, desired)
     }
 }
 
-// MARK: - luma (no dirtyRects needed)
+// MARK: - pixelRate (no dirtyRects; full-frame per-pixel RGB comparison)
 
-final class LumaClassifier: TileClassifier {
-    let name = "luma"
-    let requiresDirtyRects = false
-    private let cfg: Config.HybridConfig
-    private let history = CoverageHistory()
-    private var prev: [UInt8] = []
-    private var cur: [UInt8] = []
-    private var sampledW = 0
-    private var sampledH = 0
+/// Pluggable full-frame pixel-diff coverage backend for the pixelRate
+/// classifier. A pixel "changed" iff its RGB differs at all from the previous
+/// frame (exact inequality; the BGR*X* padding byte is ignored). The CPU
+/// backend below is the default; a Metal GPU backend can conform to this
+/// protocol later without touching the classifier or the AnalysisEngine.
+protocol PixelRateBackend: AnyObject {
+    func reset(grid: TileGrid)
+    /// Fill `coverage` (length tileCount) with each tile's changed-pixel
+    /// fraction vs the previous frame, then store this frame as the new
+    /// previous. When `primed` is false this only stores (coverage stays 0,
+    /// since there is no prior frame to diff against).
+    func coverage(grid: TileGrid, primed: Bool, pixel: CVPixelBuffer,
+                  into coverage: inout [Double])
+}
 
-    init(cfg: Config.HybridConfig) { self.cfg = cfg }
+/// CPU backend: compares every pixel to the previous frame using SIMD8<UInt32>
+/// lanes (8 BGRX words at a time), masking off the padding byte so only RGB is
+/// compared, and counts changed pixels per tile. Tile edges (64 is a multiple
+/// of the 8-lane width) and the right/bottom partial tiles fall to a scalar
+/// tail so a SIMD chunk never straddles a tile boundary.
+final class CPUPixelRateBackend: PixelRateBackend {
+    private var prev: [UInt32] = []     // tightly packed w*h previous-frame words
+    private var w = 0
+    private var h = 0
 
     func reset(grid: TileGrid) {
-        let step = max(1, cfg.spatialSampleStride)
-        sampledW = grid.width  > 0 ? (grid.width  + step - 1) / step : 0
-        sampledH = grid.height > 0 ? (grid.height + step - 1) / step : 0
-        let n = max(0, sampledW * sampledH)
-        prev = [UInt8](repeating: 0, count: n)
-        cur  = [UInt8](repeating: 0, count: n)
+        w = grid.width; h = grid.height
+        prev = [UInt32](repeating: 0, count: max(0, w * h))
+    }
+
+    func coverage(grid g: TileGrid, primed: Bool, pixel: CVPixelBuffer,
+                  into coverage: inout [Double]) {
+        CVPixelBufferLockBaseAddress(pixel, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+        let ts = g.tileSize, cols = g.cols, rows = g.rows
+        guard let base = CVPixelBufferGetBaseAddress(pixel),
+              CVPixelBufferGetWidth(pixel) == w, CVPixelBufferGetHeight(pixel) == h,
+              w > 0, h > 0, prev.count == w * h else { return }
+        let stride = CVPixelBufferGetBytesPerRow(pixel)
+        let maskWord: UInt32 = 0x00FF_FFFF      // keep B,G,R; drop the X byte
+
+        var changed = [Int](repeating: 0, count: cols * rows)
+        prev.withUnsafeMutableBufferPointer { pbuf in
+            guard let pp = pbuf.baseAddress else { return }
+            let vmask  = SIMD8<UInt32>(repeating: maskWord)
+            let vzeroU = SIMD8<UInt32>(repeating: 0)
+            let vzeroI = SIMD8<Int32>(repeating: 0)
+            let voneI  = SIMD8<Int32>(repeating: 1)
+            for y in 0..<h {
+                let curRow = base.advanced(by: y * stride)      // strided source row
+                let preRow = pp + y * w                         // packed prev row
+                if primed {
+                    let tileRowBase = (y / ts) * cols
+                    var x = 0
+                    while x < w {
+                        let run = min(8, min(w - x, ts - (x % ts)))
+                        if run == 8 {
+                            let cur = curRow.advanced(by: x * 4)
+                                .loadUnaligned(as: SIMD8<UInt32>.self)
+                            let pre = UnsafeRawPointer(preRow + x)
+                                .loadUnaligned(as: SIMD8<UInt32>.self)
+                            let diff = (cur ^ pre) & vmask
+                            let inc = vzeroI.replacing(with: voneI, where: diff .!= vzeroU)
+                            changed[tileRowBase + x / ts] += Int(inc.wrappedSum())
+                        } else {
+                            var c = 0
+                            for k in 0..<run {
+                                let cw = curRow.advanced(by: (x + k) * 4)
+                                    .loadUnaligned(as: UInt32.self)
+                                if (cw ^ preRow[x + k]) & maskWord != 0 { c += 1 }
+                            }
+                            changed[tileRowBase + x / ts] += c
+                        }
+                        x += run
+                    }
+                }
+                // Store this frame's row as the new previous (full words; the
+                // masked-off X byte is harmless since the next diff masks too).
+                memcpy(preRow, curRow, w * 4)
+            }
+        }
+
+        guard primed else { return }        // first frame: no prior → leave at 0
+        for tr in 0..<rows {
+            let th = min(ts, h - tr * ts)
+            for tc in 0..<cols {
+                let tw = min(ts, w - tc * ts)
+                let i = tr * cols + tc
+                let total = tw * th
+                coverage[i] = total > 0 ? Double(changed[i]) / Double(total) : 0
+            }
+        }
+    }
+}
+
+final class PixelRateClassifier: TileClassifier {
+    let name = "pixelRate"
+    let requiresDirtyRects = false
+    private let cfg: Config.HybridConfig
+    private let history = BitHistory()
+    private let backend: PixelRateBackend
+
+    init(cfg: Config.HybridConfig, backend: PixelRateBackend = CPUPixelRateBackend()) {
+        self.cfg = cfg
+        self.backend = backend
+    }
+
+    func reset(grid: TileGrid) {
+        backend.reset(grid: grid)
         history.reset(grid.tileCount)
     }
 
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
         -> (active: [Bool], desired: [UInt8]) {
         var coverage = [Double](repeating: 0, count: grid.tileCount)
-        computeLumaCoverage(grid: grid, primed: primed, pixel: pixel, into: &coverage)
+        backend.coverage(grid: grid, primed: primed, pixel: pixel, into: &coverage)
         let active = activeMask(coverage, primed: primed, threshold: cfg.tileActiveCoverage)
-        history.push(coverage, highThreshold: cfg.coverageHighThreshold)
+        // Per-pixel coverage IS a true magnitude, so threshold it into the bit.
+        history.push(coverage.map { $0 > cfg.coverageHighThreshold })
         let desired = history.desired(active: active,
                                       windowFrames: cfg.coverageHistoryFrames,
-                                      videoFraction: cfg.coverageVideoFraction)
+                                      enterFraction: cfg.videoFractionEnter,
+                                      exitFraction: cfg.videoFractionExit)
         return (active, desired)
     }
-
-    private func computeLumaCoverage(grid g: TileGrid, primed: Bool,
-                                     pixel: CVPixelBuffer, into coverage: inout [Double]) {
-        CVPixelBufferLockBaseAddress(pixel, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-        let w = g.width, h = g.height, ts = g.tileSize, cols = g.cols
-        guard let base = CVPixelBufferGetBaseAddress(pixel),
-              CVPixelBufferGetWidth(pixel) == w, CVPixelBufferGetHeight(pixel) == h,
-              sampledW > 0, sampledH > 0, prev.count == sampledW * sampledH else { return }
-        let stride = CVPixelBufferGetBytesPerRow(pixel)
-        let px = base.assumingMemoryBound(to: UInt8.self)
-        let step = max(1, cfg.spatialSampleStride)
-        let noise = Int(cfg.pixelNoiseThreshold)
-        var changed = [Int](repeating: 0, count: grid_tileCount(g))
-        var samples = [Int](repeating: 0, count: grid_tileCount(g))
-        for sy in 0..<sampledH {
-            let y = sy * step
-            if y >= h { break }
-            let rowBase = y * stride
-            let tileRow = y / ts
-            for sx in 0..<sampledW {
-                let x = sx * step
-                if x >= w { break }
-                let p = rowBase + x * 4
-                let b = Int(px[p]); let gg = Int(px[p + 1]); let r = Int(px[p + 2])
-                let luma = UInt8(truncatingIfNeeded: (r * 77 + gg * 150 + b * 29) >> 8)
-                let fIdx = sy * sampledW + sx
-                cur[fIdx] = luma
-                let t = tileRow * cols + (x / ts)
-                samples[t] += 1
-                if primed && abs(Int(luma) - Int(prev[fIdx])) > noise { changed[t] += 1 }
-            }
-        }
-        for i in coverage.indices {
-            coverage[i] = samples[i] > 0 ? Double(changed[i]) / Double(samples[i]) : 0
-        }
-        swap(&prev, &cur)
-    }
-
-    private func grid_tileCount(_ g: TileGrid) -> Int { g.tileCount }
 }

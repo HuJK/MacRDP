@@ -33,6 +33,7 @@ final class CursorPipeline: @unchecked Sendable {
     // Timer-thread-only state.
     private var lastToken = Int.min
     private var lastHash: UInt64 = 0
+    private var lastScale = -1.0
     private var hadCursor = false
     private var lastX = Int.min
     private var lastY = Int.min
@@ -90,13 +91,25 @@ final class CursorPipeline: @unchecked Sendable {
     }
 
     private func pollShape() {
+        // Desktop point→surface-pixel scale: the surface is advertised in the
+        // display's POINT dimensions (CGDisplayPixelsWide), so the cursor must
+        // be rendered at point size × this factor (≈1 normally) — otherwise the
+        // native Retina (2×) cursor bitmap looks double-size on the client.
+        geomLock.lock()
+        let sw = surfaceW, did = displayID
+        geomLock.unlock()
+        let macW = did != 0 ? CGDisplayPixelsWide(did) : 0
+        let scale = (macW > 0 && sw > 0) ? Double(sw) / Double(macW) : 1.0
+
         let token = source.changeToken()
         // With a valid seed, skip when unchanged. Token -1 = no seed → always
-        // fetch and dedupe by hash below.
-        if token >= 0 && token == lastToken { return }
+        // fetch and dedupe by hash below. Also re-fetch if the scale changed
+        // (resolution change) even when the shape token didn't bump.
+        if token >= 0 && token == lastToken && scale == lastScale { return }
         lastToken = token
+        lastScale = scale
 
-        if let img = source.currentCursor() {
+        if let img = source.currentCursor(scale: scale) {
             let h = CursorSource.hash(img)
             if h != lastHash || !hadCursor {
                 lastHash = h

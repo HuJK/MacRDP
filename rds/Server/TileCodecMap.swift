@@ -153,6 +153,11 @@ protocol HybridFrameSink: AnyObject, Sendable {
     /// Send one composed frame. `annexB == nil` means a Progressive-only frame
     /// (no video tiles this frame). May be called from any thread.
     func send(annexB: Data?, isIDR: Bool, pts: CMTime, payload: HybridFramePayload)
+    /// Convergence: on a non-`.complete` (idle) frame, if the last sent frame
+    /// painted an H.264 region, deliver ONE crisp Progressive repaint of that
+    /// region from `pixel` (the now-static content) so it doesn't stay stuck on
+    /// the last lossy H.264 blit. Does NOT run analysis. Called on MainActor.
+    func flushSettle(pixel: CVPixelBuffer, width: Int, height: Int, stride: Int)
 }
 
 /// Merge same-codec tiles into rectangles. Greedy per-row run-merge followed

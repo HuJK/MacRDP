@@ -35,6 +35,14 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     private var poolW = 0
     private var poolH = 0
 
+    // Convergence ("settle on idle"): the H.264 region the client is currently
+    // showing. When capture goes idle we repaint it once via Progressive so it
+    // doesn't stay stuck on the last lossy H.264 blit. Guarded by settleLock.
+    private let settleLock = NSLock()
+    private var settleRects: [Rect16] = []   // last frame's videoRects
+    private var settlePending = false        // last sent frame had H.264 tiles
+    private var settleInFlight = false        // a flush is enqueued
+
     init(config: Config, bridge: BridgePeer, initialGrid: TileGrid) {
         self.cfg = config.video.effectiveHybrid
         self.bridge = bridge
@@ -86,6 +94,12 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     }
 
     func send(annexB: Data?, isIDR: Bool, pts: CMTime, payload: HybridFramePayload) {
+        // Track the region the client now shows via H.264, for idle convergence.
+        settleLock.lock()
+        settleRects = payload.videoRects
+        settlePending = !payload.videoRects.isEmpty
+        settleLock.unlock()
+
         sendQueue.async { [weak self] in
             guard let self, let bridge = self.bridge else { return }
             let pixel = payload.pixel
@@ -101,6 +115,42 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
                 videoRects: payload.videoRects,
                 bgra: base, width: w, height: h, stride: stride,
                 staticRects: payload.staticRects)
+        }
+    }
+
+    func flushSettle(pixel: CVPixelBuffer, width: Int, height: Int, stride: Int) {
+        // Only when the client is currently showing an H.264 region and no
+        // flush is already in flight. Cleared on a successful send; on failure
+        // (backpressure) we keep it pending and retry on the next idle frame.
+        settleLock.lock()
+        guard settlePending, !settleInFlight, !settleRects.isEmpty else {
+            settleLock.unlock(); return
+        }
+        settleInFlight = true
+        let rects = settleRects
+        settleLock.unlock()
+
+        sendQueue.async { [weak self] in
+            guard let self else { return }
+            var ok = false
+            if let bridge = self.bridge {
+                CVPixelBufferLockBaseAddress(pixel, .readOnly)
+                if let baseRaw = CVPixelBufferGetBaseAddress(pixel) {
+                    let base = baseRaw.assumingMemoryBound(to: UInt8.self)
+                    // Progressive-only repaint of the now-static former H.264
+                    // region — no analysis, no AVC, just converge the pixels.
+                    ok = bridge.sendHybrid(
+                        annexB: nil, isIDR: false, pts: .invalid,
+                        videoRects: [],
+                        bgra: base, width: width, height: height, stride: stride,
+                        staticRects: rects)
+                }
+                CVPixelBufferUnlockBaseAddress(pixel, .readOnly)
+            }
+            self.settleLock.lock()
+            self.settleInFlight = false
+            if ok { self.settlePending = false }
+            self.settleLock.unlock()
         }
     }
 

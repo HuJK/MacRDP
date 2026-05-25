@@ -10,7 +10,7 @@
 //
 //  No silent fallback: if the selected classifier requires dirtyRects and they
 //  are unavailable, the engine logs a fault and exits so the operator switches
-//  `video.hybrid.classifier` to one that doesn't (e.g. "luma").
+//  `video.hybrid.classifier` to one that doesn't (e.g. "pixelRate").
 //
 
 import Foundation
@@ -143,7 +143,7 @@ final class AnalysisEngine: @unchecked Sendable {
             Log.encoder.fault("""
                 Hybrid classifier chain [\(names, privacy: .public)] is exhausted: every \
                 entry requires ScreenCaptureKit dirtyRects, which are unavailable. Add \
-                "luma" to video.hybrid.classifiers, or set video.codec to a non-hybrid \
+                "pixelRate" to video.hybrid.classifiers, or set video.codec to a non-hybrid \
                 codec. Exiting.
                 """)
             exit(EXIT_FAILURE)

@@ -54,13 +54,22 @@ final class CursorSource: @unchecked Sendable {
 
     /// The current system cursor as a top-down BGRA bitmap, or nil if hidden /
     /// unavailable.
-    func currentCursor() -> CursorImage? {
+    ///
+    /// `scale` is the desktop's point→surface-pixel factor (surfaceWidth /
+    /// CGDisplayPixelsWide). The cursor is rendered at its *point* size × scale
+    /// so it matches the captured desktop's scale. NSCursor's cgImage is the
+    /// native Retina (e.g. 2×) bitmap; on a point-resolution desktop (scale=1)
+    /// that would draw double-size, so we resample to point size here.
+    func currentCursor(scale: Double) -> CursorImage? {
         guard let cursor = NSCursor.currentSystem ?? NSCursor.current as NSCursor?,
               let cg = cursor.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else { return nil }
 
-        let w = cg.width, h = cg.height
-        guard w > 0, h > 0 else { return nil }
+        let s = scale > 0 ? scale : 1.0
+        let ptW = cursor.image.size.width, ptH = cursor.image.size.height
+        guard ptW > 0, ptH > 0, cg.width > 0, cg.height > 0 else { return nil }
+        let w = max(1, Int((ptW * s).rounded()))
+        let h = max(1, Int((ptH * s).rounded()))
 
         var data = [UInt8](repeating: 0, count: w * h * 4)
         let cs = CGColorSpaceCreateDeviceRGB()
@@ -72,20 +81,20 @@ final class CursorSource: @unchecked Sendable {
                 data: buf.baseAddress, width: w, height: h,
                 bitsPerComponent: 8, bytesPerRow: w * 4,
                 space: cs, bitmapInfo: bitmapInfo) else { return false }
+            ctx.interpolationQuality = .high
             // A bitmap context already yields row 0 = top of the image, so we
             // do NOT flip here — that gives true top-down BGRA. The C bridge
-            // flips top-down → RDP's bottom-up wire layout.
+            // flips top-down → RDP's bottom-up wire layout. Drawing into the
+            // point-sized rect resamples the native cgImage to the right scale.
             ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
             return true
         }
         guard ok else { return nil }
 
         // NSCursor.hotSpot is in the image's point coordinate space (top-left
-        // origin). Scale to pixels for Retina cursors.
-        let scaleX = Double(w) / Double(max(1, cursor.image.size.width))
-        let scaleY = Double(h) / Double(max(1, cursor.image.size.height))
-        let hotX = Int((Double(cursor.hotSpot.x) * scaleX).rounded())
-        let hotY = Int((Double(cursor.hotSpot.y) * scaleY).rounded())
+        // origin); scale it the same way as the bitmap.
+        let hotX = Int((Double(cursor.hotSpot.x) * s).rounded())
+        let hotY = Int((Double(cursor.hotSpot.y) * s).rounded())
 
         return CursorImage(bgra: data, width: w, height: h,
                            hotX: max(0, min(w - 1, hotX)),

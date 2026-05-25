@@ -41,6 +41,8 @@ final class DisplayPipeline {
     private let config: Config
     private var stream: SCStream?
     private var encoder: H264Encoder?
+    /// BGRA → full-range NV12 for the hybrid H.264 path (non-nil only in hybrid).
+    private var nv12Converter: NV12Converter?
     private var output: StreamOutputProxy?
     private var currentDisplayID: CGDirectDisplayID = 0
     private var currentWidth: Int = 0
@@ -183,9 +185,16 @@ final class DisplayPipeline {
         // Stand up the H.264 encoder for the AVC420 path or the hybrid path.
         // Hybrid feeds BGRA (VT converts); AVC420 feeds NV12.
         if let sink = hybridSink {
+            // Feed the encoder full-range NV12 (converted from BGRA below) so
+            // H.264 whites/blacks match the Progressive tiles — see NV12Converter.
+            // fullRangeVideo=false (debug) skips it: BGRA → VT limited range, so
+            // H.264 tiles render darker and the codec map is visible by eye.
+            let fullRange = config.video.effectiveHybrid.fullRangeVideo
             let encoderSettings = H264Encoder.Settings.from(
                 config.video, width: pxW, height: pxH,
-                pixelFormat: kCVPixelFormatType_32BGRA)
+                pixelFormat: fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                                       : kCVPixelFormatType_32BGRA)
+            self.nv12Converter = fullRange ? NV12Converter() : nil
             self.encoder = try H264Encoder(settings: encoderSettings) { data, isIDR, pts, userData in
                 if let payload = userData as? HybridFramePayload {
                     sink.send(annexB: data, isIDR: isIDR, pts: pts, payload: payload)
@@ -487,14 +496,19 @@ final class DisplayPipeline {
     /// — per the header, "an array of CGRect in NSValue … specified in pixels"
     /// (i.e. surface pixel coords, the same space as the tile grid). Returns
     /// nil when the attachment is absent so the analyzer falls back to a
-    /// luma-delta change signal.
+    /// full-frame pixel-diff change signal.
     private static func dirtyRects(from sample: CMSampleBuffer) -> [CGRect]? {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
             sample, createIfNecessary: false) as? [[CFString: Any]],
               let first = attachments.first,
-              let values = first[SCStreamFrameInfo.dirtyRects as CFString] as? [NSValue]
+              let raw = first[SCStreamFrameInfo.dirtyRects as CFString] as? [Any]
         else { return nil }
-        return values.map { $0.rectValue }
+        // SCK stores each rect as a CGRect *dictionary representation*
+        // (CFDictionary with X/Y/Width/Height), NOT an NSValue — decode each
+        // with CGRect(dictionaryRepresentation:).
+        return raw.compactMap { elem in
+            (elem as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        }
     }
 
     private func teardown() async throws {
@@ -517,6 +531,17 @@ final class DisplayPipeline {
         // encode pass + a wire round-trip, and lowers the latency tail
         // for the *next* real change.
         if !isCompleteFrame(sample) {
+            // Idle frame (content unchanged). Use it to converge: if the client
+            // is still showing a former H.264 region, repaint it once via
+            // Progressive so it doesn't stay stuck on the last lossy blit.
+            // No analysis here — idle frames carry no dirtyRects.
+            if let sink = hybridSink, !paused, !shouldDropCapture(),
+               let pixel = CMSampleBufferGetImageBuffer(sample) {
+                sink.flushSettle(pixel: pixel,
+                                 width: CVPixelBufferGetWidth(pixel),
+                                 height: CVPixelBufferGetHeight(pixel),
+                                 stride: CVPixelBufferGetBytesPerRow(pixel))
+            }
             return
         }
 
@@ -563,8 +588,24 @@ final class DisplayPipeline {
                 sink.send(annexB: nil, isIDR: false, pts: pts, payload: payload)
                 return
             }
+            // Convert the (masked) BGRA → full-range NV12 before encode so the
+            // H.264 region isn't darker than the Progressive region. When the
+            // converter is off (fullRangeVideo=false, debug), feed BGRA straight
+            // to VT (limited range → darker H.264, visible codec map).
+            let bgraInput = routing.maskedBuffer ?? pixel
+            let encodeInput: CVPixelBuffer
+            if let converter = nv12Converter {
+                guard let nv12 = converter.convert(bgraInput) else {
+                    Log.encoder.error("hybrid: NV12 conversion failed; dropping frame")
+                    nextForceKeyframe = true
+                    return
+                }
+                encodeInput = nv12
+            } else {
+                encodeInput = bgraInput
+            }
             do {
-                try encoder?.encode(pixelBuffer: routing.maskedBuffer ?? pixel,
+                try encoder?.encode(pixelBuffer: encodeInput,
                                     pts: pts, forceKeyframe: force, userData: payload)
             } catch {
                 Log.encoder.error("hybrid encode failed: \(String(describing: error), privacy: .public)")
