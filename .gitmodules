@@ -1,4 +1,4 @@
 [submodule "ThirdParty/FreeRDP"]
 	path = ThirdParty/FreeRDP
 	url = https://github.com/HuJK/FreeRDP.git
-	branch = hujk/fix/cliprdr-server-tail-desync
+	branch = macrdp-fork
