@@ -62,6 +62,27 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// support writing back INTO the domain — but the clipboard staging
     /// folder is only ever copied OUT of, so no modify path is exercised.)
     var capabilities: NSFileProviderItemCapabilities {
+        // Resolver failure stub: surface READ-ONLY. Writability (advertised
+        // below to keep normal copies from inheriting the uchg/Locked flag)
+        // is exactly what makes fileproviderd treat a failed download as a
+        // recoverable "complete later" placeholder; a read-only item is
+        // discarded cleanly instead. (Scoped to the stub so real copies stay
+        // writable.)
+        if entry.ephemeral == true {
+            return entry.isDirectory
+                ? [.allowsReading, .allowsContentEnumerating]
+                : [.allowsReading]
+        }
+        // The clipboard domain's only top-level directory is the synthetic
+        // staging wrapper ("MacRDP_<session>"): it's never copied out itself
+        // (Finder pastes its CHILDREN, which keep their writable caps below to
+        // avoid the uchg/Locked flag). Keep the wrapper READ-ONLY so that a
+        // FAILED paste is discarded cleanly instead of being left as a
+        // recoverable "complete later" placeholder — writability is what makes
+        // fileproviderd keep that half-downloaded placeholder around.
+        if !isWritable && entry.isDirectory && entry.parentID == nil {
+            return [.allowsReading, .allowsContentEnumerating]
+        }
         // A drive-root mount point (top-level folder in a writable drive
         // domain — parentID nil) carries no Windows path: its identifier is
         // the bare driveKey UUID. It must NOT be renamable/deletable/movable,
@@ -93,6 +114,19 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// / re-saves. Marking the source as writable makes the destination
     /// inherit umask defaults (typically 0644 / rw-r--r--).
     var fileSystemFlags: NSFileProviderFileSystemFlags {
+        // Failure stub: read-only (see capabilities) — no .userWritable, so
+        // a failed download isn't kept as a recoverable placeholder.
+        if entry.ephemeral == true {
+            return entry.isDirectory
+                ? [.userReadable, .userExecutable]
+                : [.userReadable]
+        }
+        // Synthetic clipboard staging wrapper (see capabilities): read-only,
+        // so a failed paste is discarded rather than kept as a recoverable
+        // placeholder. Its writable children avoid uchg on normal copies.
+        if !isWritable && entry.isDirectory && entry.parentID == nil {
+            return [.userReadable, .userExecutable]
+        }
         if entry.isDirectory {
             return [.userReadable, .userWritable, .userExecutable]
         }

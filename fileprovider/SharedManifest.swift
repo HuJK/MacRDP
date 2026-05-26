@@ -39,6 +39,11 @@ struct ManifestItem: Codable, Equatable {
     let isDirectory: Bool
     /// Unix epoch milliseconds, optional.
     let modificationMs: Int64?
+    /// Resolver failure stub (the unreadable `broken.bin` + its wrapper
+    /// folder). Such items are surfaced READ-ONLY so a failed download is
+    /// discarded cleanly instead of being kept as a recoverable, half-
+    /// downloaded placeholder. nil/false = a normal (writable) item.
+    var ephemeral: Bool? = nil
 }
 
 // MARK: - App Group layout

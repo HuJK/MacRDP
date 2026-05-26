@@ -686,12 +686,13 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             }
             guard let listIndex = CopyEventStore.shared.listIndex(for: itemID) else {
                 // No FGDW index — this is the resolver's `broken.bin` stub
-                // (resolve failed). Return a POSIX I/O error so Finder
-                // reports "couldn't read some data" and CLEANS UP the
-                // destination folder it created, rather than leaving an
-                // empty stub behind.
-                return (nil, NSError(domain: NSPOSIXErrorDomain, code: Int(EIO),
-                    userInfo: [NSLocalizedDescriptionKey: "Could not read file from the Windows session."]))
+                // (resolve failed). Report the item as PERMANENTLY gone, not
+                // a transient read error: a POSIX EIO makes fileproviderd keep
+                // the destination as a recoverable, half-downloaded placeholder
+                // (the "complete the copy later" dialog + dimmed folder).
+                // NSFileProviderError.noSuchItem tells it the item doesn't
+                // exist, so it removes the placeholder instead.
+                return (nil, NSFileProviderError(.noSuchItem) as NSError)
             }
             let data = self.awaitFileContents(
                 listIndex: UInt32(listIndex),
@@ -746,9 +747,11 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
                 let brokenTree: [ManifestItem] = [
                     ManifestItem(id: failedID, filename: placeholderName, size: 0,
-                                 parentID: nil, isDirectory: true, modificationMs: nowMs),
+                                 parentID: nil, isDirectory: true, modificationMs: nowMs,
+                                 ephemeral: true),
                     ManifestItem(id: brokenID, filename: "broken.bin", size: 1024,
-                                 parentID: failedID, isDirectory: false, modificationMs: nil),
+                                 parentID: failedID, isDirectory: false, modificationMs: nil,
+                                 ephemeral: true),
                 ]
                 event.tree.replaceItems(brokenTree)
                 // brokenID gets NO listIndex → its byte fetch returns an
