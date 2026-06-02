@@ -204,6 +204,23 @@ typedef void (*macrdp_on_audio_in_frame_fn)(
     int32_t sample_rate,
     int32_t channels);
 
+/* RDPECAM enumerator (MS-RDPECAM device-enumeration channel). Fires once per
+ * camera the client announces / removes. `device_id` is the per-camera virtual
+ * channel name (stable ASCII id used to correlate add/remove); `name` is the
+ * human-readable UTF-8 device name (falls back to device_id if the client
+ * sends none). Enumeration only — the per-camera media/sample channel is not
+ * opened here. */
+typedef void (*macrdp_on_camera_added_fn)(
+    void *ctx, const char *device_id, const char *name);
+typedef void (*macrdp_on_camera_removed_fn)(
+    void *ctx, const char *device_id);
+
+/* One encoded H.264 sample for a camera whose media channel was started via
+ * macrdp_session_camera_start. `data` is the client's H.264 elementary stream
+ * for one sample (Annex-B). Fires on the camera channel thread. */
+typedef void (*macrdp_on_camera_frame_fn)(
+    void *ctx, const char *device_id, const uint8_t *data, size_t len);
+
 /* Fired once RDPSND format negotiation completes and we know whether
  * the client wants PCM or AAC. Swift uses this to decide whether to
  * engage AVAudioConverter for AAC encoding. */
@@ -251,6 +268,9 @@ typedef struct macrdp_callbacks {
     macrdp_on_rdpdr_write_complete_fn            on_rdpdr_write_complete;
     macrdp_on_rdpdr_status_complete_fn           on_rdpdr_close_complete;
     macrdp_on_rdpdr_status_complete_fn           on_rdpdr_simple_complete;
+    macrdp_on_camera_added_fn                    on_camera_added;
+    macrdp_on_camera_removed_fn                  on_camera_removed;
+    macrdp_on_camera_frame_fn                    on_camera_frame;
 } macrdp_callbacks;
 
 /* -------- session lifecycle --------------------------------------- */
@@ -299,6 +319,7 @@ typedef struct macrdp_session_config {
     int32_t     enable_clipboard;      /* 0/1 */
     int32_t     enable_disp;           /* 0/1 */
     int32_t     enable_rdpdr;          /* 0/1 — drive redirection */
+    int32_t     enable_camera;         /* 0/1 — RDPECAM client camera enumeration */
 } macrdp_session_config;
 
 /* Create a session for an already-accepted file descriptor. The bridge
@@ -541,6 +562,15 @@ int32_t macrdp_session_rdpdr_delete_dir(macrdp_session_t s, uint64_t token,
 int32_t macrdp_session_rdpdr_rename_file(macrdp_session_t s, uint64_t token,
                                          uint32_t device_id, const char *old_path,
                                          const char *new_path);
+
+/* -------- RDPECAM camera media channel (start/stop one camera) ----- */
+/* Open the per-camera media channel for `device_id` (a VirtualChannelName from
+ * on_camera_added), negotiate H.264, and stream samples back via
+ * on_camera_frame. Idempotent. The channel is opened on the peer event-loop
+ * thread, so this just records the request. */
+int32_t macrdp_session_camera_start(macrdp_session_t s, const char *device_id);
+/* Stop streaming + close the camera media channel. Idempotent. */
+int32_t macrdp_session_camera_stop(macrdp_session_t s, const char *device_id);
 
 /* -------- versioning ---------------------------------------------- */
 

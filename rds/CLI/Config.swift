@@ -256,7 +256,7 @@ struct Config: Codable, Sendable {
                 classifiers: ["dirtyFreqDR"],
                 tileActiveCoverage: 0.02,
                 largeRegionTiles: 12,
-                coverageHistoryFrames: 10,
+                coverageHistoryFrames: 30,
                 coverageHighThreshold: 0.1,
                 videoFractionEnter: 0.9,
                 videoFractionExit: 0.4,

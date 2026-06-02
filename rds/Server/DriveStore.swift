@@ -25,26 +25,64 @@ import Foundation
 import FileProvider
 import os
 
-/// The single "RDP Drives" FileProvider domain. Registered when the first
-/// drive mounts, unregistered when the last unmounts. Each drive is a
-/// published top-level folder; `DriveStore` serves the live contents.
+/// One FileProvider domain PER connected client, so two clients that both
+/// share "C:" don't collide and a disconnect can tear down just that client's
+/// drives. Created lazily when the client's first drive mounts; unregistered
+/// when the session ends (`unregisterAll`) or its last drive unmounts. Each
+/// redirected drive is a published top-level folder; `DriveStore` serves the
+/// live contents. Owned by the `RDPSession`.
 @MainActor
-final class DriveDomains {
-    static let shared = DriveDomains()
-    private init() {}
+final class DriveDomain {
 
-    /// Fixed id; the "drive-" prefix marks the domain writable (see the
-    /// extension's `isWritable`). subdir == id (AppGroupShared is 1:1).
-    nonisolated static let domainID = "\(AppGroupShared.driveDomainPrefix)shared"
-    nonisolated static var domainSubdir: String { AppGroupShared.domainSubdir(for: domainID) }
+    /// Unique per session. Identifier is `<user>-<n>` (no `MacRDP-` prefix);
+    /// macOS auto-prefixes the CloudStorage folder with the app name, giving
+    /// `MacRDP-<user>-<n>`. Writability is now keyed in the extension by
+    /// `AppGroupShared.isWritableDomain`, not the identifier prefix.
+    /// subdir == id (AppGroupShared is 1:1).
+    let domainID: String
+    let subdir: String
+    private let displayName: String
+    private let index: Int
 
     private var inbox: FileProviderInbox?
     private var folders: [String: String] = [:]   // driveKey → display label
 
+    /// Indices currently in use across all live drive domains, so each new
+    /// domain takes the smallest free integer. Single client → always 0;
+    /// multi-client (future) → 1, 2, … Freed in `unregisterAll`.
+    private static var usedIndices: Set<Int> = []
+
+    /// id = `drive-<user>-<n>` where `n` is the smallest free index. Stable for
+    /// the common single-client case (always `…-0`), so a reconnect reuses the
+    /// same domain rather than leaking a new one.
+    init(clientLabel: String) {
+        var n = 0
+        while Self.usedIndices.contains(n) { n += 1 }
+        Self.usedIndices.insert(n)
+        self.index = n
+
+        let base = clientLabel.isEmpty ? "client" : clientLabel
+        // Filesystem/identifier-safe token: keep alphanumerics, others → '-'.
+        let user = String(base.unicodeScalars.map {
+            CharacterSet.alphanumerics.contains($0) ? Character($0) : "-"
+        }).lowercased()
+        // Identifier WITHOUT any "MacRDP-" prefix — macOS auto-prefixes the
+        // CloudStorage folder with the app name "MacRDP", giving the clean
+        // `MacRDP-<user>-<n>`. Putting "MacRDP-" in the identifier would
+        // double it ("MacRDP-MacRDP-…").
+        self.domainID = "\(user)-\(n)"
+        self.subdir = AppGroupShared.domainSubdir(for: domainID)
+        // displayName does NOT include "MacRDP" — when an app has more than one
+        // FileProvider domain, Finder renders each as "<app> - <displayName>",
+        // so any "MacRDP" we put here gets doubled in the sidebar
+        // ("MacRDP - MacRDP HuJK"). Just the label → "MacRDP - HuJK".
+        self.displayName = clientLabel.isEmpty ? "Drives" : clientLabel
+    }
+
     /// Add (or relabel) a drive folder, registering the domain on first use.
     func addFolder(driveKey: String, label: String) async {
         if inbox == nil {
-            let i = FileProviderInbox(domainID: Self.domainID, displayName: "RDP Drives")
+            let i = FileProviderInbox(domainID: domainID, displayName: displayName)
             inbox = i
             await i.register()
         }
@@ -64,12 +102,48 @@ final class DriveDomains {
         }
     }
 
+    /// Tear the whole domain down — call on session end.
+    func unregisterAll() async {
+        folders.removeAll()
+        Self.usedIndices.remove(index)
+        guard let inbox else { return }
+        await inbox.unregister()
+        self.inbox = nil
+    }
+
+    /// User-visible Finder URL for a drive's root folder (for "open in Finder").
+    func userVisibleURL(driveKey: String) async -> URL? {
+        guard let inbox, let label = folders[driveKey] else { return nil }
+        return await inbox.userVisibleURL(itemID: driveKey, filename: label)
+    }
+
     private func republish() async {
         let items = folders.map {
             FileProviderInbox.PublishItem(id: $0.key, filename: $0.value, parentID: nil,
                                           isDirectory: true, size: 0, modificationMs: nil)
         }
         try? await inbox?.publish(items)
+    }
+
+    /// Remove every FileProvider domain this app owns (drive + clipboard).
+    /// `getDomains` only returns the current app's domains, so this is scoped
+    /// to MacRDP. Run at startup to wipe leftovers from a previous crash /
+    /// force-quit (exit-time async removal usually can't finish before the
+    /// process dies — startup is the reliable cleanup point).
+    @MainActor
+    static func removeAllAppDomains() async {
+        let domains: [NSFileProviderDomain] = await withCheckedContinuation { cont in
+            NSFileProviderManager.getDomainsWithCompletionHandler { domains, _ in
+                cont.resume(returning: domains)
+            }
+        }
+        Self.usedIndices.removeAll()
+        for d in domains {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                NSFileProviderManager.remove(d) { _ in cont.resume() }
+            }
+            Log.server.notice("Removed leftover FileProvider domain \(d.identifier.rawValue, privacy: .public)")
+        }
     }
 }
 
@@ -95,16 +169,27 @@ nonisolated final class DriveStore: @unchecked Sendable {
         let adapter: BridgePeer
         let deviceID: UInt32
         let label: String
+        /// The owning client's per-session FileProvider domain subdir.
+        let domainSubdir: String
         var openFiles: [String: UInt32] = [:]   // winPath → client fileId (reads)
-        init(adapter: BridgePeer, deviceID: UInt32, label: String) {
-            self.adapter = adapter; self.deviceID = deviceID; self.label = label
+        init(adapter: BridgePeer, deviceID: UInt32, label: String, domainSubdir: String) {
+            self.adapter = adapter; self.deviceID = deviceID
+            self.label = label; self.domainSubdir = domainSubdir
         }
     }
     private var drives: [String: Drive] = [:]   // driveKey → Drive
 
-    /// All requests for the single drives domain route here.
+    /// True if any active drive belongs to this (per-client) domain.
     func handles(domainSubdir: String) -> Bool {
-        domainSubdir == DriveDomains.domainSubdir
+        lock.lock(); defer { lock.unlock() }
+        return drives.values.contains { $0.domainSubdir == domainSubdir }
+    }
+
+    /// Drives belonging to one client (by its bridge), for the menu-bar list.
+    func drives(adapter: BridgePeer) -> [(key: String, label: String)] {
+        lock.lock(); defer { lock.unlock() }
+        return drives.compactMap { (k, d) in d.adapter === adapter ? (k, d.label) : nil }
+            .sorted { $0.label < $1.label }
     }
 
     /// Split an item id into its owning drive + the backslash path within
@@ -153,34 +238,45 @@ nonisolated final class DriveStore: @unchecked Sendable {
 
     // MARK: - Drive lifecycle (called from RDPSession sinks)
 
-    func addDrive(adapter: BridgePeer, deviceID: UInt32, dosName: String) {
+    /// Register a drive in the routing registry. Returns the (globally unique)
+    /// driveKey + display label so the caller can publish a matching folder
+    /// into the session's `DriveDomain`. Returns nil for non-filesystem
+    /// devices. The session owns the domain (per-client), so publishing is the
+    /// caller's responsibility — this keeps DriveStore free of MainActor hops.
+    func addDrive(adapter: BridgePeer, deviceID: UInt32, dosName: String,
+                  domainSubdir: String) -> (key: String, label: String)? {
         // DOS names arrive as e.g. "D:" — strip the trailing colon (and any
         // NUL padding). A literal ":" in the display name is rendered by
         // Finder as "/", because macOS swaps ':' and '/' at the Carbon layer.
         let trimmed = dosName.trimmingCharacters(in: CharacterSet(charactersIn: " \0:"))
         let label = trimmed.isEmpty ? "Drive" : trimmed
-        // STABLE key derived from the drive name, NOT a per-mount UUID. The
-        // key is the prefix of every FileProvider item id under this drive;
-        // a fresh UUID each mount made all ids go stale after a reconnect, so
-        // resolve() failed and delete/rename silently no-op'd on Windows while
-        // Finder optimistically updated. The drive letter is stable across
-        // reconnects, so ids stay valid. (Must be backslash-free — it is: the
-        // label has had any ':' stripped and DOS names carry no '\'.)
-        let driveKey = label
-        lock.lock(); drives[driveKey] = Drive(adapter: adapter, deviceID: deviceID, label: label); lock.unlock()
+        // Globally unique key = domain subdir + label. Scoping by the
+        // per-client domain means two clients sharing "C:" no longer collide
+        // in the shared registry. Must be backslash-free (it is: subdir is
+        // "drive-<hex>", label has ':' stripped, DOS names carry no '\') since
+        // the key is the prefix of every FileProvider item id under this drive.
+        let driveKey = "\(domainSubdir)~\(label)"
+        lock.lock()
+        drives[driveKey] = Drive(adapter: adapter, deviceID: deviceID,
+                                 label: label, domainSubdir: domainSubdir)
+        lock.unlock()
         Log.session.notice("RDPDR mounting drive '\(label, privacy: .public)' id=\(deviceID, privacy: .public) key=\(driveKey, privacy: .public)")
-        Task { @MainActor in await DriveDomains.shared.addFolder(driveKey: driveKey, label: label) }
+        return (driveKey, label)
     }
 
-    func removeDrive(adapter: BridgePeer, deviceID: UInt32) {
-        teardown { $0.adapter === adapter && $0.deviceID == deviceID }
+    /// Remove one drive; returns its driveKey so the caller can unpublish the
+    /// matching folder from its `DriveDomain`.
+    @discardableResult
+    func removeDrive(adapter: BridgePeer, deviceID: UInt32) -> String? {
+        teardown { $0.adapter === adapter && $0.deviceID == deviceID }.first
     }
 
     func removeAllDrives(adapter: BridgePeer) {
-        teardown { $0.adapter === adapter }
+        _ = teardown { $0.adapter === adapter }
     }
 
-    private func teardown(_ match: (Drive) -> Bool) {
+    @discardableResult
+    private func teardown(_ match: (Drive) -> Bool) -> [String] {
         lock.lock()
         let victims = drives.filter { match($0.value) }
         for (key, _) in victims { drives[key] = nil }
@@ -197,25 +293,28 @@ nonisolated final class DriveStore: @unchecked Sendable {
             }
         }
         lock.unlock()
-        for (key, d) in victims {
+        for (_, d) in victims {
             for (_, fid) in d.openFiles {   // fire-and-forget close (token 0 = no pending)
                 d.adapter.rdpdrCloseFile(token: 0, deviceID: d.deviceID, fileID: fid)
             }
-            Task { @MainActor in await DriveDomains.shared.removeFolder(driveKey: key) }
         }
+        // The caller (session) unpublishes folders + unregisters the domain.
+        return Array(victims.keys)
     }
 
     // MARK: - XPC read entry points
 
     func handleEnumerateChildren(domainSubdir: String, containerID: String,
                                  reply: @escaping (Data?, NSError?) -> Void) {
-        // Root: list the drive folders (normally served from the published
-        // manifest, but answer defensively if asked).
+        // Root: list this domain's drive folders (normally served from the
+        // published manifest, but answer defensively if asked). Filter by
+        // domainSubdir so each client's domain only shows its own drives.
         if containerID.isEmpty {
             lock.lock()
-            let folders = drives.map { (key, d) in
-                ManifestItem(id: key, filename: d.label, size: 0,
-                             parentID: nil, isDirectory: true, modificationMs: nil)
+            let folders = drives.compactMap { (key, d) -> ManifestItem? in
+                guard d.domainSubdir == domainSubdir else { return nil }
+                return ManifestItem(id: key, filename: d.label, size: 0,
+                                    parentID: nil, isDirectory: true, modificationMs: nil)
             }
             lock.unlock()
             do { reply(try JSONEncoder().encode(folders), nil) }

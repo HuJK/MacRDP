@@ -21,9 +21,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     let domain: NSFileProviderDomain
     let domainSubdir: String
 
-    /// Drive domains are read-write; the clipboard domain is read-only.
+    /// Whether this domain is reported writable to Finder. Drives are
+    /// genuinely writable; the clipboard reports writable too so files copied
+    /// out don't carry the read-only flag (its writes are protocol-layer
+    /// no-ops). See `AppGroupShared.isWritableDomain`.
     private var isWritable: Bool {
-        domainSubdir.hasPrefix(AppGroupShared.driveDomainPrefix)
+        AppGroupShared.isWritableDomain(domainSubdir)
     }
 
     /// Backslash drive path for a container id (root → "").

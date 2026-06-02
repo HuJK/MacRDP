@@ -55,6 +55,9 @@ static uint64_t now_ms(void) {
 #  include <freerdp/server/rdpdr.h>
 #  include <freerdp/channels/rdpdr.h>
 #  include <freerdp/utils/rdpdr_utils.h>
+#  include <freerdp/server/rdpecam-enumerator.h>
+#  include <freerdp/server/rdpecam.h>
+#  include <freerdp/channels/rdpecam.h>
 #  include <freerdp/codec/audio.h>
 #  include <freerdp/settings.h>
 #  include <freerdp/crypto/certificate.h>
@@ -78,6 +81,24 @@ static os_log_t bridge_log(void) {
 /* 1-second buckets of the minimum observed audio lag, for the windowed-floor
  * drift detector. 64 buckets = up to 64 s of reference history. */
 #define MACRDP_AUDIO_LAG_BUCKETS 64
+
+#if MACRDP_HAVE_FREERDP
+#define MACRDP_MAX_CAMERAS 8
+/* One per-camera RDPECAM media channel, opened on demand. Negotiation runs as
+ * a tiny state machine across the channel's callbacks. */
+typedef struct macrdp_camera_media {
+    struct macrdp_session     *s;
+    CameraDeviceServerContext *ctx;
+    char                      *device_id;     /* our copy (for callbacks/log) */
+    BYTE                       stream_index;
+    CAM_MEDIA_TYPE_DESCRIPTION fmt;           /* chosen H.264 description */
+    int                        state;         /* 0 idle,1 activating,2 listing,3 streaming */
+    bool                       opened;
+    bool                       streaming;
+    _Atomic bool               open_requested;
+    _Atomic bool               stop_requested;
+} macrdp_camera_media;
+#endif
 
 struct macrdp_session {
     int                    fd;
@@ -172,6 +193,15 @@ struct macrdp_session {
      * as FileProvider domains. */
     RdpdrServerContext    *rdpdr;
     bool                   rdpdr_open;
+    /* RDPECAM device-enumeration channel — client cameras. Enumeration
+     * only (count + names); the per-camera media channel is not opened. */
+    CamDevEnumServerContext *rdpecam_enum;
+    bool                   rdpecam_enum_open;
+    BYTE                   rdpecam_version;       /* negotiated protocol version */
+    /* Per-camera media channels, opened on demand by camera_start. Guarded by
+     * cameras_lock; opened/closed on the peer thread via pump_cameras. */
+    macrdp_camera_media   *cameras[MACRDP_MAX_CAMERAS];
+    os_unfair_lock         cameras_lock;
     /* Set after the server↔client capability + monitor-ready handshake
      * completes; before that we must not send FormatList PDUs. */
     atomic_bool            cliprdr_ready;
@@ -415,16 +445,28 @@ static void try_open_audin(struct macrdp_session *s) {
     ctx->Data        = audin_receive_data_cb;
     ctx->serverVersion = SNDIN_VERSION_Version_2;
 
-    /* Advertise PCM 48k stereo (universal). Pass count=-1 to also include
-     * FreeRDP's default format list — gives older clients a fallback. */
-    AUDIO_FORMAT preferred = { 0 };
-    preferred.wFormatTag      = WAVE_FORMAT_PCM;
-    preferred.nChannels       = 2;
-    preferred.nSamplesPerSec  = 48000;
-    preferred.wBitsPerSample  = 16;
-    preferred.nBlockAlign     = 4;
-    preferred.nAvgBytesPerSec = 48000 * 4;
-    if (!audin_server_set_formats(ctx, 1, &preferred)) {
+    /* Advertise several common PCM formats, not just one. FreeRDP's default
+     * ReceiveFormats handler only sends SNDIN_OPEN (which starts the client
+     * recording) if it finds a server format COMPATIBLE with one the client's
+     * mic offers — a single rigid 48k/stereo entry fails to match many mics
+     * (44.1k / mono), so no SNDIN_OPEN is sent and no audio ever arrives.
+     * 48k/stereo stays first (preferred); the rest are fallbacks. All PCM —
+     * our AudioInPipeline only decodes PCM. */
+    static const struct { UINT32 rate; UINT16 ch; } combos[] = {
+        { 48000, 2 }, { 44100, 2 }, { 48000, 1 }, { 44100, 1 }, { 16000, 1 },
+    };
+    const size_t nFmts = sizeof(combos) / sizeof(combos[0]);
+    AUDIO_FORMAT fmts[5];
+    memset(fmts, 0, sizeof(fmts));
+    for (size_t i = 0; i < nFmts; ++i) {
+        fmts[i].wFormatTag      = WAVE_FORMAT_PCM;
+        fmts[i].nChannels       = combos[i].ch;
+        fmts[i].nSamplesPerSec  = combos[i].rate;
+        fmts[i].wBitsPerSample  = 16;
+        fmts[i].nBlockAlign     = (UINT16)(combos[i].ch * 2);
+        fmts[i].nAvgBytesPerSec = combos[i].rate * combos[i].ch * 2;
+    }
+    if (!audin_server_set_formats(ctx, (SSIZE_T)nFmts, fmts)) {
         os_log(bridge_log(), "audin_server_set_formats failed");
         audin_server_context_free(ctx);
         return;
@@ -438,6 +480,255 @@ static void try_open_audin(struct macrdp_session *s) {
     s->audin = ctx;
     s->audin_open = true;
     os_log(bridge_log(), "AUDIN channel opened (client mic -> server)");
+}
+
+/* -------- RDPECAM enumerator (client cameras) --------------------- */
+
+/* Client asks us to agree a protocol version; echo it back. */
+static UINT cam_enum_select_version_request_cb(
+        CamDevEnumServerContext *ctx, const CAM_SELECT_VERSION_REQUEST *req) {
+    if (!ctx || !req || !ctx->SelectVersionResponse) return CHANNEL_RC_OK;
+    struct macrdp_session *s = (struct macrdp_session*)ctx->userdata;
+    if (s) s->rdpecam_version = req->Header.Version;   /* reuse for media channels */
+    CAM_SELECT_VERSION_RESPONSE resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.Header.Version   = req->Header.Version;
+    resp.Header.MessageId = CAM_MSG_ID_SelectVersionResponse;
+    return ctx->SelectVersionResponse(ctx, &resp);
+}
+
+static UINT cam_enum_device_added_cb(
+        CamDevEnumServerContext *ctx, const CAM_DEVICE_ADDED_NOTIFICATION *n) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->userdata;
+    if (!s || !n) return CHANNEL_RC_OK;
+    const char *chan = n->VirtualChannelName ? n->VirtualChannelName : "";
+    char *name = NULL;
+    if (n->DeviceName) name = ConvertWCharToUtf8Alloc(n->DeviceName, NULL);
+    os_log(bridge_log(), "RDPECAM camera added: chan='%{public}s' name='%{public}s'",
+           chan, name ? name : "");
+    if (s->cbs.on_camera_added)
+        s->cbs.on_camera_added(s->swift_ctx, chan, (name && name[0]) ? name : chan);
+    free(name);
+    return CHANNEL_RC_OK;
+}
+
+static UINT cam_enum_device_removed_cb(
+        CamDevEnumServerContext *ctx, const CAM_DEVICE_REMOVED_NOTIFICATION *n) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->userdata;
+    if (!s || !n) return CHANNEL_RC_OK;
+    const char *chan = n->VirtualChannelName ? n->VirtualChannelName : "";
+    os_log(bridge_log(), "RDPECAM camera removed: chan='%{public}s'", chan);
+    if (s->cbs.on_camera_removed)
+        s->cbs.on_camera_removed(s->swift_ctx, chan);
+    return CHANNEL_RC_OK;
+}
+
+static void try_open_rdpecam_enum(struct macrdp_session *s) {
+    if (s->rdpecam_enum_open || !s->cfg.enable_camera) return;
+    if (!atomic_load(&s->activated)) return;
+    HANDLE vcm = vcm_from_session(s);
+    if (!vcm) return;
+    /* Enumerator rides DRDYNVC. */
+    if (!WTSVirtualChannelManagerIsChannelJoined(vcm, DRDYNVC_SVC_CHANNEL_NAME))
+        return;
+    if (WTSVirtualChannelManagerGetDrdynvcState(vcm) != DRDYNVC_STATE_READY)
+        return;
+
+    CamDevEnumServerContext *ctx = cam_dev_enum_server_context_new(vcm);
+    if (!ctx) {
+        os_log(bridge_log(), "cam_dev_enum_server_context_new failed");
+        return;
+    }
+    ctx->userdata                 = s;
+    ctx->rdpcontext               = s->peer->context;
+    ctx->SelectVersionRequest     = cam_enum_select_version_request_cb;
+    ctx->DeviceAddedNotification  = cam_enum_device_added_cb;
+    ctx->DeviceRemovedNotification = cam_enum_device_removed_cb;
+
+    UINT rc = ctx->Open(ctx);
+    if (rc != CHANNEL_RC_OK) {
+        os_log(bridge_log(), "rdpecam enum Open failed: %u", rc);
+        cam_dev_enum_server_context_free(ctx);
+        return;
+    }
+    s->rdpecam_enum = ctx;
+    s->rdpecam_enum_open = true;
+    os_log(bridge_log(), "RDPECAM enumerator opened (client cameras)");
+}
+
+/* -------- RDPECAM media channel (one camera's video) -------------- */
+/* Negotiation state machine, driven by the channel's response callbacks
+ * (they fire on the camera channel's own thread):
+ *   open → ActivateDeviceRequest → [SuccessResponse] → StreamListRequest
+ *   → [StreamListResponse] → MediaTypeListRequest
+ *   → [MediaTypeListResponse: pick H264] → StartStreamsRequest + SampleRequest
+ *   → [SampleResponse: forward H264 to Swift] → SampleRequest (pull next) … */
+
+static UINT cam_media_success_cb(CameraDeviceServerContext *ctx,
+                                 const CAM_SUCCESS_RESPONSE *pdu) {
+    (void)pdu;
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    if (!cm) return CHANNEL_RC_OK;
+    if (cm->state == 1) {                 /* activate acked → list streams */
+        cm->state = 2;
+        CAM_STREAM_LIST_REQUEST req; memset(&req, 0, sizeof(req));
+        (void)ctx->StreamListRequest(ctx, &req);
+    }
+    return CHANNEL_RC_OK;
+}
+
+static UINT cam_media_error_cb(CameraDeviceServerContext *ctx,
+                               const CAM_ERROR_RESPONSE *pdu) {
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    os_log(bridge_log(), "RDPECAM media error: chan='%{public}s' code=%u",
+           cm && cm->device_id ? cm->device_id : "?", pdu ? (unsigned)pdu->ErrorCode : 0u);
+    return CHANNEL_RC_OK;
+}
+
+static UINT cam_media_stream_list_response_cb(CameraDeviceServerContext *ctx,
+                                              const CAM_STREAM_LIST_RESPONSE *pdu) {
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    if (!cm || !pdu || pdu->N_Descriptions == 0) return CHANNEL_RC_OK;
+    cm->stream_index = 0;   /* first stream (typically the capture stream) */
+    CAM_MEDIA_TYPE_LIST_REQUEST req; memset(&req, 0, sizeof(req));
+    req.StreamIndex = cm->stream_index;
+    return ctx->MediaTypeListRequest(ctx, &req);
+}
+
+static UINT cam_media_media_type_list_response_cb(
+        CameraDeviceServerContext *ctx, const CAM_MEDIA_TYPE_LIST_RESPONSE *pdu) {
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    if (!cm || !pdu) return CHANNEL_RC_OK;
+    int idx = -1;
+    for (size_t i = 0; i < pdu->N_Descriptions; ++i) {
+        if (pdu->MediaTypeDescriptions[i].Format == CAM_MEDIA_FORMAT_H264) { idx = (int)i; break; }
+    }
+    if (idx < 0) {
+        os_log(bridge_log(), "RDPECAM '%{public}s': no H.264 media type, giving up",
+               cm->device_id ? cm->device_id : "?");
+        return CHANNEL_RC_OK;
+    }
+    cm->fmt = pdu->MediaTypeDescriptions[idx];
+
+    CAM_START_STREAMS_REQUEST ss; memset(&ss, 0, sizeof(ss));
+    ss.N_Infos = 1;
+    ss.StartStreamsInfo[0].StreamIndex = cm->stream_index;
+    ss.StartStreamsInfo[0].MediaTypeDescription = cm->fmt;
+    UINT rc = ctx->StartStreamsRequest(ctx, &ss);
+    if (rc != CHANNEL_RC_OK) return rc;
+    cm->state = 3;
+    cm->streaming = true;
+    os_log(bridge_log(), "RDPECAM '%{public}s': streaming H.264 %ux%u",
+           cm->device_id ? cm->device_id : "?", cm->fmt.Width, cm->fmt.Height);
+
+    CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));
+    req.StreamIndex = cm->stream_index;
+    return ctx->SampleRequest(ctx, &req);
+}
+
+static UINT cam_media_sample_response_cb(CameraDeviceServerContext *ctx,
+                                         const CAM_SAMPLE_RESPONSE *pdu) {
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    if (!cm || !pdu) return CHANNEL_RC_OK;
+    struct macrdp_session *s = cm->s;
+    if (pdu->Sample && pdu->SampleSize > 0 && s->cbs.on_camera_frame) {
+        s->cbs.on_camera_frame(s->swift_ctx, cm->device_id, pdu->Sample, pdu->SampleSize);
+    }
+    if (atomic_load(&cm->stop_requested)) return CHANNEL_RC_OK;
+    CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));   /* pull the next frame */
+    req.StreamIndex = cm->stream_index;
+    return ctx->SampleRequest(ctx, &req);
+}
+
+static UINT cam_media_sample_error_cb(CameraDeviceServerContext *ctx,
+                                      const CAM_SAMPLE_ERROR_RESPONSE *pdu) {
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    (void)pdu;
+    if (!cm || atomic_load(&cm->stop_requested)) return CHANNEL_RC_OK;
+    CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));   /* keep pulling */
+    req.StreamIndex = cm->stream_index;
+    return ctx->SampleRequest(ctx, &req);
+}
+
+/* Fires (on the camera channel thread) once the DVC is actually open and its
+ * id assigned — the earliest point the channel is writable. Sending the first
+ * PDU before this races WTSVirtualChannelOpenEx and fails. */
+static BOOL cam_media_channel_id_assigned_cb(CameraDeviceServerContext *ctx, UINT32 channelId) {
+    (void)channelId;
+    macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
+    if (!cm) return TRUE;
+    cm->state = 1;   /* activating */
+    CAM_ACTIVATE_DEVICE_REQUEST act; memset(&act, 0, sizeof(act));
+    (void)ctx->ActivateDeviceRequest(ctx, &act);
+    return TRUE;
+}
+
+/* Opens the channel + kicks negotiation. Runs on the peer thread (pump). */
+static void cam_media_open(macrdp_camera_media *cm) {
+    struct macrdp_session *s = cm->s;
+    HANDLE vcm = vcm_from_session(s);
+    if (!vcm) return;
+    CameraDeviceServerContext *ctx = camera_device_server_context_new(vcm);
+    if (!ctx) {
+        os_log(bridge_log(), "camera_device_server_context_new failed");
+        return;
+    }
+    ctx->userdata             = cm;
+    ctx->rdpcontext           = s->peer->context;
+    ctx->virtualChannelName   = _strdup(cm->device_id);   /* context frees it */
+    ctx->protocolVersion      = s->rdpecam_version ? s->rdpecam_version : 0x02;
+    ctx->ChannelIdAssigned    = cam_media_channel_id_assigned_cb;
+    ctx->SuccessResponse      = cam_media_success_cb;
+    ctx->ErrorResponse        = cam_media_error_cb;
+    ctx->StreamListResponse   = cam_media_stream_list_response_cb;
+    ctx->MediaTypeListResponse = cam_media_media_type_list_response_cb;
+    ctx->SampleResponse       = cam_media_sample_response_cb;
+    ctx->SampleErrorResponse  = cam_media_sample_error_cb;
+
+    UINT rc = ctx->Open(ctx);
+    if (rc != CHANNEL_RC_OK) {
+        os_log(bridge_log(), "RDPECAM media Open failed: %u", rc);
+        camera_device_server_context_free(ctx);
+        return;
+    }
+    cm->ctx = ctx;
+    cm->opened = true;
+    /* First PDU (ActivateDeviceRequest) is sent from ChannelIdAssigned once the
+     * channel is writable — see cam_media_channel_id_assigned_cb. */
+    os_log(bridge_log(), "RDPECAM media channel opening: '%{public}s'", cm->device_id);
+}
+
+static void cam_media_close_free(macrdp_camera_media *cm) {
+    if (!cm) return;
+    if (cm->ctx) {
+        if (cm->streaming) {
+            CAM_STOP_STREAMS_REQUEST st; memset(&st, 0, sizeof(st));
+            (void)cm->ctx->StopStreamsRequest(cm->ctx, &st);
+        }
+        CAM_DEACTIVATE_DEVICE_REQUEST de; memset(&de, 0, sizeof(de));
+        (void)cm->ctx->DeactivateDeviceRequest(cm->ctx, &de);
+        if (cm->ctx->Close) (void)cm->ctx->Close(cm->ctx);
+        camera_device_server_context_free(cm->ctx);
+    }
+    free(cm->device_id);
+    free(cm);
+}
+
+/* Peer-thread pump: process Swift-requested camera start/stop. */
+static void pump_cameras(struct macrdp_session *s) {
+    os_unfair_lock_lock(&s->cameras_lock);
+    for (int i = 0; i < MACRDP_MAX_CAMERAS; ++i) {
+        macrdp_camera_media *cm = s->cameras[i];
+        if (!cm) continue;
+        if (atomic_load(&cm->stop_requested)) {
+            s->cameras[i] = NULL;
+            cam_media_close_free(cm);
+        } else if (atomic_load(&cm->open_requested) && !cm->opened) {
+            atomic_store(&cm->open_requested, false);
+            cam_media_open(cm);
+        }
+    }
+    os_unfair_lock_unlock(&s->cameras_lock);
 }
 
 /* -------- RDPSND --------------------------------------------------- */
@@ -1495,6 +1786,8 @@ int32_t macrdp_session_run(macrdp_session_t s)
         try_open_disp(s);
         try_open_cliprdr(s);
         try_open_rdpdr(s);
+        try_open_rdpecam_enum(s);
+        pump_cameras(s);
 
         /* FrameAck watchdog: if a client stops acking but the connection
          * is otherwise healthy, force-clear credit so we don't go black. */
@@ -1570,6 +1863,14 @@ void macrdp_session_destroy(macrdp_session_t s)
         if (s->audin->Close) (void)s->audin->Close(s->audin);
         audin_server_context_free(s->audin);
         s->audin = NULL;
+    }
+    if (s->rdpecam_enum) {
+        if (s->rdpecam_enum->Close) (void)s->rdpecam_enum->Close(s->rdpecam_enum);
+        cam_dev_enum_server_context_free(s->rdpecam_enum);
+        s->rdpecam_enum = NULL;
+    }
+    for (int i = 0; i < MACRDP_MAX_CAMERAS; ++i) {
+        if (s->cameras[i]) { cam_media_close_free(s->cameras[i]); s->cameras[i] = NULL; }
     }
     if (s->rdpsnd) {
         if (s->rdpsnd->Close) s->rdpsnd->Close(s->rdpsnd);
@@ -2553,6 +2854,58 @@ int32_t macrdp_session_rdpdr_rename_file(macrdp_session_t s, uint64_t token,
 #else
     (void)s;(void)token;(void)device_id;(void)old_path;(void)new_path;
     return MACRDP_E_NOT_IMPLEMENTED;
+#endif
+}
+
+/* -------- RDPECAM camera media start/stop (called from Swift) ------ */
+
+int32_t macrdp_session_camera_start(macrdp_session_t s, const char *device_id) {
+    if (!s || !device_id) return MACRDP_E_INVALID_ARG;
+#if MACRDP_HAVE_FREERDP
+    os_unfair_lock_lock(&s->cameras_lock);
+    int freeIdx = -1;
+    for (int i = 0; i < MACRDP_MAX_CAMERAS; ++i) {
+        if (s->cameras[i]) {
+            if (s->cameras[i]->device_id &&
+                strcmp(s->cameras[i]->device_id, device_id) == 0) {
+                os_unfair_lock_unlock(&s->cameras_lock);   /* already active */
+                return MACRDP_OK;
+            }
+        } else if (freeIdx < 0) {
+            freeIdx = i;
+        }
+    }
+    if (freeIdx < 0) { os_unfair_lock_unlock(&s->cameras_lock); return MACRDP_E_INTERNAL; }
+    macrdp_camera_media *cm = calloc(1, sizeof(*cm));
+    if (!cm) { os_unfair_lock_unlock(&s->cameras_lock); return MACRDP_E_INTERNAL; }
+    cm->s = s;
+    cm->device_id = strdup(device_id);
+    atomic_store(&cm->open_requested, true);
+    s->cameras[freeIdx] = cm;
+    os_unfair_lock_unlock(&s->cameras_lock);
+    return MACRDP_OK;
+#else
+    (void)device_id;
+    return MACRDP_E_FREERDP_UNAVAILABLE;
+#endif
+}
+
+int32_t macrdp_session_camera_stop(macrdp_session_t s, const char *device_id) {
+    if (!s || !device_id) return MACRDP_E_INVALID_ARG;
+#if MACRDP_HAVE_FREERDP
+    os_unfair_lock_lock(&s->cameras_lock);
+    for (int i = 0; i < MACRDP_MAX_CAMERAS; ++i) {
+        if (s->cameras[i] && s->cameras[i]->device_id &&
+            strcmp(s->cameras[i]->device_id, device_id) == 0) {
+            atomic_store(&s->cameras[i]->stop_requested, true);
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&s->cameras_lock);
+    return MACRDP_OK;
+#else
+    (void)device_id;
+    return MACRDP_E_FREERDP_UNAVAILABLE;
 #endif
 }
 

@@ -23,6 +23,12 @@ final class AudioInPipeline: @unchecked Sendable {
     private let player = AVAudioPlayerNode()
     private var playbackFormat: AVAudioFormat?
 
+    /// Optional observer of the decoded mic PCM (Int16LE interleaved), used to
+    /// drive the menu-bar live spectrum. Set/cleared and invoked on the same
+    /// (MainActor) path as `feedPCM`, so no extra synchronization is needed.
+    /// nil = no tap (zero added work).
+    var pcmTap: ((Data) -> Void)?
+
     init(config: Config) {
         self.config = config
     }
@@ -75,6 +81,7 @@ final class AudioInPipeline: @unchecked Sendable {
     /// negotiated — Phase 5 narrows this once AUDIN format-negotiation
     /// is in place).
     func feedPCM(_ pcm: Data) {
+        if let pcmTap, !pcm.isEmpty { pcmTap(pcm) }
         guard let fmt = playbackFormat, !pcm.isEmpty else { return }
         let bytesPerFrame = Int(fmt.streamDescription.pointee.mBytesPerFrame)
         let frameCount = pcm.count / max(1, bytesPerFrame)

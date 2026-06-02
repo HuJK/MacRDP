@@ -8,6 +8,7 @@
 //  DisplayControl) are spun up after the peer reaches Activate.
 //
 
+import AppKit
 import Foundation
 import Darwin
 @preconcurrency import CoreMedia
@@ -25,11 +26,121 @@ final class RDPSession {
     /// Authenticated username, set once the peer connects.
     private(set) var clientUsername: String?
 
+    /// Per-client FileProvider domain for this session's redirected drives.
+    /// Created lazily on first drive announce; unregistered at shutdown.
+    private var driveDomain: DriveDomain?
+    /// Cameras the client announced over RDPECAM (id = virtual-channel name).
+    private var cameras: [(id: String, name: String)] = []
+    /// Live mic spectrum window (nil unless the user opened it from the menu).
+    private var micSpectrum: MicSpectrumWindowController?
+    /// Open camera view windows, keyed by RDPECAM device id.
+    private var cameraViews: [String: CameraViewWindowController] = [:]
+    /// Reference counts per camera id. The media channel is started on the
+    /// first acquirer and only stopped when the last releases it — so a local
+    /// view and (future) virtual-camera consumer can share one stream without
+    /// one closing cutting off the other.
+    private var cameraRefs: [String: Int] = [:]
+
     /// Snapshot for the menu-bar UI.
     func info() -> SessionInfo {
-        SessionInfo(id: ObjectIdentifier(self),
-                    username: clientUsername ?? "authenticating…",
-                    ip: clientIP, role: role)
+        var driveList: [DriveResource] = []
+        #if MACRDP_BRIDGE_AVAILABLE
+        if let bridge {
+            driveList = DriveStore.shared.drives(adapter: bridge).map {
+                DriveResource(key: $0.key, label: $0.label)
+            }
+        }
+        #endif
+        return SessionInfo(
+            id: ObjectIdentifier(self),
+            username: clientUsername ?? "authenticating…",
+            ip: clientIP, role: role,
+            drives: driveList,
+            micCount: (audioIn != nil) ? 1 : 0,
+            cameras: cameras.map { CameraResource(id: $0.id, name: $0.name) })
+    }
+
+    private func ensureDriveDomain() -> DriveDomain {
+        if let d = driveDomain { return d }
+        // Prefer the RDP-authenticated user; with no-auth there's none, so fall
+        // back to the Mac account name (e.g. "hujk") rather than the raw IP.
+        let user = (clientUsername?.isEmpty == false) ? clientUsername! : NSUserName()
+        let d = DriveDomain(clientLabel: user)
+        driveDomain = d
+        return d
+    }
+
+    // MARK: - Menu-bar resource actions
+
+    /// Open this client's drive in Finder (resolves the FileProvider
+    /// user-visible URL for the drive's root folder).
+    func openDrive(driveKey: String) {
+        guard let domain = driveDomain else { return }
+        Task { @MainActor in
+            if let url = await domain.userVisibleURL(driveKey: driveKey) {
+                NSWorkspace.shared.open(url)
+            } else {
+                Log.session.notice("openDrive: no user-visible URL yet for \(driveKey, privacy: .public)")
+            }
+        }
+    }
+
+    /// Show a live spectrum of this client's redirected mic — decoded PCM is
+    /// tapped straight off AUDIN (does not go through any system audio device).
+    func showMicSpectrum() {
+        guard let audioIn else { return }
+        if micSpectrum == nil {
+            let ctrl = MicSpectrumWindowController(title: "Mic — \(clientUsername ?? clientIP)")
+            ctrl.onClose = { [weak self] in
+                self?.audioIn?.pcmTap = nil
+                self?.micSpectrum = nil
+            }
+            micSpectrum = ctrl
+            audioIn.pcmTap = { [weak ctrl] pcm in ctrl?.feed(pcm) }
+        }
+        micSpectrum?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Open a live view of one client camera — starts its RDPECAM media
+    /// channel and decodes the H.264 directly into the window (not via the
+    /// system / a virtual camera device).
+    func showCamera(id: String, name: String) {
+        if cameraViews[id] == nil {
+            let ctrl = CameraViewWindowController(title: "Camera — \(name)")
+            ctrl.onClose = { [weak self] in
+                self?.cameraViews[id] = nil
+                self?.releaseCamera(id)          // balanced with acquire below
+            }
+            cameraViews[id] = ctrl
+            acquireCamera(id)
+        }
+        cameraViews[id]?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Start (or join) a camera's media channel. The channel is opened only on
+    /// the first acquirer.
+    private func acquireCamera(_ id: String) {
+        let n = (cameraRefs[id] ?? 0) + 1
+        cameraRefs[id] = n
+        #if MACRDP_BRIDGE_AVAILABLE
+        if n == 1 { bridge?.cameraStart(deviceID: id) }
+        #endif
+    }
+
+    /// Release a camera's media channel; it closes only when the last consumer
+    /// lets go.
+    private func releaseCamera(_ id: String) {
+        guard let n = cameraRefs[id] else { return }
+        if n <= 1 {
+            cameraRefs[id] = nil
+            #if MACRDP_BRIDGE_AVAILABLE
+            bridge?.cameraStop(deviceID: id)
+            #endif
+        } else {
+            cameraRefs[id] = n - 1
+        }
     }
 
     #if MACRDP_BRIDGE_AVAILABLE
@@ -148,8 +259,22 @@ final class RDPSession {
         hybridCoordinator = nil
         #endif
         audioOut?.stop()
+        audioIn?.pcmTap = nil
         audioIn?.stop()
+        micSpectrum?.close()
+        micSpectrum = nil
+        for (_, ctrl) in cameraViews { ctrl.close() }
+        cameraViews.removeAll()
+        #if MACRDP_BRIDGE_AVAILABLE
+        for id in cameraRefs.keys { bridge?.cameraStop(deviceID: id) }
+        #endif
+        cameraRefs.removeAll()
         clipboard?.stop()
+        // Unregister this client's drive domain (per-client; see DriveDomain).
+        if let domain = driveDomain {
+            Task { @MainActor in await domain.unregisterAll() }
+            driveDomain = nil
+        }
         #if MACRDP_BRIDGE_AVAILABLE
         if let bridge { DriveStore.shared.removeAllDrives(adapter: bridge) }
         bridge?.requestStop()
@@ -313,14 +438,48 @@ final class RDPSession {
             default:   kind = String(format: "0x%X", type)
             }
             Log.session.notice("RDPDR device announced: id=\(id, privacy: .public) type=\(kind, privacy: .public) name='\(dos, privacy: .public)'")
-            // OnDriveCreate only fires for filesystem devices, but guard anyway.
-            guard type == 0x08, let bridge = self?.bridge else { return }
-            DriveStore.shared.addDrive(adapter: bridge, deviceID: id, dosName: dos)
+            // Drive redirection only fires for filesystem devices.
+            guard type == 0x08 else { return }
+            // Hop to MainActor: each client gets its own FileProvider domain,
+            // created here and torn down at disconnect.
+            Task { @MainActor [weak self] in
+                guard let self, let bridge = self.bridge else { return }
+                let domain = self.ensureDriveDomain()
+                if let drive = DriveStore.shared.addDrive(
+                    adapter: bridge, deviceID: id, dosName: dos,
+                    domainSubdir: domain.subdir) {
+                    await domain.addFolder(driveKey: drive.key, label: drive.label)
+                }
+            }
         }
         sinks.onRdpdrDeviceRemoved = { [weak self] id in
             Log.session.notice("RDPDR device removed: id=\(id, privacy: .public)")
-            guard let bridge = self?.bridge else { return }
-            DriveStore.shared.removeDrive(adapter: bridge, deviceID: id)
+            Task { @MainActor [weak self] in
+                guard let self, let bridge = self.bridge else { return }
+                if let key = DriveStore.shared.removeDrive(adapter: bridge, deviceID: id) {
+                    await self.driveDomain?.removeFolder(driveKey: key)
+                }
+            }
+        }
+        // RDPECAM enumeration — track the client's cameras for the menu.
+        sinks.onCameraAdded = { [weak self] camID, name in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.cameras.contains(where: { $0.id == camID }) {
+                    self.cameras.append((id: camID, name: name))
+                }
+            }
+        }
+        sinks.onCameraRemoved = { [weak self] camID in
+            Task { @MainActor [weak self] in
+                self?.cameras.removeAll { $0.id == camID }
+            }
+        }
+        // Decoded H.264 sample for an open camera view → feed its window.
+        sinks.onCameraFrame = { [weak self] camID, data in
+            Task { @MainActor [weak self] in
+                self?.cameraViews[camID]?.enqueue(data)
+            }
         }
         sinks.onRdpdrDirEntry = { token, isEntry, ioStatus, name, attrs, size, mtime in
             DriveStore.shared.onDirEntry(token: token, isEntry: isEntry, ioStatus: ioStatus,

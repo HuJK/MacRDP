@@ -56,7 +56,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         let items = itemsFor(container: containerID)
         elog.info("Returning \(items.count, privacy: .public) item(s)")
         let sessionID = ManifestCache.shared.manifest(domainSubdir: domainSubdir)?.sessionID ?? "lazy"
-        let writable = domainSubdir.hasPrefix(AppGroupShared.driveDomainPrefix)
+        let writable = AppGroupShared.isWritableDomain(domainSubdir)
         let fpItems = items.map { FileProviderItem($0, manifestSessionID: sessionID, isWritable: writable) }
         observer.didEnumerate(fpItems)
         observer.finishEnumerating(upTo: nil)
@@ -84,7 +84,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         }
         let items = itemsFor(container: containerID)
         let sessionID = ManifestCache.shared.manifest(domainSubdir: domainSubdir)?.sessionID ?? "lazy"
-        let writable = domainSubdir.hasPrefix(AppGroupShared.driveDomainPrefix)
+        let writable = AppGroupShared.isWritableDomain(domainSubdir)
         let fpItems = items.map { FileProviderItem($0, manifestSessionID: sessionID, isWritable: writable) }
         elog.info("enumerateChanges container=\(self.containerID.rawValue, privacy: .public) updating \(fpItems.count, privacy: .public)")
         observer.didUpdate(fpItems)

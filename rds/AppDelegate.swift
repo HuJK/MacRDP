@@ -16,10 +16,25 @@
 //
 
 import Cocoa
+import FileProvider
 import Foundation
 @preconcurrency import CoreMedia
 @preconcurrency import ScreenCaptureKit
 import os
+
+/// Reference box stored in an NSMenuItem's `representedObject` so resource rows
+/// can carry which session + resource they act on (ObjectIdentifier can't be a
+/// menu-item tag). Read back by `menuActionClicked`.
+final class MenuAction {
+    enum Kind {
+        case disconnect(ObjectIdentifier)
+        case openDrive(ObjectIdentifier, String)        // sessionID, driveKey
+        case micSpectrum(ObjectIdentifier, Int)         // sessionID, micIndex
+        case camera(ObjectIdentifier, String, String)   // sessionID, deviceID, name
+    }
+    let kind: Kind
+    init(_ kind: Kind) { self.kind = kind }
+}
 
 @MainActor
 @main
@@ -37,9 +52,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// FileProvider domain for Win→Mac clipboard files. Registered once
     /// at app launch (after permissions); `ClipboardBridge` writes into
     /// it whenever the Windows side copies files.
+    // displayName has no "MacRDP" prefix — Finder renders FileProvider domains
+    // as "<app name> - <displayName>" (and `~/Library/CloudStorage` folders as
+    // `<app name>-<displayName>`), so any "MacRDP" here doubles up. Just
+    // "Clipboard" → CloudStorage `MacRDP-Clipboard`, sidebar `MacRDP - Clipboard`.
     static let sharedClipboardInbox = FileProviderInbox(
         domainID: AppGroupShared.clipboardDomainID,
-        displayName: "MacRDP Clipboard")
+        displayName: "Clipboard")
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // The Storyboard target template auto-instantiates an empty
@@ -149,6 +168,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// by a picker dialog the moment an RDP client connects.
     private func beginServing(config: Config) {
         Task { @MainActor in
+            // Wipe any FileProvider domains left over from a previous crash /
+            // force-quit before (re)registering. Exit-time removal is
+            // unreliable (the process dies before the async unregister
+            // finishes), so a clean slate at startup is the real guarantee.
+            await DriveDomain.removeAllAppDomains()
             await self.preWarmScreenCapture()
             // Register the FileProvider clipboard domain so the
             // extension can serve "MacRDP Clipboard" through Finder.
@@ -263,16 +287,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menuSessions = listener?.activeSessions() ?? []
         if menuSessions.isEmpty {
-            let none = NSMenuItem(title: "  No active sessions", action: nil, keyEquivalent: "")
+            let none = NSMenuItem(title: "No active sessions", action: nil, keyEquivalent: "")
+            none.indentationLevel = 1
             none.isEnabled = false
             menu.addItem(none)
         } else {
-            for (i, s) in menuSessions.enumerated() {
-                let title = "  \(s.username) @ \(s.ip)  (\(s.role.rawValue)) — Disconnect"
-                let mi = NSMenuItem(title: title, action: #selector(kickSession(_:)), keyEquivalent: "")
-                mi.target = self
-                mi.tag = i
-                menu.addItem(mi)
+            for s in menuSessions {
+                addSessionItems(s, to: menu)
             }
         }
 
@@ -285,10 +306,74 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(off)
     }
 
-    @objc private func kickSession(_ sender: NSMenuItem) {
-        let i = sender.tag
-        guard i >= 0, i < menuSessions.count else { return }
-        listener?.kick(id: menuSessions[i].id)
+    /// Render one session as an indented group: the client header, then its
+    /// forwarded resources (drives / mics / cameras) one level deeper, then a
+    /// Disconnect action. `indentationLevel` marks the parent/child grouping.
+    private func addSessionItems(_ s: SessionInfo, to menu: NSMenu) {
+        // Session row at level 1; give it an icon so it shares the same image
+        // column as the resource rows below and the nesting reads cleanly.
+        let header = NSMenuItem(title: "\(s.ip)  —  \(s.username)", action: nil, keyEquivalent: "")
+        header.indentationLevel = 1
+        header.image = NSImage(systemSymbolName: "display", accessibilityDescription: nil)
+        header.isEnabled = false
+        menu.addItem(header)
+
+        for d in s.drives {
+            let mi = resourceItem(title: d.label, symbol: "externaldrive.fill",
+                                  action: .openDrive(s.id, d.key))
+            menu.addItem(mi)
+        }
+        for n in 1...max(1, s.micCount) where s.micCount > 0 {
+            let mi = resourceItem(title: "Mic \(n)", symbol: "mic.fill",
+                                  action: .micSpectrum(s.id, n - 1))
+            menu.addItem(mi)
+        }
+        for (i, c) in s.cameras.enumerated() {
+            let label = c.name.isEmpty ? "Camera \(i + 1)" : c.name
+            let mi = resourceItem(title: label, symbol: "camera.fill",
+                                  action: .camera(s.id, c.id, label))
+            mi.toolTip = "Open a live view (decodes the client's camera directly over RDPECAM)"
+            menu.addItem(mi)
+        }
+
+        let disconnect = NSMenuItem(title: "Disconnect", action: #selector(menuActionClicked(_:)),
+                                    keyEquivalent: "")
+        disconnect.indentationLevel = 2
+        disconnect.target = self
+        disconnect.representedObject = MenuAction(.disconnect(s.id))
+        menu.addItem(disconnect)
+    }
+
+    /// Build an indented resource row with an SF Symbol icon. A nil `action`
+    /// makes it a non-clickable (greyed) listing.
+    private func resourceItem(title: String, symbol: String, action: MenuAction.Kind?) -> NSMenuItem {
+        let mi = NSMenuItem(
+            title: title,
+            action: action == nil ? nil : #selector(menuActionClicked(_:)),
+            keyEquivalent: "")
+        mi.indentationLevel = 2
+        mi.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        if let action {
+            mi.target = self
+            mi.representedObject = MenuAction(action)
+        } else {
+            mi.isEnabled = false
+        }
+        return mi
+    }
+
+    @objc private func menuActionClicked(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? MenuAction else { return }
+        switch action.kind {
+        case .disconnect(let id):
+            listener?.kick(id: id)
+        case .openDrive(let id, let key):
+            listener?.openDrive(sessionID: id, driveKey: key)
+        case .micSpectrum(let id, _):
+            listener?.openMicSpectrum(sessionID: id)
+        case .camera(let id, let deviceID, let name):
+            listener?.openCamera(sessionID: id, deviceID: deviceID, name: name)
+        }
     }
 
     @objc private func restartService(_ sender: NSMenuItem) {
@@ -309,6 +394,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ aNotification: Notification) {
         listener?.stop()
         listener = nil
+        // Best-effort: drop all our FileProvider domains on the way out. Bounded
+        // wait — the completion fires on a background queue so blocking the main
+        // thread briefly here is safe (no MainActor re-entry). Startup cleanup
+        // is the real guarantee if this doesn't finish.
+        let sem = DispatchSemaphore(value: 0)
+        NSFileProviderManager.removeAllDomains { _ in sem.signal() }
+        _ = sem.wait(timeout: .now() + 2)
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {

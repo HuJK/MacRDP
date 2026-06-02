@@ -58,7 +58,19 @@ enum AppGroupShared {
     /// drives) don't collide. The caller picks a stable string per
     /// domain — see `domainSubdir(for:)` below for canonical names.
     static let clipboardDomainID  = "clipboard"
-    static let driveDomainPrefix  = "drive-"     // suffixed with the drive name
+
+    /// Whether items in this domain should be REPORTED writable to Finder.
+    /// Always true: drives are genuinely writable (writes flow back to the
+    /// client over RDPDR), and the clipboard staging domain also reports
+    /// writable so that files copied OUT of it don't land with the read-only
+    /// flag set — its actual writes are no-ops at the protocol layer.
+    /// (Replaces the old `hasPrefix(driveDomainPrefix)` check, which let us
+    /// drop the `MacRDP-` prefix from drive identifiers so `~/Library/
+    /// CloudStorage` shows `MacRDP-<user>-<n>` without doubling the app name.)
+    static func isWritableDomain(_ domainSubdir: String) -> Bool {
+        _ = domainSubdir
+        return true
+    }
 
     /// `~/Library/Group Containers/group.com.mac-rdp.rds/`.
     static func containerURL() -> URL? {

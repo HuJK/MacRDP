@@ -83,6 +83,14 @@ final class BridgePeer: @unchecked Sendable {
                                    _ bytesWritten: UInt32) -> Void = { _,_,_ in }
         var onRdpdrCloseComplete: (_ token: UInt64, _ ioStatus: UInt32) -> Void = { _,_ in }
         var onRdpdrSimpleComplete: (_ token: UInt64, _ ioStatus: UInt32) -> Void = { _,_ in }
+        // RDPECAM enumeration — client cameras. `deviceID` is the per-camera
+        // virtual-channel name (stable id for add/remove correlation); `name`
+        // is the human-readable label (falls back to deviceID).
+        var onCameraAdded: (_ deviceID: String, _ name: String) -> Void = { _,_ in }
+        var onCameraRemoved: (_ deviceID: String) -> Void = { _ in }
+        /// One H.264 sample (Annex-B) for a camera started via `cameraStart`.
+        /// Fires on the camera channel thread.
+        var onCameraFrame: (_ deviceID: String, _ data: Data) -> Void = { _,_ in }
     }
 
     private var session: macrdp_session_t?
@@ -136,6 +144,9 @@ final class BridgePeer: @unchecked Sendable {
         cbs.on_rdpdr_write_complete      = Self.cbRdpdrWriteComplete
         cbs.on_rdpdr_close_complete      = Self.cbRdpdrCloseComplete
         cbs.on_rdpdr_simple_complete     = Self.cbRdpdrSimpleComplete
+        cbs.on_camera_added              = Self.cbCameraAdded
+        cbs.on_camera_removed            = Self.cbCameraRemoved
+        cbs.on_camera_frame              = Self.cbCameraFrame
 
         var cfg = macrdp_session_config()
         // Resolve the login policy into an NLA setup. Fail closed: a
@@ -183,6 +194,9 @@ final class BridgePeer: @unchecked Sendable {
                                         || config.clipboard.files) ? 1 : 0
         cfg.enable_disp              = (config.display.resizeHook != nil) ? 1 : 0
         cfg.enable_rdpdr             = config.rdpdr.enabled ? 1 : 0
+        // RDPECAM enumeration is cheap (just lists the client's cameras for the
+        // menu); always on. The per-camera media channel isn't opened here.
+        cfg.enable_camera            = 1
 
         // TLS paths. Pin the bytes for the duration of the C call —
         // freerdp_key_new_from_file_enc reads the file immediately so we
@@ -549,6 +563,21 @@ final class BridgePeer: @unchecked Sendable {
         return macrdp_session_rdpdr_rename_file(s, token, deviceID, oldPath, newPath) == MACRDP_OK
     }
 
+    // MARK: - RDPECAM camera media channel
+
+    /// Start streaming one client camera's H.264 video (by its RDPECAM
+    /// virtual-channel name). Frames arrive via `sinks.onCameraFrame`.
+    func cameraStart(deviceID: String) {
+        guard let s = session else { return }
+        _ = macrdp_session_camera_start(s, deviceID)
+    }
+
+    /// Stop + close that camera's media channel.
+    func cameraStop(deviceID: String) {
+        guard let s = session else { return }
+        _ = macrdp_session_camera_stop(s, deviceID)
+    }
+
     // MARK: - C trampolines
 
     private static func unmanagedSelf(_ ctx: UnsafeMutableRawPointer?) -> BridgePeer? {
@@ -695,6 +724,21 @@ final class BridgePeer: @unchecked Sendable {
     private static let cbRdpdrSimpleComplete: macrdp_on_rdpdr_status_complete_fn = {
         ctx, token, ioStatus in
         unmanagedSelf(ctx)?.sinks.onRdpdrSimpleComplete(token, ioStatus)
+    }
+    private static let cbCameraAdded: macrdp_on_camera_added_fn = { ctx, deviceID, name in
+        let id = deviceID.map { String(cString: $0) } ?? ""
+        let n = name.map { String(cString: $0) } ?? ""
+        unmanagedSelf(ctx)?.sinks.onCameraAdded(id, n.isEmpty ? id : n)
+    }
+    private static let cbCameraRemoved: macrdp_on_camera_removed_fn = { ctx, deviceID in
+        let id = deviceID.map { String(cString: $0) } ?? ""
+        unmanagedSelf(ctx)?.sinks.onCameraRemoved(id)
+    }
+    private static let cbCameraFrame: macrdp_on_camera_frame_fn = { ctx, deviceID, data, len in
+        guard let data, len > 0 else { return }
+        let id = deviceID.map { String(cString: $0) } ?? ""
+        let d = Data(bytes: data, count: len)
+        unmanagedSelf(ctx)?.sinks.onCameraFrame(id, d)
     }
 }
 

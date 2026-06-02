@@ -181,4 +181,19 @@ final class RDPListener {
         s.shutdown()
         sessions.removeValue(forKey: id)
     }
+
+    /// Open a session's redirected drive in Finder (menu-bar action).
+    func openDrive(sessionID: ObjectIdentifier, driveKey: String) {
+        sessions[sessionID]?.openDrive(driveKey: driveKey)
+    }
+
+    /// Show a session's mic live spectrum (menu-bar action).
+    func openMicSpectrum(sessionID: ObjectIdentifier) {
+        sessions[sessionID]?.showMicSpectrum()
+    }
+
+    /// Open a live view of a session's redirected camera (menu-bar action).
+    func openCamera(sessionID: ObjectIdentifier, deviceID: String, name: String) {
+        sessions[sessionID]?.showCamera(id: deviceID, name: name)
+    }
 }
