@@ -123,18 +123,27 @@ struct HybridRouting {
     /// Non-nil when masking is enabled and there are video tiles: feed this
     /// to the H.264 encoder instead of the original frame.
     var maskedBuffer: CVPixelBuffer?
+    /// Monotonic per-frame token assigned by `route()` in capture order. Used
+    /// by `send()` to keep paint ordering capture-correct even when the H.264
+    /// encoder runs late and a newer Progressive-only frame already painted
+    /// some of this frame's intended video tiles — those tiles get filtered
+    /// out of the AVC blit so the newer Progressive content isn't stomped.
+    var captureToken: Int64
 }
 
 /// Per-frame payload threaded from the encode call back to the send path so
 /// the encoded H.264 bytes can be correlated with their tile rects and the
 /// original (unmasked) frame used for the Progressive region.
 final class HybridFramePayload: @unchecked Sendable {
+    let captureToken: Int64
     let videoRects: [Rect16]
     let staticRects: [Rect16]
     let grid: TileGrid
     let pixel: CVPixelBuffer
-    init(videoRects: [Rect16], staticRects: [Rect16],
+    init(captureToken: Int64,
+         videoRects: [Rect16], staticRects: [Rect16],
          grid: TileGrid, pixel: CVPixelBuffer) {
+        self.captureToken = captureToken
         self.videoRects = videoRects
         self.staticRects = staticRects
         self.grid = grid
@@ -158,6 +167,12 @@ protocol HybridFrameSink: AnyObject, Sendable {
     /// region from `pixel` (the now-static content) so it doesn't stay stuck on
     /// the last lossy H.264 blit. Does NOT run analysis. Called on MainActor.
     func flushSettle(pixel: CVPixelBuffer, width: Int, height: Int, stride: Int)
+    /// Consume a pending IDR request, set when a late H.264 send had every one
+    /// of its blit rects filtered out (the AVC NAL was therefore dropped to
+    /// avoid stomping newer Progressive paints, which leaves the client decoder
+    /// DPB one frame behind ours — the next encoded frame must be IDR to
+    /// resync). Read on MainActor by DisplayPipeline before each encode.
+    func popPendingKeyframe() -> Bool
 }
 
 /// Merge same-codec tiles into rectangles. Greedy per-row run-merge followed
