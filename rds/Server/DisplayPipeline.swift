@@ -580,6 +580,7 @@ final class DisplayPipeline {
             CVPixelBufferUnlockBaseAddress(pixel, .readOnly)
 
             let payload = HybridFramePayload(
+                captureToken: routing.captureToken,
                 videoRects: routing.videoRects, staticRects: routing.staticRects,
                 grid: routing.grid, pixel: pixel)
 
@@ -604,9 +605,15 @@ final class DisplayPipeline {
             } else {
                 encodeInput = bgraInput
             }
+            // The sink can demand an IDR after a prior send dropped its AVC NAL
+            // (every blit rect filtered against newer Progressive paints) — the
+            // client decoder DPB is one frame behind us until we resync.
+            let forceFromSink = sink.popPendingKeyframe()
             do {
                 try encoder?.encode(pixelBuffer: encodeInput,
-                                    pts: pts, forceKeyframe: force, userData: payload)
+                                    pts: pts,
+                                    forceKeyframe: force || forceFromSink,
+                                    userData: payload)
             } catch {
                 Log.encoder.error("hybrid encode failed: \(String(describing: error), privacy: .public)")
             }
