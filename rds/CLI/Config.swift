@@ -51,8 +51,9 @@ struct Config: Codable, Sendable {
         ///              with the serial as the password.
         ///   "nthash" — NLA against a configured NT-hash (`ntHash`). Generate
         ///              it with `rds nthash` so no plaintext lives in config.
-        ///   "ssh"    — verify the password against an SSH server (the real
-        ///              macOS account password); caches the NT-hash for NLA.
+        ///   "local"  — verify the password against the local macOS account
+        ///              via OpenDirectory (`opendirectoryd`); caches the
+        ///              NT-hash for NLA on subsequent connections.
         var passwordPolicy: String
 
         /// NLA domain. nil → empty (log in with a bare username, no domain).
@@ -61,14 +62,12 @@ struct Config: Codable, Sendable {
         /// with `rds nthash`.
         var ntHash: String?
 
-        // --- "ssh" policy ---
-        // First login is SSH-verified; the resulting NT-hash is cached so later
-        // connections use NLA. The cache stays valid exactly while the account's
-        // passwordLastSetTime is unchanged (no expiry). If that time can't be
-        // read (a different user, needs root) the hash isn't cached and every
-        // connection re-verifies via SSH.
-        var sshHost: String?            // default 127.0.0.1
-        var sshPort: Int?               // default 22
+        // --- "local" policy ---
+        // First login is verified via OpenDirectory; the resulting NT-hash is
+        // cached so later connections use NLA. The cache stays valid exactly
+        // while the account's passwordLastSetTime is unchanged (no expiry). If
+        // that time can't be read (a different user, needs root) the hash isn't
+        // cached and every connection re-verifies via OpenDirectory.
 
         // --- TLS server certificate (auto-generated if files are nil) ---
         var certificateFile: String?
@@ -528,7 +527,7 @@ struct Config: Codable, Sendable {
             listen: .init(host: "0.0.0.0", port: 3389),
             auth: .init(authUserPolicy: "self", username: nil,
                         passwordPolicy: "none", domain: nil,
-                        ntHash: nil, sshHost: nil, sshPort: nil,
+                        ntHash: nil,
                         certificateFile: nil, privateKeyFile: nil,
                         certificateValidityDays: 3650,
                         rsaKeyBits: 2048),

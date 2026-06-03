@@ -1,18 +1,20 @@
 //
-//  SSHAuthCache.swift
+//  PasswordVerifyCache.swift
 //  MacRDP
 //
-//  Process-wide cache of NT-hashes learned from a successful SSH password
-//  verification. While an entry is valid, subsequent connections for that user
-//  can use NLA (validated against the cached NT-hash) instead of re-sending the
-//  plaintext. Only the NT-hash is stored — never the plaintext. The TTL bounds
-//  how long a since-changed password keeps working.
+//  Process-wide cache of NT-hashes learned from a successful plaintext password
+//  verification (via OpenDirectory). While an entry is valid, subsequent
+//  connections for that user can use NLA (validated against the cached NT-hash)
+//  instead of re-sending the plaintext. Only the NT-hash is stored — never the
+//  plaintext. The cache is invalidated the moment the account's
+//  `passwordLastSetTime` changes, so a since-changed password can't keep
+//  accepting the old one.
 //
 
 import Foundation
 
-final class SSHAuthCache: @unchecked Sendable {
-    static let shared = SSHAuthCache()
+final class PasswordVerifyCache: @unchecked Sendable {
+    static let shared = PasswordVerifyCache()
 
     private let lock = NSLock()
     private struct Entry {
@@ -24,9 +26,9 @@ final class SSHAuthCache: @unchecked Sendable {
     private func key(_ user: String) -> String { user.lowercased() }
 
     /// Cached NT-hash for `user`, valid exactly while the account's
-    /// passwordLastSetTime is unchanged. No expiry. If the time can't be read
+    /// passwordLastSetTime is unchanged. No expiry. If that time can't be read
     /// now (e.g. a different user without root) the cache can't be trusted →
-    /// miss (the caller re-verifies via SSH).
+    /// miss (the caller re-verifies via OpenDirectory).
     func cachedNtHash(user: String) -> String? {
         lock.lock(); defer { lock.unlock() }
         guard let e = entries[key(user)] else { return nil }

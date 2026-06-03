@@ -61,7 +61,7 @@ final class BridgePeer: @unchecked Sendable {
         var onClipFileContentsResponse: (_ streamID: UInt32, _ data: Data) -> Void = { _,_ in }
         var onAudioInFrame: (_ pcm: Data, _ sampleRate: Int, _ channels: Int) -> Void = { _,_,_ in }
         var onAudioFormatSelected: (_ format: AudioFormat) -> Void = { _ in }
-        /// Login gate (ssh policy): verify client-submitted creds. Defaults to
+        /// Login gate (local policy): verify client-submitted creds. Defaults to
         /// reject, so a gate with no verifier fails closed.
         var onVerifyPassword: (_ user: String, _ domain: String, _ password: String) -> Bool = { _,_,_ in false }
         var onAuthenticatedUser: (_ user: String) -> Void = { _ in }

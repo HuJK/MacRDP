@@ -298,19 +298,31 @@ final class RDPSession {
                 self?.clientUsername = user.isEmpty ? nil : user
             }
         }
-        // "ssh" login policy gate: verify the client's password against the
-        // SSH server (the real macOS account), then cache its NT-hash so the
-        // next connection can use NLA. Fires on the bridge thread.
-        sinks.onVerifyPassword = { [config = self.config] user, _, password in
-            let host = config.auth.sshHost ?? "127.0.0.1"
-            let port = config.auth.sshPort ?? 22
-            guard SSHVerifier.verify(username: user, password: password,
-                                     host: host, port: port) else { return false }
-            SSHAuthCache.shared.store(
-                user: user,
-                ntHashHex: AuthProvisioner.ntHashHex(password),
-                pwLastSet: AccountPolicy.passwordLastSetTime(user: user))
-            return true
+        // "local" login policy gate: verify the client's password against the
+        // local macOS account via OpenDirectory (in-process, no subprocess),
+        // then cache its NT-hash so the next connection can use NLA. Fires on
+        // the bridge thread.
+        sinks.onVerifyPassword = { user, _, password in
+            switch OpenDirectoryVerifier.verify(username: user, password: password) {
+            case .ok:
+                PasswordVerifyCache.shared.store(
+                    user: user,
+                    ntHashHex: AuthProvisioner.ntHashHex(password),
+                    pwLastSet: AccountPolicy.passwordLastSetTime(user: user))
+                return true
+            case .wrongPassword:
+                Log.server.warning("Logon refused for \(user, privacy: .public): wrong password")
+                return false
+            case .noSuchUser:
+                Log.server.warning("Logon refused for \(user, privacy: .public): no such local user")
+                return false
+            case .accountDisabled:
+                Log.server.warning("Logon refused for \(user, privacy: .public): account disabled / expired / locked")
+                return false
+            case .error(let msg):
+                Log.server.error("OpenDirectory verify error for \(user, privacy: .public): \(msg, privacy: .public)")
+                return false   // fail closed
+            }
         }
         sinks.onActivated = { [weak self] w, h, bpp, connType, audioMode in
             Task { @MainActor [weak self] in
