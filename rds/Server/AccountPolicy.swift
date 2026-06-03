@@ -7,8 +7,8 @@
 //  *current* user; another user's needs root (returns nil → caller falls back
 //  to TTL-only cache invalidation).
 //
-//  Used to invalidate the SSH NT-hash cache the moment the macOS password
-//  changes, so a stale cached hash can't keep accepting the old password.
+//  Used to invalidate the PasswordVerifyCache NT-hash the moment the macOS
+//  password changes, so a stale cached hash can't keep accepting the old one.
 //
 
 import Foundation

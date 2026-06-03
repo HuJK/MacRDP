@@ -19,7 +19,7 @@ import os
 enum AuthResolution {
     case noAuth                          // NLA off, accept everyone (policy "none")
     case nla(samFilePath: String)        // NLA on, validate against this SAM file
-    case gate                            // NLA off, verify client password at logon (ssh)
+    case gate                            // NLA off, verify client password at logon (OpenDirectory)
     case deny(reason: String)            // misconfigured / unsupported → refuse
 }
 
@@ -83,11 +83,12 @@ enum AuthProvisioner {
             }
             return writeSAM(user: user, domain: domain, ntHex: hex.uppercased())
 
-        case "ssh":
+        case "local":
             // If we have a still-valid cached NT-hash for this user, use NLA
             // (no plaintext this connection). Otherwise gate: verify the
-            // client-submitted password via SSH at logon.
-            if let nt = SSHAuthCache.shared.cachedNtHash(user: user) {
+            // client-submitted password against the local macOS account
+            // database via OpenDirectory at logon.
+            if let nt = PasswordVerifyCache.shared.cachedNtHash(user: user) {
                 return writeSAM(user: user, domain: domain, ntHex: nt)
             }
             return .gate
