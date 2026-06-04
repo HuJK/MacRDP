@@ -108,9 +108,9 @@ enum DefaultConfig {
             analysis: blobDRAnalysisDefault),
         dirtyFreqDR: Config.TileConfig.DirtyFreqDRConfig(
             tileActiveCoverage: 0.02,
-            historyFrames: 90,
-            videoFractionEnter: 0.9,
-            videoFractionExit: 0.1,
+            historyFrames: 30,
+            videoFractionEnter: 0.999,
+            videoFractionExit: 0.001,
             analysis: dirtyFreqDRAnalysisDefault),
         pixelRate: Config.TileConfig.PixelRateConfig(
             tileActiveCoverage: 0.02,
@@ -171,7 +171,16 @@ enum DefaultConfig {
             shortWindowMs: 1000,
             refWindowMs: 20_000,
             driftAllowanceMs: 80,
-            maxMs: 500))
+            // Absolute backstop OFF by default. The drift detector above
+            // catches sustained growth correctly; an absolute cap on
+            // shortFloor mis-classifies legitimately deep client jitter
+            // buffers (mstsc PCM ≈ 300-500ms, slow links higher) as
+            // "broken", and once shortFloor exceeds the cap the system
+             // dead-locks — drops stop all sends, no sends → no confirms
+             // → shortFloor stuck high → drops continue. Set to >0 only
+             // when you have a specific runaway-skew scenario that drift
+             // alone can't see.
+            maxMs: 0))
 
     // MARK: - audio in
 

@@ -146,7 +146,12 @@ audioOut:
     shortWindowMs: 1000
     refWindowMs: 20000
     driftAllowanceMs: 80           # 0 disables drift detection
-    maxMs: 500                     # 0 disables hard backstop
+    maxMs: 0                       # 0 disables hard backstop (recommended).
+                                    # The drift detector above already handles
+                                    # sustained growth; an absolute cap will
+                                    # mis-classify deep client buffers (e.g.
+                                    # mstsc PCM ~300-500ms) as "broken" and
+                                    # silence the stream once it kicks in.
 
 audioIn:
   enabled: true
