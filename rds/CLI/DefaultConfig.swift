@@ -83,26 +83,21 @@ enum DefaultConfig {
 
     // MARK: - tile
 
-    // Per-classifier cadence + switching defaults. The numbers happen to be the
-    // same starting point for all three, but they live with their owning
-    // classifier so you can tune each one independently. Diverging them later
-    // requires no schema change.
+    // Per-classifier cadence defaults. The numbers happen to be the same
+    // starting point for all three, but they live with their owning
+    // classifier so you can diverge them later without a schema change.
 
-    /// blobDR is cheap (region-area on a dirty-rect bitmap) and its decisions
-    /// are area-based — they don't flap on noise. Run often, low hysteresis.
-    static let blobDRAnalysisDefault   = Config.TileConfig.AnalysisCadence(frameInterval: 2,  minIntervalMs: 33)
-    static let blobDRSwitchingDefault  = Config.TileConfig.SwitchingConfig(hysteresisFrames: 3, settleRepaint: true)
-
-    /// dirtyFreqDR is also cheap and reads from a rolling window already — the
-    /// window does its own smoothing, so the post-pass hysteresis stays small.
-    static let dirtyFreqDRAnalysisDefault  = Config.TileConfig.AnalysisCadence(frameInterval: 2,  minIntervalMs: 33)
-    static let dirtyFreqDRSwitchingDefault = Config.TileConfig.SwitchingConfig(hysteresisFrames: 3, settleRepaint: true)
-
+    /// blobDR is cheap (region-area on a dirty-rect bitmap). Run often.
+    static let blobDRAnalysisDefault = Config.TileConfig.AnalysisCadence(
+        frameInterval: 2, minIntervalMs: 33)
+    /// dirtyFreqDR is cheap and reads from a rolling window already.
+    static let dirtyFreqDRAnalysisDefault = Config.TileConfig.AnalysisCadence(
+        frameInterval: 2, minIntervalMs: 33)
     /// pixelRate is the expensive one (full-frame per-pixel compare). The
-    /// engine still runs it at the same baseline cadence; the operator dials
-    /// it back here when they pick pixelRate as the active classifier.
-    static let pixelRateAnalysisDefault  = Config.TileConfig.AnalysisCadence(frameInterval: 2,  minIntervalMs: 33)
-    static let pixelRateSwitchingDefault = Config.TileConfig.SwitchingConfig(hysteresisFrames: 3, settleRepaint: true)
+    /// engine still runs it at the same baseline cadence; the operator
+    /// dials it back here when they pick pixelRate as the active classifier.
+    static let pixelRateAnalysisDefault = Config.TileConfig.AnalysisCadence(
+        frameInterval: 2, minIntervalMs: 33)
 
     static let tileDefault = Config.TileConfig(
         tileSize: 64,
@@ -110,29 +105,26 @@ enum DefaultConfig {
         blobDR: Config.TileConfig.BlobDRConfig(
             tileActiveCoverage: 0.02,
             largeRegionTiles: 12,
-            analysis:  blobDRAnalysisDefault,
-            switching: blobDRSwitchingDefault),
+            analysis: blobDRAnalysisDefault),
         dirtyFreqDR: Config.TileConfig.DirtyFreqDRConfig(
             tileActiveCoverage: 0.02,
-            historyFrames: 30,
+            historyFrames: 90,
             videoFractionEnter: 0.9,
-            videoFractionExit: 0.4,
-            analysis:  dirtyFreqDRAnalysisDefault,
-            switching: dirtyFreqDRSwitchingDefault),
+            videoFractionExit: 0.1,
+            analysis: dirtyFreqDRAnalysisDefault),
         pixelRate: Config.TileConfig.PixelRateConfig(
             tileActiveCoverage: 0.02,
             perFrameCoverageThreshold: 0.1,
             historyFrames: 30,
             videoFractionEnter: 0.9,
             videoFractionExit: 0.4,
-            analysis:  pixelRateAnalysisDefault,
-            switching: pixelRateSwitchingDefault),
+            analysis: pixelRateAnalysisDefault),
         mask: Config.TileConfig.MaskConfig(
             enable: false,
             colorBGRA: 0xFF00_0000,  // opaque black
             haloTiles: 2),
         encoder: Config.TileConfig.EncoderConfig(
-            fullRangeVideo: true,
+            fullRangeVideo: false,
             qp: 22,
             qualityVal: 100))
 

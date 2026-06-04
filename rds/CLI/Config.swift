@@ -205,18 +205,17 @@ struct Config: Codable, Sendable {
             var minIntervalMs: Int
         }
 
-        struct SwitchingConfig: Codable, Sendable {
-            /// A tile only adopts a *new* codec after the new decision
-            /// persists this many consecutive analyses (anti-flap at region
-            /// edges).
-            var hysteresisFrames: Int
-            /// When a tile that was H.264 stops changing, send it once via
-            /// Progressive (crisp re-render) before going idle — keeps text
-            /// sharp after a window drag / video stops.
-            var settleRepaint: Bool
-        }
+        // No post-classification "switching" layer: the only enter/exit
+        // mechanism is each classifier's own Schmitt-trigger band
+        // (videoFractionEnter / videoFractionExit) running over its history
+        // window. There is no engine-side hysteresisFrames and no
+        // "settle on idle" repaint path; when a tile stops changing, its
+        // window fills with 0s and the Schmitt exits on its own.
 
         /// "blobDR" — dirtyRects → connected-component AREA of touched tiles.
+        /// This classifier has no temporal smoothing of its own — it's an
+        /// area heuristic per analysis, prone to flap. Suitable when you want
+        /// a deterministic per-frame rule and accept the trade-off.
         struct BlobDRClassifierConfig: Codable, Sendable {
             /// Fraction of a tile's sampled pixels that must be "changed" for
             /// the tile to count as "active" (worth sending at all).
@@ -226,8 +225,6 @@ struct Config: Codable, Sendable {
             var largeRegionTiles: Int
             /// When + how often this classifier runs.
             var analysis: AnalysisCadence
-            /// How to stabilize this classifier's output.
-            var switching: SwitchingConfig
         }
         typealias BlobDRConfig = BlobDRClassifierConfig
 
@@ -235,16 +232,19 @@ struct Config: Codable, Sendable {
         /// over a recent window (a true touched/not boolean per frame).
         struct DirtyFreqDRClassifierConfig: Codable, Sendable {
             var tileActiveCoverage: Double
-            /// Window length (analyses) of the per-tile bit history.
+            /// Window length (analyses) of the per-tile bit history. Honored
+            /// verbatim — no silent cap. Memory grows ~tileCount * window
+            /// bytes (a few hundred KB at 4K/64).
             var historyFrames: Int
-            /// Schmitt-trigger band on the windowed set-bit fraction. The
-            /// tile flips to H.264 once the fraction reaches `videoFractionEnter`
-            /// and reverts to Progressive only once it drops below
-            /// `videoFractionExit`. Require enter > exit.
+            /// Schmitt-trigger band on the windowed set-bit fraction.
+            ///   * enter ≥ flips to H.264
+            ///   * exit  < flips back to Progressive (including the case
+            ///            where the tile fully stops being touched: window
+            ///            fills with 0s, fraction decays past exit)
+            /// Require enter > exit. This is the ONLY enter/exit gate.
             var videoFractionEnter: Double
             var videoFractionExit: Double
             var analysis: AnalysisCadence
-            var switching: SwitchingConfig
         }
         typealias DirtyFreqDRConfig = DirtyFreqDRClassifierConfig
 
@@ -260,7 +260,6 @@ struct Config: Codable, Sendable {
             var videoFractionEnter: Double
             var videoFractionExit: Double
             var analysis: AnalysisCadence
-            var switching: SwitchingConfig
         }
         typealias PixelRateConfig = PixelRateClassifierConfig
 

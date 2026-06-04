@@ -39,13 +39,14 @@ final class AnalysisEngine: @unchecked Sendable {
     private var pendingDirtyValid = true        // false if any frame lacked dirty info
     private var drainScheduled = false
 
-    // --- engine-owned finalize state (touched only on `queue`) ---
+    // --- engine-owned state (touched only on `queue`) ---
+    //
+    // The engine carries no codec-decision state of its own. Each tick it
+    // takes whatever (active, desired) the classifier returns and publishes
+    // it unchanged. All hysteresis / smoothing lives inside the classifier
+    // (the Schmitt band over its history window).
     private var grid: TileGrid
     private var primed = false
-    private var lastCodec: [UInt8] = []         // last {progressive,h264} decision per tile
-    private var wasActive: [Bool] = []          // was the tile changing last analysis?
-    private var candCodec: [UInt8] = []         // hysteresis candidate
-    private var candRun: [Int] = []             // consecutive analyses the candidate held
     private var submitCount: Int = 0
     private var lastAnalysisMs: UInt64 = 0
 
@@ -186,45 +187,20 @@ final class AnalysisEngine: @unchecked Sendable {
 
     private func analyze(_ pixel: CVPixelBuffer, dirty: [CGRect], dirtyValid: Bool,
                          active classifier: TileClassifier) {
-        guard grid.cols > 0, grid.rows > 0, grid.tileCount == lastCodec.count else { return }
+        guard grid.cols > 0, grid.rows > 0, grid.tileCount > 0 else { return }
 
         let (active, desired) = classifier.classify(
             grid: grid, primed: primed,
             dirtyRects: dirtyValid ? dirty : nil, pixel: pixel)
         guard active.count == grid.tileCount, desired.count == grid.tileCount else { return }
 
-        // Finalize using THIS classifier's switching tuning — hysteresis on
-        // codec changes, optional Progressive settle when a video tile goes
-        // idle. Both knobs come from the classifier so two classifiers can't
-        // share a stabilization profile by accident.
-        let switching = classifier.switching
-        let H = max(1, switching.hysteresisFrames)
-        let settleRepaint = switching.settleRepaint
+        // Pure pass-through: each tile is either skipped (not active this
+        // frame) or sent with the codec the classifier picked. No extra
+        // hysteresis layer, no settle-on-idle override. The classifier's
+        // Schmitt band over its history window is the only enter/exit gate.
         var newTiles = [UInt8](repeating: TileCodec.skip.rawValue, count: grid.tileCount)
         for i in 0..<grid.tileCount {
-            if active[i] {
-                let want = desired[i]
-                let final: UInt8
-                if want == lastCodec[i] {
-                    final = want; candRun[i] = 0
-                } else {
-                    if candCodec[i] == want { candRun[i] += 1 }
-                    else { candCodec[i] = want; candRun[i] = 1 }
-                    if candRun[i] >= H { final = want; lastCodec[i] = want; candRun[i] = 0 }
-                    else { final = lastCodec[i] }
-                }
-                newTiles[i] = final
-                wasActive[i] = true
-            } else {
-                if wasActive[i] && settleRepaint && lastCodec[i] == TileCodec.h264.rawValue {
-                    newTiles[i] = TileCodec.progressive.rawValue
-                    lastCodec[i] = TileCodec.progressive.rawValue
-                } else {
-                    newTiles[i] = TileCodec.skip.rawValue
-                }
-                candRun[i] = 0
-                wasActive[i] = false
-            }
+            newTiles[i] = active[i] ? desired[i] : TileCodec.skip.rawValue
         }
 
         primed = true
@@ -234,11 +210,7 @@ final class AnalysisEngine: @unchecked Sendable {
     // MARK: - Helpers
 
     private func allocState(for g: TileGrid) {
-        let n = max(0, g.tileCount)
-        lastCodec = [UInt8](repeating: TileCodec.progressive.rawValue, count: n)
-        wasActive = [Bool](repeating: false, count: n)
-        candCodec = [UInt8](repeating: TileCodec.progressive.rawValue, count: n)
-        candRun   = [Int](repeating: 0, count: n)
+        // Engine carries no per-tile decision state now; just reset counters.
         submitCount = 0
     }
 

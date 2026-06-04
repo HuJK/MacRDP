@@ -76,30 +76,30 @@ video:
     classifiers: [dirtyFreqDR]
 
     # Each classifier owns its OWN sub-config — including cadence (when to
-    # run) and switching (hysteresis + settle for its outputs). Two
-    # classifiers cannot share a tuning even when they look similar.
+    # run). The history-window Schmitt band (videoFractionEnter /
+    # videoFractionExit) is the ONLY enter/exit gate: no engine-side
+    # hysteresis, no "settle on idle" repaint. When a tile stops being
+    # touched the window fills with 0s, the fraction decays past exit, and
+    # the Schmitt flips back to Progressive on its own.
     blobDR:
       tileActiveCoverage: 0.02
       largeRegionTiles: 12
-      analysis:   { frameInterval: 2, minIntervalMs: 33 }
-      switching:  { hysteresisFrames: 3, settleRepaint: true }
+      analysis: { frameInterval: 2, minIntervalMs: 33 }
     dirtyFreqDR:
       tileActiveCoverage: 0.02
-      historyFrames: 30
+      historyFrames: 90               # honored verbatim — no silent cap
       videoFractionEnter: 0.9
-      videoFractionExit: 0.4
-      analysis:   { frameInterval: 2, minIntervalMs: 33 }
-      switching:  { hysteresisFrames: 3, settleRepaint: true }
+      videoFractionExit: 0.1
+      analysis: { frameInterval: 2, minIntervalMs: 33 }
     pixelRate:
       tileActiveCoverage: 0.02
       perFrameCoverageThreshold: 0.1
       historyFrames: 30
       videoFractionEnter: 0.9
       videoFractionExit: 0.4
-      # pixelRate is the expensive one — feel free to dial these back when
-      # you make it the active classifier (e.g. frameInterval: 4).
-      analysis:   { frameInterval: 2, minIntervalMs: 33 }
-      switching:  { hysteresisFrames: 3, settleRepaint: true }
+      # pixelRate is the expensive one — dial cadence back when you make it
+      # the active classifier (e.g. frameInterval: 4).
+      analysis: { frameInterval: 2, minIntervalMs: 33 }
 
     # Applied to the classifier's OUTPUT regardless of which one ran. Not a
     # per-classifier tuning.

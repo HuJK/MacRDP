@@ -40,14 +40,14 @@ protocol TileClassifier: AnyObject {
     /// (when to run / how often). Lives with the classifier so two classifiers
     /// can't accidentally share a cadence.
     var analysis: Config.TileConfig.AnalysisCadence { get }
-    /// Post-classification stabilization (hysteresis + settle) the engine
-    /// applies to THIS classifier's output. Same reason — no sharing.
-    var switching: Config.TileConfig.SwitchingConfig { get }
     /// Re-size internal state for a new grid (resolution change).
     func reset(grid: TileGrid)
-    /// Per-tile decision for one frame. `dirtyRects` is guaranteed non-nil when
-    /// `requiresDirtyRects`. `pixel` is used only by pixel-based classifiers
-    /// (they lock it themselves). Returns parallel arrays of length tileCount.
+    /// Per-tile decision for one frame. `dirtyRects` is guaranteed non-nil
+    /// when `requiresDirtyRects`. `pixel` is used only by pixel-based
+    /// classifiers (they lock it themselves). Returns parallel arrays of
+    /// length tileCount: `active` is "should we send this tile this frame";
+    /// `desired` is "which codec if we do send it". The engine treats
+    /// `!active` as skip and never overrides `desired`.
     func classify(grid: TileGrid, primed: Bool,
                   dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
         -> (active: [Bool], desired: [UInt8])
@@ -129,42 +129,72 @@ private func tilesTouched(by rects: [CGRect], grid g: TileGrid) -> [Bool] {
     return touched
 }
 
-/// Rolling per-tile bit history → windowed set-bit fraction, turned into a
-/// codec decision via a Schmitt trigger (dual threshold). dirtyFreqDR feeds
-/// "tile was touched this frame"; pixelRate feeds "real pixel-coverage was
-/// high this frame". The set-bit fraction over the recent window is the video
-/// signal; the enter/exit band stops it flickering when the fraction hovers
-/// around a single cutoff (e.g. bouncing 0.3↔0.5 around 0.4).
+/// Rolling per-tile bit history → windowed set-bit fraction → Schmitt-trigger
+/// codec decision (dual threshold).
+///
+///   dirtyFreqDR pushes "tile was touched this frame";
+///   pixelRate   pushes "real changed-pixel coverage was high this frame".
+///
+/// The set-bit fraction over the recent window is the video signal; the
+/// enter/exit band stops it flickering when the fraction hovers around a
+/// single cutoff (e.g. bouncing 0.3↔0.5 around 0.4).
+///
+/// Storage: per-tile ring buffer of bits, with the window length set at
+/// reset time. The window honors `historyFrames` verbatim (no silent cap);
+/// memory cost is `tileCount * historyFrames` bytes, which is well under a
+/// MB even at 4K/64.
+///
+/// Schmitt updates EVERY analysis for EVERY tile, regardless of whether the
+/// tile is being touched this frame. That's the only enter/exit mechanism:
+/// when the tile stops changing, the window fills with 0s, the fraction
+/// decays past `videoFractionExit`, and the Schmitt flips back to
+/// Progressive on its own. There is no separate "settle on idle" path.
 private final class BitHistory {
-    private var hist: [UInt32] = []
-    private var videoState: [Bool] = []     // last Schmitt decision per tile
-    func reset(_ n: Int) {
-        hist = [UInt32](repeating: 0, count: max(0, n))
-        videoState = [Bool](repeating: false, count: max(0, n))
+    private var window: Int = 1
+    private var bits: [Bool] = []       // flat ring: bits[i * window + j]
+    private var head: [Int] = []        // next-write position per tile (0..<window)
+    private var popcount: [Int] = []    // current 1-bit count in window per tile
+    private var videoState: [Bool] = [] // last Schmitt decision per tile
+
+    func reset(tileCount: Int, window: Int) {
+        self.window = max(1, window)
+        bits = [Bool](repeating: false, count: tileCount * self.window)
+        head = [Int](repeating: 0, count: tileCount)
+        popcount = [Int](repeating: 0, count: tileCount)
+        videoState = [Bool](repeating: false, count: tileCount)
     }
-    func push(_ bits: [Bool]) {
-        if hist.count != bits.count { hist = [UInt32](repeating: 0, count: bits.count) }
-        for i in bits.indices {
-            hist[i] = (hist[i] << 1) | (bits[i] ? 1 : 0)
+
+    /// Shift `newBits[i]` into tile i's ring; maintain `popcount` in O(1).
+    /// If the per-frame array doesn't match our tile count (resize raced),
+    /// re-init at the new count, keeping the configured window.
+    func push(_ newBits: [Bool]) {
+        if head.count != newBits.count {
+            reset(tileCount: newBits.count, window: window)
+        }
+        for i in 0..<head.count {
+            let slot = i * window + head[i]
+            let old = bits[slot]
+            let new = newBits[i]
+            bits[slot] = new
+            if old != new {
+                popcount[i] += new ? 1 : -1
+            }
+            head[i] = (head[i] + 1) % window
         }
     }
-    /// `enterFraction` > `exitFraction`. A tile becomes video once its windowed
-    /// set-bit fraction reaches `enterFraction`, and reverts to non-video only
-    /// once it drops below `exitFraction`; in between it holds its last state.
-    func desired(active: [Bool], windowFrames: Int,
-                 enterFraction: Double, exitFraction: Double) -> [UInt8] {
-        let window = min(32, max(1, windowFrames))
-        let mask: UInt32 = window >= 32 ? .max : ((1 << UInt32(window)) - 1)
-        if videoState.count != hist.count { videoState = [Bool](repeating: false, count: hist.count) }
-        var out = [UInt8](repeating: TileCodec.progressive.rawValue, count: hist.count)
-        for i in hist.indices {
-            if i < active.count && active[i] {
-                let frac = Double((hist[i] & mask).nonzeroBitCount) / Double(window)
-                if videoState[i] {
-                    if frac < exitFraction { videoState[i] = false }
-                } else if frac >= enterFraction {
-                    videoState[i] = true
-                }
+
+    /// Run the Schmitt update for every tile and return the per-tile codec
+    /// decision. `enterFraction` > `exitFraction`.
+    func updateAndRead(enterFraction: Double, exitFraction: Double) -> [UInt8] {
+        let n = popcount.count
+        var out = [UInt8](repeating: TileCodec.progressive.rawValue, count: n)
+        let denom = Double(window)
+        for i in 0..<n {
+            let frac = Double(popcount[i]) / denom
+            if videoState[i] {
+                if frac < exitFraction { videoState[i] = false }
+            } else if frac >= enterFraction {
+                videoState[i] = true
             }
             out[i] = videoState[i] ? TileCodec.h264.rawValue : TileCodec.progressive.rawValue
         }
@@ -202,8 +232,7 @@ final class BlobDRClassifier: TileClassifier {
     let name = "blobDR"
     let requiresDirtyRects = true
     private let cfg: Config.TileConfig.BlobDRConfig
-    var analysis:  Config.TileConfig.AnalysisCadence { cfg.analysis }
-    var switching: Config.TileConfig.SwitchingConfig { cfg.switching }
+    var analysis: Config.TileConfig.AnalysisCadence { cfg.analysis }
     init(cfg: Config.TileConfig.BlobDRConfig) { self.cfg = cfg }
     func reset(grid: TileGrid) {}
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
@@ -224,21 +253,24 @@ final class DirtyFreqDRClassifier: TileClassifier {
     let requiresDirtyRects = true
     private let cfg: Config.TileConfig.DirtyFreqDRConfig
     private let history = BitHistory()
-    var analysis:  Config.TileConfig.AnalysisCadence { cfg.analysis }
-    var switching: Config.TileConfig.SwitchingConfig { cfg.switching }
+    var analysis: Config.TileConfig.AnalysisCadence { cfg.analysis }
     init(cfg: Config.TileConfig.DirtyFreqDRConfig) { self.cfg = cfg }
-    func reset(grid: TileGrid) { history.reset(grid.tileCount) }
+    func reset(grid: TileGrid) {
+        history.reset(tileCount: grid.tileCount, window: cfg.historyFrames)
+    }
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
         -> (active: [Bool], desired: [UInt8]) {
         // Boolean "touched this frame" per tile — no area magnitude. A tile is
         // active (worth sending) iff it was touched; first frame = full repaint.
         let touched = tilesTouched(by: dirtyRects ?? [], grid: grid)
         let active = primed ? touched : [Bool](repeating: true, count: grid.tileCount)
+        // Schmitt runs EVERY analysis on EVERY tile (touched or not). That's
+        // how a tile that stops being touched eventually exits H.264 — the
+        // window fills with 0s, the fraction decays past videoFractionExit.
         history.push(touched)
-        let desired = history.desired(active: active,
-                                      windowFrames: cfg.historyFrames,
-                                      enterFraction: cfg.videoFractionEnter,
-                                      exitFraction: cfg.videoFractionExit)
+        let desired = history.updateAndRead(
+            enterFraction: cfg.videoFractionEnter,
+            exitFraction:  cfg.videoFractionExit)
         return (active, desired)
     }
 }
@@ -346,8 +378,7 @@ final class PixelRateClassifier: TileClassifier {
     private let cfg: Config.TileConfig.PixelRateConfig
     private let history = BitHistory()
     private let backend: PixelRateBackend
-    var analysis:  Config.TileConfig.AnalysisCadence { cfg.analysis }
-    var switching: Config.TileConfig.SwitchingConfig { cfg.switching }
+    var analysis: Config.TileConfig.AnalysisCadence { cfg.analysis }
 
     init(cfg: Config.TileConfig.PixelRateConfig, backend: PixelRateBackend = CPUPixelRateBackend()) {
         self.cfg = cfg
@@ -356,7 +387,7 @@ final class PixelRateClassifier: TileClassifier {
 
     func reset(grid: TileGrid) {
         backend.reset(grid: grid)
-        history.reset(grid.tileCount)
+        history.reset(tileCount: grid.tileCount, window: cfg.historyFrames)
     }
 
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
@@ -365,11 +396,11 @@ final class PixelRateClassifier: TileClassifier {
         backend.coverage(grid: grid, primed: primed, pixel: pixel, into: &coverage)
         let active = activeMask(coverage, primed: primed, threshold: cfg.tileActiveCoverage)
         // Per-pixel coverage IS a true magnitude, so threshold it into the bit.
+        // Schmitt runs every analysis (see DirtyFreqDR for the same rationale).
         history.push(coverage.map { $0 > cfg.perFrameCoverageThreshold })
-        let desired = history.desired(active: active,
-                                      windowFrames: cfg.historyFrames,
-                                      enterFraction: cfg.videoFractionEnter,
-                                      exitFraction: cfg.videoFractionExit)
+        let desired = history.updateAndRead(
+            enterFraction: cfg.videoFractionEnter,
+            exitFraction:  cfg.videoFractionExit)
         return (active, desired)
     }
 }
