@@ -60,7 +60,7 @@ final class RDPListener {
         }
 
         self.listenFD = fd
-        Log.listener.notice("Listening on tcp/[::]:\(self.config.listen.port, privacy: .public)")
+        LogTo.listener.notice("Listening on tcp/[::]:\(self.config.listen.port)")
 
         // Capture the fd by value for the accept thread — must NOT touch
         // MainActor-isolated state from there.
@@ -100,7 +100,7 @@ final class RDPListener {
                 let err = errno
                 if err == EINTR { continue }
                 // Either we were shut down (fd closed) or a real error.
-                Log.listener.notice("accept() loop exiting: \(String(cString: strerror(err)), privacy: .public)")
+                LogTo.listener.notice("accept() loop exiting: \(String(cString: strerror(err)))")
                 return
             }
             // Disable Nagle's algorithm on the accepted socket. RDP is
@@ -152,7 +152,7 @@ final class RDPListener {
         // control sessions kick each other.
         let newRole: SessionRole = .control
         for (sid, s) in sessions where s.role == .control {
-            Log.listener.notice("New control session from \(peerIP, privacy: .public) — kicking previous (\(s.clientIP, privacy: .public))")
+            LogTo.listener.notice("New control session from \(peerIP) — kicking previous (\(s.clientIP))")
             s.shutdown()
             sessions.removeValue(forKey: sid)
         }
@@ -165,7 +165,7 @@ final class RDPListener {
                 self?.sessions.removeValue(forKey: id)
             }
         }
-        Log.listener.info("Accepted client fd=\(fd, privacy: .public) ip=\(peerIP, privacy: .public)")
+        LogTo.listener.info("Accepted client fd=\(fd) ip=\(peerIP)")
         session.start()
     }
 
@@ -177,7 +177,7 @@ final class RDPListener {
 
     func kick(id: ObjectIdentifier) {
         guard let s = sessions[id] else { return }
-        Log.listener.notice("Kicking session \(s.clientIP, privacy: .public)")
+        LogTo.listener.notice("Kicking session \(s.clientIP)")
         s.shutdown()
         sessions.removeValue(forKey: id)
     }

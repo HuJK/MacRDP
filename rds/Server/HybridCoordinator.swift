@@ -23,7 +23,7 @@ import Foundation
 import os
 
 final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
-    private let cfg: Config.HybridConfig
+    private let cfg: Config.TileConfig
     let store: TileCodecMapStore
     private let engine: AnalysisEngine
     private weak var bridge: BridgePeer?
@@ -55,10 +55,10 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     private var keyframeRequested = false
 
     init(config: Config, bridge: BridgePeer, initialGrid: TileGrid) {
-        self.cfg = config.video.effectiveHybrid
+        self.cfg = config.video.tile
         self.bridge = bridge
         self.store = TileCodecMapStore(initialGrid: initialGrid)
-        self.engine = AnalysisEngine(hybrid: self.cfg, store: store)
+        self.engine = AnalysisEngine(tile: self.cfg, store: store)
         self.paintGrid = initialGrid
         self.lastPaintToken = [Int64](repeating: 0,
                                       count: max(0, initialGrid.tileCount))
@@ -126,13 +126,13 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         let finalStatic = primingRects.isEmpty ? staticRects : staticRects + primingRects
 
         var masked: CVPixelBuffer?
-        if cfg.maskNonVideoTiles, !videoRects.isEmpty,
+        if cfg.mask.enable, !videoRects.isEmpty,
            let srcRaw = CVPixelBufferGetBaseAddress(pixel) {
             let src = srcRaw.assumingMemoryBound(to: UInt8.self)
             // Keep real pixels for the video tiles PLUS a halo around them, so
             // the H.264 references stay realistic at the seam (no flash when a
             // tile enters video). Only the un-dilated videoRects are blitted.
-            let margin = max(0, cfg.maskHaloTiles) * cfg.tileSize
+            let margin = max(0, cfg.mask.haloTiles) * cfg.tileSize
             let keepReal = margin > 0
                 ? inflate(videoRects, by: margin, width: width, height: height)
                 : videoRects
@@ -452,7 +452,7 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         let dstBase = dstRaw.assumingMemoryBound(to: UInt8.self)
 
         // Flat fill with the configured mask colour (4-byte BGRX pattern).
-        var word = cfg.maskColorBGRA
+        var word = cfg.mask.colorBGRA
         withUnsafeBytes(of: &word) { wb in
             if let wp = wb.baseAddress {
                 memset_pattern4(dstBase, wp, dstStride * height)

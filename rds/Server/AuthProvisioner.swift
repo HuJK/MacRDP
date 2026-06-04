@@ -49,16 +49,18 @@ enum AuthProvisioner {
         return cf.takeRetainedValue() as? String
     }
 
+    /// Resolve `auth.username` against `authUserPolicy`. `effective` here
+    /// means "given the policy + username, the wire username we present" —
+    /// not the old "fill in a default for a missing config field" sense.
     static func effectiveUsername(_ auth: Config.AuthConfig) -> String {
-        if auth.authUserPolicy.lowercased() == "fixed",
-           let u = auth.username, !u.isEmpty {
-            return u
+        if auth.authUserPolicy.lowercased() == "fixed", !auth.username.isEmpty {
+            return auth.username
         }
-        return NSUserName()   // "self" (default)
+        return NSUserName()   // "self"
     }
 
     static func effectiveDomain(_ auth: Config.AuthConfig) -> String {
-        auth.domain ?? ""
+        auth.domain
     }
 
     /// Resolve the configured policy into an NLA setup. For policies that need
@@ -68,7 +70,7 @@ enum AuthProvisioner {
         let domain = effectiveDomain(auth)
         switch auth.passwordPolicy.lowercased() {
         case "none":
-            Log.server.warning("Auth policy \"none\": ANY client may connect with no password")
+            LogTo.server.warning("Auth policy \"none\": ANY client may connect with no password")
             return .noAuth
 
         case "serial":
@@ -78,7 +80,8 @@ enum AuthProvisioner {
             return writeSAM(user: user, domain: domain, ntHex: ntHashHex(serial))
 
         case "nthash":
-            guard let hex = auth.ntHash, isValidNtHash(hex) else {
+            let hex = auth.ntHash
+            guard isValidNtHash(hex) else {
                 return .deny(reason: "nthash policy: auth.ntHash must be 32 hex chars (run `rds nthash`)")
             }
             return writeSAM(user: user, domain: domain, ntHex: hex.uppercased())
@@ -113,7 +116,7 @@ enum AuthProvisioner {
         } catch {
             return .deny(reason: "could not write SAM file: \(error.localizedDescription)")
         }
-        Log.server.info("NLA enabled for user \(user, privacy: .public)@\(domain.isEmpty ? "(no domain)" : domain, privacy: .public)")
+        LogTo.server.info("NLA enabled for user \(user)@\(domain.isEmpty ? "(no domain)" : domain)")
         return .nla(samFilePath: path)
     }
 }

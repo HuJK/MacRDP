@@ -64,7 +64,7 @@ final class FileProviderInbox {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             NSFileProviderManager.remove(domain) { error in
                 if let error {
-                    Log.clip.info("FileProvider domain remove (pre-add): \(String(describing: error), privacy: .public)")
+                    LogTo.clipboard.info("FileProvider domain remove (pre-add): \(String(describing: error))")
                 }
                 cont.resume()
             }
@@ -76,9 +76,9 @@ final class FileProviderInbox {
                     // "Already exists" is benign — we just keep using
                     // the existing domain. Anything else is logged.
                     if error.domain == NSFileProviderErrorDomain {
-                        Log.clip.info("FileProvider domain \(self.domainIdentifier.rawValue, privacy: .public) add returned: \(String(describing: error), privacy: .public)")
+                        LogTo.clipboard.info("FileProvider domain \(self.domainIdentifier.rawValue) add returned: \(String(describing: error))")
                     } else {
-                        Log.clip.error("FileProvider domain add failed: \(String(describing: error), privacy: .public)")
+                        LogTo.clipboard.error("FileProvider domain add failed: \(String(describing: error))")
                     }
                 }
                 self.manager = NSFileProviderManager(for: domain)
@@ -88,7 +88,7 @@ final class FileProviderInbox {
                 // enumerateItems call before any Windows copy would
                 // surface as "FP -1005" errors in the log.
                 self.seedEmptyManifestIfNeeded()
-                Log.clip.info("FileProvider domain ready: \(self.domainIdentifier.rawValue, privacy: .public)")
+                LogTo.clipboard.info("FileProvider domain ready: \(self.domainIdentifier.rawValue)")
                 cont.resume()
             }
         }
@@ -121,7 +121,7 @@ final class FileProviderInbox {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             NSFileProviderManager.remove(domain) { error in
                 if let error {
-                    Log.clip.notice("FileProvider domain remove: \(String(describing: error), privacy: .public)")
+                    LogTo.clipboard.notice("FileProvider domain remove: \(String(describing: error))")
                 }
                 cont.resume()
             }
@@ -174,7 +174,7 @@ final class FileProviderInbox {
         let manifestURL = domainDir.appendingPathComponent("manifest.json")
         try manifestData.write(to: manifestURL, options: .atomic)
 
-        Log.clip.info("Inbox published: domain=\(self.domainIdentifier.rawValue, privacy: .public) items=\(items.count, privacy: .public)")
+        LogTo.clipboard.info("Inbox published: domain=\(self.domainIdentifier.rawValue) items=\(items.count)")
 
         // Push the JSON to the extension's in-memory cache via
         // NSFileProviderService. The extension can't read the App Group
@@ -237,10 +237,10 @@ final class FileProviderInbox {
         do {
             try newData.write(to: manifestURL, options: .atomic)
         } catch {
-            Log.clip.error("unpublishItem: manifest write failed: \(String(describing: error), privacy: .public)")
+            LogTo.clipboard.error("unpublishItem: manifest write failed: \(String(describing: error))")
             return
         }
-        Log.clip.info("Inbox unpublished item \(id, privacy: .public) (+\(toRemove.count - 1, privacy: .public) descendants); \(keptItems.count, privacy: .public) item(s) remain")
+        LogTo.clipboard.info("Inbox unpublished item \(id) (+\(toRemove.count - 1) descendants); \(keptItems.count) item(s) remain")
         await pushManifestToExtension(newData)
         await signal(.rootContainer)
         await signal(.workingSet)
@@ -256,14 +256,14 @@ final class FileProviderInbox {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 proxy.pushManifest(domainSubdir: self.subdir, data: data) { ok in
                     if !ok {
-                        Log.clip.notice("pushManifest returned !ok")
+                        LogTo.clipboard.notice("pushManifest returned !ok")
                     }
                     cont.resume()
                 }
             }
-            Log.clip.info("Pushed manifest to extension via NSFileProviderService (\(data.count, privacy: .public)B)")
+            LogTo.clipboard.info("Pushed manifest to extension via NSFileProviderService (\(data.count)B)")
         } catch {
-            Log.clip.error("pushManifest failed: \(String(describing: error), privacy: .public)")
+            LogTo.clipboard.error("pushManifest failed: \(String(describing: error))")
             // Drop a possibly-broken connection so the next attempt
             // re-opens.
             self.extensionConnection?.invalidate()
@@ -315,11 +315,11 @@ final class FileProviderInbox {
         conn.exportedInterface = NSXPCInterface(with: ExtensionToHostProtocol.self)
         conn.exportedObject = exporter
         conn.invalidationHandler = { [weak self] in
-            Log.clip.notice("Extension XPC connection invalidated")
+            LogTo.clipboard.notice("Extension XPC connection invalidated")
             Task { @MainActor in self?.extensionConnection = nil }
         }
         conn.interruptionHandler = { [weak self] in
-            Log.clip.notice("Extension XPC connection interrupted")
+            LogTo.clipboard.notice("Extension XPC connection interrupted")
             Task { @MainActor in
                 self?.extensionConnection?.invalidate()
                 self?.extensionConnection = nil
@@ -331,7 +331,7 @@ final class FileProviderInbox {
             throw NSError(domain: "MacRDP.inbox", code: 5,
                 userInfo: [NSLocalizedDescriptionKey: "remoteObjectProxy doesn't conform to HostToExtensionProtocol"])
         }
-        Log.clip.info("Extension XPC connection opened (NSFileProviderService)")
+        LogTo.clipboard.info("Extension XPC connection opened (NSFileProviderService)")
         return proxy
     }
 
@@ -340,7 +340,7 @@ final class FileProviderInbox {
             guard let manager else { cont.resume(); return }
             manager.signalEnumerator(for: container) { error in
                 if let error {
-                    Log.clip.notice("signalEnumerator(\(container.rawValue, privacy: .public)) failed: \(String(describing: error), privacy: .public)")
+                    LogTo.clipboard.notice("signalEnumerator(\(container.rawValue)) failed: \(String(describing: error))")
                 }
                 cont.resume()
             }

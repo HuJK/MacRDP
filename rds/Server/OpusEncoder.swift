@@ -89,7 +89,7 @@ final class OpusEncoder: CompressedAudioEncoder, @unchecked Sendable {
                 return inBuf
             }
             if let err {
-                Log.audioOut.error("Opus convert error: \(String(describing: err), privacy: .public)")
+                LogTo.audioOut.error("Opus convert error: \(String(describing: err))")
                 return packets
             }
             if outBuf.packetCount == 0 { return packets }

@@ -39,7 +39,7 @@ enum Permissions {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as CFString
         let opts: CFDictionary = [key: kCFBooleanTrue!] as CFDictionary
         let granted = AXIsProcessTrustedWithOptions(opts)
-        Log.server.info("TCC Accessibility: \(granted ? "GRANTED" : "PENDING/DENIED", privacy: .public)")
+        LogTo.server.info("TCC Accessibility: \(granted ? "GRANTED" : "PENDING/DENIED")")
     }
 
     // MARK: - Screen Recording
@@ -51,9 +51,9 @@ enum Permissions {
         Task.detached {
             do {
                 _ = try await SCShareableContent.current
-                Log.server.info("TCC Screen Recording: GRANTED")
+                LogTo.server.info("TCC Screen Recording: GRANTED")
             } catch {
-                Log.server.notice("TCC Screen Recording: PENDING/DENIED — \(String(describing: error), privacy: .public)")
+                LogTo.server.notice("TCC Screen Recording: PENDING/DENIED — \(String(describing: error))")
             }
         }
     }
@@ -68,7 +68,7 @@ enum Permissions {
         // a client connects (AudioOutPipeline.start). If permission
         // is missing the user can grant it via System Settings →
         // Privacy & Security → Screen & System Audio Recording.
-        Log.server.info("TCC System Audio Recording: probe deferred to session start")
+        LogTo.server.info("TCC System Audio Recording: probe deferred to session start")
     }
 
 }

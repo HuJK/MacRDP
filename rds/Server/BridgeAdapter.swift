@@ -163,20 +163,19 @@ final class BridgePeer: @unchecked Sendable {
             cfg.enable_nla = 0
             cfg.auth_gate = 1
         case .deny(let reason):
-            Log.server.error("Login policy refused: \(reason, privacy: .public)")
+            LogTo.server.error("Login policy refused: \(reason)")
             throw MacRDPError.bridgeFailed(rc: MACRDP_E_NLA_FAILED)
         }
         cfg.default_bitrate_kbps     = Int32(config.video.bitrateKbps)
         cfg.default_max_fps          = Int32(config.video.maxFps)
-        cfg.prefer_avc444            = config.video.preferAVC444 ? 1 : 0
         cfg.max_outstanding_frames   = Int32(config.video.maxOutstandingFrames)
-        cfg.avc420_qp                = Int32(config.video.avc420Qp)
-        cfg.avc420_quality_val       = Int32(config.video.avc420QualityVal)
-        // Hybrid mode can override the AVC420 quant hint for its video region.
+        cfg.avc420_qp                = Int32(config.video.avc420.qp)
+        cfg.avc420_quality_val       = Int32(config.video.avc420.qualityVal)
+        // Hybrid mode has its own AVC420 quant hint for its video region —
+        // independent of `video.avc420.*` now (no cross-section fallback).
         if config.video.codec.lowercased() == "hybrid" {
-            let hy = config.video.effectiveHybrid
-            cfg.avc420_qp          = Int32(hy.videoQp ?? config.video.avc420Qp)
-            cfg.avc420_quality_val = Int32(hy.videoQualityVal ?? config.video.avc420QualityVal)
+            cfg.avc420_qp          = Int32(config.video.tile.encoder.qp)
+            cfg.avc420_quality_val = Int32(config.video.tile.encoder.qualityVal)
         }
         cfg.enable_audio_out         = config.audioOut.effectivelyEnabled ? 1 : 0
         switch config.audioOut.codec.lowercased() {
@@ -185,14 +184,14 @@ final class BridgePeer: @unchecked Sendable {
         case "opus": cfg.audio_codec = 3
         default:     cfg.audio_codec = 2   // aac
         }
-        cfg.audio_lag_short_window_ms    = Int32(config.audioOut.lagShortWindowMs)
-        cfg.audio_lag_ref_window_ms      = Int32(config.audioOut.lagRefWindowMs)
-        cfg.audio_lag_drift_allowance_ms = Int32(config.audioOut.lagDriftAllowanceMs)
-        cfg.audio_max_lag_ms             = Int32(config.audioOut.maxLagMs)
+        cfg.audio_lag_short_window_ms    = Int32(config.audioOut.lag.shortWindowMs)
+        cfg.audio_lag_ref_window_ms      = Int32(config.audioOut.lag.refWindowMs)
+        cfg.audio_lag_drift_allowance_ms = Int32(config.audioOut.lag.driftAllowanceMs)
+        cfg.audio_max_lag_ms             = Int32(config.audioOut.lag.maxMs)
         cfg.enable_audio_in          = config.audioIn.enabled  ? 1 : 0
         cfg.enable_clipboard         = (config.clipboard.text || config.clipboard.image
                                         || config.clipboard.files) ? 1 : 0
-        cfg.enable_disp              = (config.display.resizeHook != nil) ? 1 : 0
+        cfg.enable_disp              = !config.display.resize.hook.isEmpty ? 1 : 0
         cfg.enable_rdpdr             = config.rdpdr.enabled ? 1 : 0
         // RDPECAM enumeration is cheap (just lists the client's cameras for the
         // menu); always on. The per-camera media channel isn't opened here.
@@ -205,8 +204,8 @@ final class BridgePeer: @unchecked Sendable {
         // FreeRDP copies the SAM path string (set_string) at create, but reads
         // the FILE later during NLA — so the file must persist for the session
         // (deleted in deinit). The path string only needs to be valid here.
-        let certPath = config.auth.certificateFile ?? ""
-        let keyPath  = config.auth.privateKeyFile  ?? ""
+        let certPath = config.auth.tls.certificateFile
+        let keyPath  = config.auth.tls.privateKeyFile
         let samPath  = self.samFilePath ?? ""
         let rc: Int32 = certPath.withCString { cPtr -> Int32 in
             keyPath.withCString { kPtr -> Int32 in

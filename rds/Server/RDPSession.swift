@@ -80,7 +80,7 @@ final class RDPSession {
             if let url = await domain.userVisibleURL(driveKey: driveKey) {
                 NSWorkspace.shared.open(url)
             } else {
-                Log.session.notice("openDrive: no user-visible URL yet for \(driveKey, privacy: .public)")
+                LogTo.session.notice("openDrive: no user-visible URL yet for \(driveKey)")
             }
         }
     }
@@ -232,12 +232,12 @@ final class RDPSession {
         do {
             try startBridge()
         } catch {
-            Log.session.error("Bridge start failed: \(String(describing: error), privacy: .public)")
+            LogTo.session.error("Bridge start failed: \(String(describing: error))")
             shutdown()
         }
         #else
         // Bridge not yet available (bridging header / xcconfig).
-        Log.session.notice("Bridge unavailable — closing fd=\(self.fd, privacy: .public)")
+        LogTo.session.notice("Bridge unavailable — closing fd=\(self.fd)")
         close(fd)
         onTerminated?()
         #endif
@@ -311,16 +311,16 @@ final class RDPSession {
                     pwLastSet: AccountPolicy.passwordLastSetTime(user: user))
                 return true
             case .wrongPassword:
-                Log.server.warning("Logon refused for \(user, privacy: .public): wrong password")
+                LogTo.server.warning("Logon refused for \(user): wrong password")
                 return false
             case .noSuchUser:
-                Log.server.warning("Logon refused for \(user, privacy: .public): no such local user")
+                LogTo.server.warning("Logon refused for \(user): no such local user")
                 return false
             case .accountDisabled:
-                Log.server.warning("Logon refused for \(user, privacy: .public): account disabled / expired / locked")
+                LogTo.server.warning("Logon refused for \(user): account disabled / expired / locked")
                 return false
             case .error(let msg):
-                Log.server.error("OpenDirectory verify error for \(user, privacy: .public): \(msg, privacy: .public)")
+                LogTo.server.error("OpenDirectory verify error for \(user): \(msg)")
                 return false   // fail closed
             }
         }
@@ -392,28 +392,28 @@ final class RDPSession {
                     do {
                         let enc = try AACEncoder()
                         self.audioPath?.setEncoder(enc, allowRawPCM: false)
-                        Log.audioOut.notice("Audio: AAC-LC selected (HW-accelerated encoder)")
+                        LogTo.audioOut.notice("Audio: AAC-LC selected (HW-accelerated encoder)")
                     } catch {
                         // AAC negotiated but encoder unavailable → drop (don't
                         // mislabel raw PCM as AAC).
-                        Log.audioOut.error("AAC encoder init failed, dropping audio: \(String(describing: error), privacy: .public)")
+                        LogTo.audioOut.error("AAC encoder init failed, dropping audio: \(String(describing: error))")
                         self.audioPath?.setEncoder(nil, allowRawPCM: false)
                     }
                 case .opus:
                     do {
                         let ao = self.config.audioOut
-                        let frames = max(120, 48 * max(1, ao.opusFrameMs))   // 48 samples/ms @ 48k
-                        let enc = try OpusEncoder(bitRate: max(8, ao.opusBitrateKbps) * 1000,
+                        let frames = max(120, 48 * max(1, ao.opus.frameMs))   // 48 samples/ms @ 48k
+                        let enc = try OpusEncoder(bitRate: max(8, ao.opus.bitrateKbps) * 1000,
                                                   framesPerPacket: frames)
                         self.audioPath?.setEncoder(enc, allowRawPCM: false)
-                        Log.audioOut.notice("Audio: Opus selected (AudioToolbox encoder)")
+                        LogTo.audioOut.notice("Audio: Opus selected (AudioToolbox encoder)")
                     } catch {
-                        Log.audioOut.error("Opus encoder init failed, dropping audio: \(String(describing: error), privacy: .public)")
+                        LogTo.audioOut.error("Opus encoder init failed, dropping audio: \(String(describing: error))")
                         self.audioPath?.setEncoder(nil, allowRawPCM: false)
                     }
                 case .pcm:
                     self.audioPath?.setEncoder(nil, allowRawPCM: true)
-                    Log.audioOut.notice("Audio: PCM selected")
+                    LogTo.audioOut.notice("Audio: PCM selected")
                 }
             }
         }
@@ -449,7 +449,7 @@ final class RDPSession {
             case 0x20: kind = "SMARTCARD"
             default:   kind = String(format: "0x%X", type)
             }
-            Log.session.notice("RDPDR device announced: id=\(id, privacy: .public) type=\(kind, privacy: .public) name='\(dos, privacy: .public)'")
+            LogTo.session.notice("RDPDR device announced: id=\(id) type=\(kind) name='\(dos)'")
             // Drive redirection only fires for filesystem devices.
             guard type == 0x08 else { return }
             // Hop to MainActor: each client gets its own FileProvider domain,
@@ -465,7 +465,7 @@ final class RDPSession {
             }
         }
         sinks.onRdpdrDeviceRemoved = { [weak self] id in
-            Log.session.notice("RDPDR device removed: id=\(id, privacy: .public)")
+            LogTo.session.notice("RDPDR device removed: id=\(id)")
             Task { @MainActor [weak self] in
                 guard let self, let bridge = self.bridge else { return }
                 if let key = DriveStore.shared.removeDrive(adapter: bridge, deviceID: id) {
@@ -519,19 +519,19 @@ final class RDPSession {
 
         let thread = Thread {
             let rc = peer.runLoop()
-            Log.session.info("Bridge run loop returned: \(rc, privacy: .public)")
+            LogTo.session.info("Bridge run loop returned: \(rc)")
         }
         thread.name = "com.macrdp.session.peer"
         thread.start()
         self.workerThread = thread
 
-        Log.session.info("Session started fd=\(self.fd, privacy: .public) cert=\(certPath, privacy: .public)")
+        LogTo.session.info("Session started fd=\(self.fd) cert=\(certPath)")
     }
 
     private func withTLSPaths(certPath: String, keyPath: String) -> Config {
         var c = config
-        c.auth.certificateFile = certPath
-        c.auth.privateKeyFile = keyPath
+        c.auth.tls.certificateFile = certPath
+        c.auth.tls.privateKeyFile = keyPath
         return c
     }
     #endif
@@ -541,7 +541,7 @@ final class RDPSession {
     private func onActivated(width: Int, height: Int,
                              bpp: Int, connectionType: Int,
                              audioMode: BridgePeer.AudioMode) {
-        Log.session.notice("Peer activated: \(width, privacy: .public)x\(height, privacy: .public)@\(bpp, privacy: .public)bpp connType=\(connectionType, privacy: .public) audio=\(String(describing: audioMode), privacy: .public)")
+        LogTo.session.notice("Peer activated: \(width)x\(height)@\(bpp)bpp connType=\(connectionType) audio=\(String(describing: audioMode))")
 
         // Seed the per-session display mapping. Phase 1 binds slot 0 to
         // the primary CGDirectDisplayID; Phase 8 multi-monitor binds N.
@@ -585,7 +585,7 @@ final class RDPSession {
         // the activated size; the real capture size arrives via onResolved.
         let hybridCoord: HybridCoordinator?
         if config.video.codec.lowercased() == "hybrid" {
-            let tileSize = config.video.effectiveHybrid.tileSize
+            let tileSize = config.video.tile.tileSize
             let seed = TileGrid(width: width, height: height, tileSize: tileSize)
             let coord = HybridCoordinator(config: config, bridge: bridge, initialGrid: seed)
             self.hybridCoordinator = coord
@@ -597,8 +597,8 @@ final class RDPSession {
         // Hardware cursor: capture without the pointer baked in and stream it
         // over the RDP pointer channel instead.
         let cursorPipe: CursorPipeline?
-        if config.effectiveCursor.hardwareCursor {
-            let cp = CursorPipeline(bridge: bridge, config: config.effectiveCursor)
+        if config.cursor.hardwareCursor {
+            let cp = CursorPipeline(bridge: bridge, config: config.cursor)
             self.cursorPipeline = cp
             cursorPipe = cp
             cp.start()
@@ -634,7 +634,7 @@ final class RDPSession {
         let pipeline: DisplayPipeline
         switch config.video.codec.lowercased() {
         case "hybrid":
-            Log.encoder.notice("Using RDPGFX codec: hybrid (per-tile AVC420 + Progressive)")
+            LogTo.encoder.notice("Using RDPGFX codec: hybrid (per-tile AVC420 + Progressive)")
             pipeline = DisplayPipeline(
                 config: config,
                 onAudioFrame: audioHandler,
@@ -644,7 +644,7 @@ final class RDPSession {
                     bridge.outstandingFrames >= maxOutstanding
                 })
         case "progressive":
-            Log.encoder.notice("Using RDPGFX codec: RemoteFX Progressive V2")
+            LogTo.encoder.notice("Using RDPGFX codec: RemoteFX Progressive V2")
             pipeline = DisplayPipeline(
                 config: config,
                 onRawFrame: { bgra, w, h, stride in
@@ -659,7 +659,7 @@ final class RDPSession {
                     bridge.outstandingFrames >= maxOutstanding
                 })
         default:   // "avc420" and unrecognized
-            Log.encoder.notice("Using RDPGFX codec: AVC420 (VideoToolbox H.264)")
+            LogTo.encoder.notice("Using RDPGFX codec: AVC420 (VideoToolbox H.264)")
             pipeline = DisplayPipeline(
                 config: config,
                 onEncodedFrame: { data, isIDR, pts in
@@ -694,10 +694,10 @@ final class RDPSession {
                 try mute.start()
                 self.audioOut = mute
             } catch {
-                Log.audioOut.error("local mute setup failed: \(String(describing: error), privacy: .public)")
+                LogTo.audioOut.error("local mute setup failed: \(String(describing: error))")
             }
         }
-        Log.audioOut.info("Audio out via SCK (mode=\(String(describing: audioMode), privacy: .public))")
+        LogTo.audioOut.info("Audio out via SCK (mode=\(String(describing: audioMode)))")
 
         // Audio in (client mic → Mac) — start the playback engine. PCM
         // arriving over AUDIN gets routed here. With a loopback output
@@ -711,7 +711,7 @@ final class RDPSession {
                 try inPipe.start()
                 self.audioIn = inPipe
             } catch {
-                Log.audioIn.error("audio in start failed: \(String(describing: error), privacy: .public)")
+                LogTo.audioIn.error("audio in start failed: \(String(describing: error))")
             }
         }
 
@@ -747,7 +747,7 @@ final class RDPSession {
                 try clip.start()
                 self.clipboard = clip
             } catch {
-                Log.clip.error("clipboard start failed: \(String(describing: error), privacy: .public)")
+                LogTo.clipboard.error("clipboard start failed: \(String(describing: error))")
             }
         }
 
@@ -755,7 +755,7 @@ final class RDPSession {
         // Resize-policy collaborators: mode-setter ("setOnServer") and the
         // resize-hook driver ("cliCommand"). Selected per-screen in onDispLayout.
         self.displayModeController = DisplayModeController(
-            hidpiPolicy: config.display.resizeHiDPIPolicy)
+            hidpiPolicy: config.display.resize.hiDPIPolicy)
         self.displayControl = DisplayControl(
             config: config, pipeline: pipeline, mapping: displayMapping)
         let w = width, h = height
@@ -763,19 +763,19 @@ final class RDPSession {
             do {
                 try await pipeline.start(displayID: primary, width: w, height: h)
             } catch {
-                Log.display.error("display pipeline start failed: \(String(describing: error), privacy: .public)")
+                LogTo.display.error("display pipeline start failed: \(String(describing: error))")
             }
         }
         #endif
     }
 
     private func onClosed(reason: Int) {
-        Log.session.info("Peer closed: reason=\(reason, privacy: .public)")
+        LogTo.session.info("Peer closed: reason=\(reason)")
         shutdown()
     }
 
     private func onSuppressOutput(allow: Bool) {
-        Log.session.info("Client suppress_output: allow=\(allow, privacy: .public)")
+        LogTo.session.info("Client suppress_output: allow=\(allow)")
         if allow {
             displayPipeline?.resumeCapture()
         } else {
@@ -792,10 +792,10 @@ final class RDPSession {
             return
         }
         let slot = primary.rdpSlot
-        let policy = ResizePolicy(config.display.effectiveResizePolicy(slot: slot))
+        let policy = ResizePolicy(config.display.resize.policy(forSlot: slot))
         let w = primary.width, h = primary.height
         let scale = primary.scale
-        Log.resize.info("Client DISP request: slot=\(slot, privacy: .public) \(w, privacy: .public)x\(h, privacy: .public) scale=\(scale, privacy: .public) policy=\(policy.rawValue, privacy: .public)")
+        LogTo.resize.info("Client DISP request: slot=\(slot) \(w)x\(h) scale=\(scale) policy=\(policy.rawValue)")
         guard let pipeline = displayPipeline else { return }
 
         switch policy {
@@ -807,7 +807,7 @@ final class RDPSession {
             // pipeline.resize skips when the fit is already exact.
             Task { @MainActor in
                 do { try await pipeline.resize(width: w, height: h) }
-                catch { Log.resize.error("resize failed: \(String(describing: error), privacy: .public)") }
+                catch { LogTo.resize.error("resize failed: \(String(describing: error))") }
             }
 
         case .setOnServer:
@@ -821,12 +821,12 @@ final class RDPSession {
                 // fall back to resampling to the client size.
                 let (rw, rh) = fit ?? (w, h)
                 do { try await pipeline.resize(width: rw, height: rh) }
-                catch { Log.resize.error("setOnServer resize failed: \(String(describing: error), privacy: .public)") }
+                catch { LogTo.resize.error("setOnServer resize failed: \(String(describing: error))") }
             }
 
         case .cliCommand:
             guard let ctrl = displayControl else {
-                Log.resize.error("cliCommand policy but no DisplayControl / resize_hook configured")
+                LogTo.resize.error("cliCommand policy but no DisplayControl / resize_hook configured")
                 return
             }
             Task { @MainActor in await ctrl.handleClientResize(raw: monitors) }

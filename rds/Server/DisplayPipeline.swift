@@ -144,8 +144,8 @@ final class DisplayPipeline {
         currentWidth  = pxW
         currentHeight = pxH
         if pxW != reqW || pxH != reqH {
-            Log.display.notice(
-                "Aspect-fit: Mac \(macW, privacy: .public)x\(macH, privacy: .public) → capture \(pxW, privacy: .public)x\(pxH, privacy: .public) (client requested \(reqW, privacy: .public)x\(reqH, privacy: .public))")
+            LogTo.display.notice(
+                "Aspect-fit: Mac \(macW)x\(macH) → capture \(pxW)x\(pxH) (client requested \(reqW)x\(reqH))")
         }
         // Tell the rest of the stack about the resolved dimensions so
         // the bridge advertises them via RESETGRAPHICS and the input
@@ -168,7 +168,7 @@ final class DisplayPipeline {
         cfg.queueDepth = config.video.sckQueueDepth
         // Hardware cursor: keep the pointer OUT of the captured frame and send
         // it over the RDP pointer channel instead (see CursorPipeline).
-        cfg.showsCursor = !config.effectiveCursor.hardwareCursor
+        cfg.showsCursor = !config.cursor.hardwareCursor
         cfg.colorSpaceName = CGColorSpace.sRGB
         // System audio capture (SCK 14+). Cheaper and more reliable than
         // building our own CATap-on-aggregate-device — Apple's own
@@ -189,7 +189,7 @@ final class DisplayPipeline {
             // H.264 whites/blacks match the Progressive tiles — see NV12Converter.
             // fullRangeVideo=false (debug) skips it: BGRA → VT limited range, so
             // H.264 tiles render darker and the codec map is visible by eye.
-            let fullRange = config.video.effectiveHybrid.fullRangeVideo
+            let fullRange = config.video.tile.encoder.fullRangeVideo
             let encoderSettings = H264Encoder.Settings.from(
                 config.video, width: pxW, height: pxH,
                 pixelFormat: fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -246,7 +246,7 @@ final class DisplayPipeline {
         if onAudioFrame != nil {
             try stream.addStreamOutput(proxy, type: .audio,
                                        sampleHandlerQueue: audioQueue)
-            Log.audioOut.info("SCK system audio capture enabled")
+            LogTo.audioOut.info("SCK system audio capture enabled")
         }
         try await stream.startCapture()
         self.stream = stream
@@ -258,7 +258,7 @@ final class DisplayPipeline {
         reconnectAttempts = 0
         reconnectInProgress = false
 
-        Log.display.info("Display capture started \(pxW, privacy: .public)x\(pxH, privacy: .public) (CGDirectDisplayID=\(self.currentDisplayID, privacy: .public))")
+        LogTo.display.info("Display capture started \(pxW)x\(pxH) (CGDirectDisplayID=\(self.currentDisplayID))")
     }
 
     func stop() {
@@ -294,7 +294,7 @@ final class DisplayPipeline {
         // Backoff: 1s, 2s, 4s, ..., capped at 30s.
         let delaySec = min(pow(2.0, Double(reconnectAttempts)), 30.0)
         reconnectAttempts += 1
-        Log.display.notice("SCStream lost (\(String(describing: error), privacy: .public)); reconnect attempt \(self.reconnectAttempts, privacy: .public) in \(delaySec, privacy: .public)s")
+        LogTo.display.notice("SCStream lost (\(String(describing: error))); reconnect attempt \(self.reconnectAttempts) in \(delaySec)s")
 
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
@@ -315,9 +315,9 @@ final class DisplayPipeline {
             try await start(displayID: id, width: w, height: h)
             reconnectAttempts = 0
             reconnectInProgress = false
-            Log.display.info("SCStream reconnected on display \(id, privacy: .public) \(w, privacy: .public)x\(h, privacy: .public)")
+            LogTo.display.info("SCStream reconnected on display \(id) \(w)x\(h)")
         } catch {
-            Log.display.error("SCStream reconnect failed: \(String(describing: error), privacy: .public)")
+            LogTo.display.error("SCStream reconnect failed: \(String(describing: error))")
             reconnectInProgress = false
             // Treat the failure itself as another stop event so we
             // keep retrying with backoff.
@@ -351,7 +351,7 @@ final class DisplayPipeline {
         // already capture (covers "one dim equal, the other larger" and "both
         // equal") — avoids a needless SCStream reconfigure + latency hit.
         if pxW == currentWidth && pxH == currentHeight {
-            Log.display.info("Resize \(width, privacy: .public)x\(height, privacy: .public) → no-op (already \(pxW, privacy: .public)x\(pxH, privacy: .public))")
+            LogTo.display.info("Resize \(width)x\(height) → no-op (already \(pxW)x\(pxH))")
             return
         }
 
@@ -364,7 +364,7 @@ final class DisplayPipeline {
         cfg.minimumFrameInterval = CMTime(value: 1,
             timescale: CMTimeScale(max(config.video.maxFps * 2, 120)))
         cfg.queueDepth = config.video.sckQueueDepth
-        cfg.showsCursor = !config.effectiveCursor.hardwareCursor
+        cfg.showsCursor = !config.cursor.hardwareCursor
 
         try await stream.updateConfiguration(cfg)
 
@@ -390,7 +390,7 @@ final class DisplayPipeline {
         self.currentWidth = pxW
         self.currentHeight = pxH
         self.nextForceKeyframe = true
-        Log.display.info("Display resize \(pxW, privacy: .public)x\(pxH, privacy: .public) (client requested \(width, privacy: .public)x\(height, privacy: .public))")
+        LogTo.display.info("Display resize \(pxW)x\(pxH) (client requested \(width)x\(height))")
         onDimensionsResolved?(pxW, pxH)
     }
 
@@ -435,7 +435,7 @@ final class DisplayPipeline {
                 let drift = wallElapsed - ptsElapsed
                 let avgSend = sumSendMs / Double(samples)
                 lock.unlock()
-                Log.audioOut.info("Audio: rate=\(Int(measuredRate), privacy: .public)Hz drift=\(Int(drift*1000), privacy: .public)ms chunk(min/max)=\(self.minChunk == .max ? -1 : self.minChunk, privacy: .public)/\(self.maxChunk, privacy: .public) send(avg/max)=\(Int(avgSend), privacy: .public)/\(Int(self.maxSendMs), privacy: .public)ms")
+                LogTo.audioOut.info("Audio: rate=\(Int(measuredRate))Hz drift=\(Int(drift*1000))ms chunk(min/max)=\(self.minChunk == .max ? -1 : self.minChunk)/\(self.maxChunk) send(avg/max)=\(Int(avgSend))/\(Int(self.maxSendMs))ms")
                 lock.lock()
                 lastLogWall = now
                 maxChunk = 0; minChunk = .max
@@ -597,7 +597,7 @@ final class DisplayPipeline {
             let encodeInput: CVPixelBuffer
             if let converter = nv12Converter {
                 guard let nv12 = converter.convert(bgraInput) else {
-                    Log.encoder.error("hybrid: NV12 conversion failed; dropping frame")
+                    LogTo.encoder.error("hybrid: NV12 conversion failed; dropping frame")
                     nextForceKeyframe = true
                     return
                 }
@@ -615,7 +615,7 @@ final class DisplayPipeline {
                                     forceKeyframe: force || forceFromSink,
                                     userData: payload)
             } catch {
-                Log.encoder.error("hybrid encode failed: \(String(describing: error), privacy: .public)")
+                LogTo.encoder.error("hybrid encode failed: \(String(describing: error))")
             }
             return
         }
@@ -637,7 +637,7 @@ final class DisplayPipeline {
         do {
             try encoder?.encode(pixelBuffer: pixel, pts: pts, forceKeyframe: force)
         } catch {
-            Log.encoder.error("encode failed: \(String(describing: error), privacy: .public)")
+            LogTo.encoder.error("encode failed: \(String(describing: error))")
         }
     }
 }
@@ -669,7 +669,7 @@ private final class StreamOutputProxy: NSObject, SCStreamOutput, SCStreamDelegat
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        Log.display.error("SCStream stopped: \(String(describing: error), privacy: .public)")
+        LogTo.display.error("SCStream stopped: \(String(describing: error))")
         onStopped(error)
     }
 }

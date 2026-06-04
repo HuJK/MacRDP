@@ -1,0 +1,197 @@
+# MacRDP example config.
+#
+# Every key shown here is OPTIONAL. Anything you omit falls back to the
+# typed default in rds/CLI/DefaultConfig.swift. Pass this file with
+# `macrdp-server --config /path/to/config.yaml`. Without --config, the
+# server runs with all defaults (no filesystem search).
+#
+# Layout rules:
+#   - Top-level sections (listen, auth, video, …) match the structure in
+#     rds/CLI/Config.swift exactly.
+#   - Unknown keys are an error (helps catch typos early).
+#   - Maps merge with defaults (so partial overrides work); lists fully
+#     replace.
+
+listen:
+  host: 0.0.0.0
+  port: 3389
+
+auth:
+  # "self" → MacRDP runs as the current user; that user logs in.
+  # "fixed" → use `username` below.
+  authUserPolicy: self
+  username: ""
+
+  # "local"  → verify against macOS account via OpenDirectory (default)
+  # "serial" → NLA against the Mac's serial as the password
+  # "nthash" → NLA against the configured ntHash (use `rds nthash`)
+  # "none"   → accept anyone (DANGEROUS; opt-in)
+  passwordPolicy: local
+  domain: ""
+  ntHash: ""
+
+  tls:
+    # Empty → auto-generate at ~/Library/Application Support/MacRDP/{cert,key}.pem
+    certificateFile: ""
+    privateKeyFile: ""
+    certificateValidityDays: 3650
+    rsaKeyBits: 2048
+
+video:
+  bitrateKbps: 25000
+  keyframeIntervalFrames: 120
+  hwAcceleration: required        # required | allow | disable
+  maxFps: 60
+  useClientHint: true
+  useBandwidthAutodetect: true
+  dataRate:
+    burstMultiplier: 1.5
+    burstSeconds: 1
+  maxFrameDelayCount: 0
+  sckQueueDepth: 5
+  maxOutstandingFrames: 2
+
+  # AVC420 quant hints sent in metablocks for client QoE reporting.
+  # Don't drive our encoder — VideoToolbox picks its own QP.
+  avc420:
+    qp: 22
+    qualityVal: 100
+
+  codec: hybrid                   # avc420 | progressive | hybrid
+
+  # Adaptive presets keyed by connection-type hint.
+  profiles:
+    lan:       { bitrateKbps: 25000, maxFps: 60 }
+    broadband: { bitrateKbps: 10000, maxFps: 30 }
+    modem:     { bitrateKbps:  1500, maxFps: 15 }
+
+  tile:
+    # Structural — there's one tile grid the masker and encoder both have to
+    # agree on, so this stays shared across classifiers by construction.
+    tileSize: 64
+
+    # Ordered fallback chain. Each frame uses the first classifier whose
+    # data requirements are met. If all entries need dirtyRects and they're
+    # unavailable, the server logs a fault and exits.
+    classifiers: [dirtyFreqDR]
+
+    # Each classifier owns its OWN sub-config — including cadence (when to
+    # run) and switching (hysteresis + settle for its outputs). Two
+    # classifiers cannot share a tuning even when they look similar.
+    blobDR:
+      tileActiveCoverage: 0.02
+      largeRegionTiles: 12
+      analysis:   { frameInterval: 2, minIntervalMs: 33 }
+      switching:  { hysteresisFrames: 3, settleRepaint: true }
+    dirtyFreqDR:
+      tileActiveCoverage: 0.02
+      historyFrames: 30
+      videoFractionEnter: 0.9
+      videoFractionExit: 0.4
+      analysis:   { frameInterval: 2, minIntervalMs: 33 }
+      switching:  { hysteresisFrames: 3, settleRepaint: true }
+    pixelRate:
+      tileActiveCoverage: 0.02
+      perFrameCoverageThreshold: 0.1
+      historyFrames: 30
+      videoFractionEnter: 0.9
+      videoFractionExit: 0.4
+      # pixelRate is the expensive one — feel free to dial these back when
+      # you make it the active classifier (e.g. frameInterval: 4).
+      analysis:   { frameInterval: 2, minIntervalMs: 33 }
+      switching:  { hysteresisFrames: 3, settleRepaint: true }
+
+    # Applied to the classifier's OUTPUT regardless of which one ran. Not a
+    # per-classifier tuning.
+    mask:
+      enable: false
+      colorBGRA: 4278190080       # 0xFF000000 — opaque black
+      haloTiles: 2
+
+    encoder:
+      fullRangeVideo: true
+      qp: 22                       # Independent of video.avc420.qp
+      qualityVal: 100
+
+display:
+  resize:
+    policy: resize                # none | resize | setOnServer | cliCommand
+    perSlot: {}                   # e.g. {"0": "setOnServer", "1": "resize"}
+    hook: ""                      # required when policy=cliCommand
+    timeoutSeconds: 3.0
+    hiDPIPolicy: client           # client | force | off
+  captureDisplayID: 0             # 0 = main; ignored if monitors is non-empty
+  monitors: []                    # e.g. [{rdpSlot: 0, macDisplay: "main"}]
+
+input:
+  wheelPixelsPerNotch: 50
+
+cursor:
+  hardwareCursor: true
+  pollIntervalMs: 16
+  allowLargePointer: true
+  streamPosition: false
+
+tray:
+  enabled: true
+
+audioOut:
+  enabled: true
+  codec: aac                       # none | pcm | aac | opus
+  muteLocalOutput: always          # never | whileTapped | always
+  opus:
+    frameMs: 10                    # 2.5/5/10/20/40/60
+    bitrateKbps: 96
+  lag:
+    shortWindowMs: 1000
+    refWindowMs: 20000
+    driftAllowanceMs: 80           # 0 disables drift detection
+    maxMs: 500                     # 0 disables hard backstop
+
+audioIn:
+  enabled: true
+  outputDeviceUID: ""              # e.g. "BlackHole2ch_UID"
+
+clipboard:
+  text: true
+  image: true
+  files: true
+  maxFileSizeMiB: 4096
+  pollIntervalMs: 200
+  fileFetchMode: lazy              # eager | lazy
+  speedStatsWindowSec: 4.0
+  showInFinder: false
+  echo:
+    suppressMs: 500
+    cancelReleaseMs: 3000
+
+rdpdr:
+  enabled: true
+
+log:
+  # Fallback level for any source not present in `sources` below.
+  default: notice                  # debug | info | notice | warning | error | fault
+
+  # Message-formatting knobs. Both off → bare message in the log line
+  # (Console.app already shows timestamp + category in its own columns).
+  # Turn them on when piping the unified log to a plain-text stream that
+  # loses that metadata.
+  format:
+    timestamp: false               # prepend "HH:mm:ss.SSS "
+    prefix: false                  # prepend "[<source>] "
+
+  # Per-source levels. Every known source name is listed below so this file
+  # doubles as the discovery point for what's tunable. Override a line to
+  # raise (or lower) just that subsystem.
+  sources:
+    server:    notice  # bootstrap, TLS provisioning, signal handlers
+    listener:  notice  # accept loop, kicks, new-peer arrival
+    session:   notice  # per-peer lifecycle, RDPDR device announces
+    display:   notice  # ScreenCaptureKit, capture reconnects
+    encoder:   notice  # VT H.264, tile classifier setup, codec picks
+    audio.out: notice  # system-audio capture, codec, lag stats
+    audio.in:  notice  # client mic, loopback device routing
+    clipboard: notice  # format lists, file copy events, bridge lifecycle
+    input:     notice  # keyboard/mouse injection, sticky modifiers
+    resize:    notice  # client DISP requests, mode setter, resize hook
+    config:    notice  # config load, display-binding resolution

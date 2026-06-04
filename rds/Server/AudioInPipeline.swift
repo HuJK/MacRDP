@@ -35,7 +35,7 @@ final class AudioInPipeline: @unchecked Sendable {
 
     func start() throws {
         guard config.audioIn.enabled else {
-            Log.audioIn.info("audio in disabled by config")
+            LogTo.audioIn.info("audio in disabled by config")
             return
         }
 
@@ -44,14 +44,15 @@ final class AudioInPipeline: @unchecked Sendable {
         //  - Otherwise auto-detect a known loopback driver (BlackHole)
         //    so Mac apps can pick it as their microphone source.
         //  - Otherwise fall back to default output (audible — diagnostic only).
-        if let wantedUID = config.audioIn.outputDeviceUID {
+        let wantedUID = config.audioIn.outputDeviceUID
+        if !wantedUID.isEmpty {
             try applyOutputDevice(uid: wantedUID)
-            Log.audioIn.info("AUDIN → output device UID=\(wantedUID, privacy: .public)")
+            LogTo.audioIn.info("AUDIN → output device UID=\(wantedUID)")
         } else if let bh = Self.findLoopbackDevice() {
             try applyOutputDevice(uid: bh.uid)
-            Log.audioIn.notice("AUDIN auto-routed to loopback device: \(bh.name, privacy: .public) (UID=\(bh.uid, privacy: .public))")
+            LogTo.audioIn.notice("AUDIN auto-routed to loopback device: \(bh.name) (UID=\(bh.uid))")
         } else {
-            Log.audioIn.notice("AUDIN: no loopback device (BlackHole/Loopback) detected; mic audio will play on default output. Install BlackHole to route into Mac apps as a virtual mic.")
+            LogTo.audioIn.notice("AUDIN: no loopback device (BlackHole/Loopback) detected; mic audio will play on default output. Install BlackHole to route into Mac apps as a virtual mic.")
         }
 
         // Standard 48 kHz / Int16 / stereo for now; later we negotiate.
@@ -67,7 +68,7 @@ final class AudioInPipeline: @unchecked Sendable {
 
         try engine.start()
         player.play()
-        Log.audioIn.info("Audio in playback ready")
+        LogTo.audioIn.info("Audio in playback ready")
     }
 
     func stop() {
@@ -104,7 +105,7 @@ final class AudioInPipeline: @unchecked Sendable {
 
     private func applyOutputDevice(uid: String) throws {
         guard let deviceID = Self.findDevice(byUID: uid) else {
-            Log.audioIn.error("output device UID \(uid, privacy: .public) not found")
+            LogTo.audioIn.error("output device UID \(uid) not found")
             return
         }
         let outputUnit = engine.outputNode.audioUnit
@@ -117,7 +118,7 @@ final class AudioInPipeline: @unchecked Sendable {
             &did,
             UInt32(MemoryLayout<AudioDeviceID>.size))
         if status != noErr {
-            Log.audioIn.error("AudioUnitSetProperty(CurrentDevice) failed: \(status, privacy: .public)")
+            LogTo.audioIn.error("AudioUnitSetProperty(CurrentDevice) failed: \(status)")
         }
     }
 

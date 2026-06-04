@@ -193,8 +193,9 @@ enum ExerciseMode {
             print("usage: macrdp exercise hook <width> <height> <refresh-hz>")
             return
         }
-        guard let template = config.display.resizeHook else {
-            print("no resize_hook configured"); return
+        let template = config.display.resize.hook
+        guard !template.isEmpty else {
+            print("no display.resize.hook configured"); return
         }
         let primaryID = CGMainDisplayID()
         let request = MonitorLayoutRequest(monitors: [
@@ -206,7 +207,7 @@ enum ExerciseMode {
                           primary: true)
         ])
         let hook = ResizeHook(template: template,
-                              timeoutSeconds: config.display.resizeTimeoutSeconds)
+                              timeoutSeconds: config.display.resize.timeoutSeconds)
         do {
             try await hook.run(request)
             print("Hook completed OK")

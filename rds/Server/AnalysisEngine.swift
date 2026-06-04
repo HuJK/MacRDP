@@ -5,12 +5,19 @@
 //  Background driver for the hybrid codec's per-tile classification. Runs on
 //  its own serial queue, off the capture/encode hot path: the hot path hands
 //  it the latest frame + dirty rects (no copy); it asks the configured
-//  TileClassifier for a per-tile decision, applies the shared skip/settle/
-//  hysteresis pass, and publishes the tile map.
+//  TileClassifier for a per-tile decision, applies the active classifier's
+//  skip/settle/hysteresis pass, and publishes the tile map.
 //
-//  No silent fallback: if the selected classifier requires dirtyRects and they
-//  are unavailable, the engine logs a fault and exits so the operator switches
-//  `video.hybrid.classifier` to one that doesn't (e.g. "pixelRate").
+//  Every per-tick tunable — cadence (when to run), the dirty-vs-pixel data
+//  the classifier needs, and the post-classification stabilization — comes
+//  from THE classifier that runs this tick. The engine itself owns no
+//  tuning; it only orchestrates. See `Config.TileConfig` for the per-
+//  classifier sub-configs.
+//
+//  No silent fallback: if the chain has nothing whose data requirements are
+//  met this tick (every entry needs dirtyRects, none available), the engine
+//  logs a fault and exits so the operator switches `video.tile.classifiers`
+//  to one that doesn't (e.g. "pixelRate").
 //
 
 import Foundation
@@ -20,7 +27,6 @@ import CoreGraphics
 import os
 
 final class AnalysisEngine: @unchecked Sendable {
-    private let cfg: Config.HybridConfig
     private let store: TileCodecMapStore
     private let chain: [TileClassifier]     // ordered fallback chain
     private let queue = DispatchQueue(label: "com.macrdp.analysis", qos: .utility)
@@ -43,16 +49,15 @@ final class AnalysisEngine: @unchecked Sendable {
     private var submitCount: Int = 0
     private var lastAnalysisMs: UInt64 = 0
 
-    init(hybrid: Config.HybridConfig, store: TileCodecMapStore) {
-        self.cfg = hybrid
+    init(tile: Config.TileConfig, store: TileCodecMapStore) {
         self.store = store
         var built: [TileClassifier] = []
-        for name in hybrid.classifiers {
-            if let c = makeTileClassifier(named: name, cfg: hybrid) { built.append(c) }
-            else { Log.encoder.error("Ignoring unknown hybrid classifier \"\(name, privacy: .public)\"") }
+        for name in tile.classifiers {
+            if let c = makeTileClassifier(named: name, tile: tile) { built.append(c) }
+            else { LogTo.encoder.error("Ignoring unknown tile classifier \"\(name)\"") }
         }
         if built.isEmpty {
-            Log.encoder.fault("video.hybrid.classifiers has no valid entries \(hybrid.classifiers, privacy: .public); exiting")
+            LogTo.encoder.fault("video.tile.classifiers has no valid entries \(tile.classifiers); exiting")
             exit(EXIT_FAILURE)
         }
         self.chain = built
@@ -94,30 +99,48 @@ final class AnalysisEngine: @unchecked Sendable {
     }
 
     // MARK: - Drain / cadence
+    //
+    // Each tick picks the active classifier from the chain BEFORE gating the
+    // cadence, because cadence is the active classifier's tuning. Pick uses a
+    // peek at `pendingDirtyValid` (lock held, no reset). If gates pass, we
+    // re-take the dirty state under lock and re-pick if dirtyValid flipped
+    // during the peek→take window (it can only go true→false; a submit doesn't
+    // reset it). That keeps the chosen classifier and the data it receives
+    // consistent without holding the lock across the gate.
 
     private func drain() {
+        // 1. Dequeue frame pointer; peek dirtyValid (read-only).
         pendingLock.lock()
         let pixel = pendingPixel
         let submittedGrid = pendingGrid
         pendingPixel = nil
         pendingGrid = nil
         drainScheduled = false
+        let dirtyValidPeek = pendingDirtyValid
         pendingLock.unlock()
 
         guard let pixel, let submittedGrid else { return }
         guard submittedGrid == grid else { return }   // resize raced ahead
 
         submitCount &+= 1
-        let interval = max(1, cfg.analysisFrameInterval)
-        // Skipping for cadence/rate keeps the accumulated dirty rects so the
-        // next real analysis sees every change since the last one.
-        if submitCount % interval != 0 { return }
-        let now = nowMs()
-        if cfg.analysisMinIntervalMs > 0,
-           now &- lastAnalysisMs < UInt64(cfg.analysisMinIntervalMs) {
+
+        // 2. Pick active classifier from the chain using the peeked state.
+        guard let activePeek = pickClassifier(dirtyValid: dirtyValidPeek) else {
+            faultChainExhausted()
             return
         }
 
+        // 3. Cadence gate, using THIS classifier's cadence. Skipping leaves
+        //    the accumulated dirty rects in place for the next real tick.
+        let interval = max(1, activePeek.analysis.frameInterval)
+        if submitCount % interval != 0 { return }
+        let now = nowMs()
+        if activePeek.analysis.minIntervalMs > 0,
+           now &- lastAnalysisMs < UInt64(activePeek.analysis.minIntervalMs) {
+            return
+        }
+
+        // 4. Take the dirty state for real.
         pendingLock.lock()
         let dirty = pendingDirty
         let dirtyValid = pendingDirtyValid
@@ -125,37 +148,58 @@ final class AnalysisEngine: @unchecked Sendable {
         pendingDirtyValid = true
         pendingLock.unlock()
 
+        // 5. If dirtyValid changed between peek and take (only true→false is
+        //    possible — submit never re-validates), re-pick. We don't re-gate:
+        //    cadence already passed once, and the chosen classifier still
+        //    deserves its hysteresis applied to this tick's output.
+        let active: TileClassifier
+        if dirtyValid == dirtyValidPeek {
+            active = activePeek
+        } else if let repicked = pickClassifier(dirtyValid: dirtyValid) {
+            active = repicked
+        } else {
+            faultChainExhausted()
+            return
+        }
+
         lastAnalysisMs = now
-        analyze(pixel, dirty: dirty, dirtyValid: dirtyValid)
+        analyze(pixel, dirty: dirty, dirtyValid: dirtyValid, active: active)
+    }
+
+    private func pickClassifier(dirtyValid: Bool) -> TileClassifier? {
+        for c in chain where !c.requiresDirtyRects || dirtyValid { return c }
+        return nil
+    }
+
+    private func faultChainExhausted() -> Never {
+        let names = chain.map { $0.name }.joined(separator: ", ")
+        LogTo.encoder.fault("""
+            Hybrid classifier chain [\(names)] is exhausted: every \
+            entry requires ScreenCaptureKit dirtyRects, which are unavailable. Add \
+            "pixelRate" to video.tile.classifiers, or set video.codec to a non-hybrid \
+            codec. Exiting.
+            """)
+        exit(EXIT_FAILURE)
     }
 
     // MARK: - Analyze
 
-    private func analyze(_ pixel: CVPixelBuffer, dirty: [CGRect], dirtyValid: Bool) {
+    private func analyze(_ pixel: CVPixelBuffer, dirty: [CGRect], dirtyValid: Bool,
+                         active classifier: TileClassifier) {
         guard grid.cols > 0, grid.rows > 0, grid.tileCount == lastCodec.count else { return }
-
-        // Walk the fallback chain: first classifier whose requirements are met.
-        var chosen: TileClassifier?
-        for c in chain where !c.requiresDirtyRects || dirtyValid { chosen = c; break }
-        guard let classifier = chosen else {
-            // Chain exhausted — every classifier needs dirtyRects, none available.
-            let names = chain.map { $0.name }.joined(separator: ", ")
-            Log.encoder.fault("""
-                Hybrid classifier chain [\(names, privacy: .public)] is exhausted: every \
-                entry requires ScreenCaptureKit dirtyRects, which are unavailable. Add \
-                "pixelRate" to video.hybrid.classifiers, or set video.codec to a non-hybrid \
-                codec. Exiting.
-                """)
-            exit(EXIT_FAILURE)
-        }
 
         let (active, desired) = classifier.classify(
             grid: grid, primed: primed,
             dirtyRects: dirtyValid ? dirty : nil, pixel: pixel)
         guard active.count == grid.tileCount, desired.count == grid.tileCount else { return }
 
-        // Shared finalize: skip / settle for inactive tiles, hysteresis on switches.
-        let H = max(1, cfg.codecSwitchHysteresisFrames)
+        // Finalize using THIS classifier's switching tuning — hysteresis on
+        // codec changes, optional Progressive settle when a video tile goes
+        // idle. Both knobs come from the classifier so two classifiers can't
+        // share a stabilization profile by accident.
+        let switching = classifier.switching
+        let H = max(1, switching.hysteresisFrames)
+        let settleRepaint = switching.settleRepaint
         var newTiles = [UInt8](repeating: TileCodec.skip.rawValue, count: grid.tileCount)
         for i in 0..<grid.tileCount {
             if active[i] {
@@ -172,7 +216,7 @@ final class AnalysisEngine: @unchecked Sendable {
                 newTiles[i] = final
                 wasActive[i] = true
             } else {
-                if wasActive[i] && cfg.settleRepaint && lastCodec[i] == TileCodec.h264.rawValue {
+                if wasActive[i] && settleRepaint && lastCodec[i] == TileCodec.h264.rawValue {
                     newTiles[i] = TileCodec.progressive.rawValue
                     lastCodec[i] = TileCodec.progressive.rawValue
                 } else {

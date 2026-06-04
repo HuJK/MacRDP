@@ -32,7 +32,7 @@ final class FrameCounter: @unchecked Sendable {
             self.bytes = 0
             self.lastTick = now
             lock.unlock()
-            Log.encoder.info("encoded \(f, privacy: .public) frames/s, \(i, privacy: .public) IDR, \(b / 1024, privacy: .public) KiB/s")
+            LogTo.encoder.info("encoded \(f) frames/s, \(i) IDR, \(b / 1024) KiB/s")
             return
         }
         lock.unlock()

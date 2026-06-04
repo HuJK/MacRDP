@@ -40,7 +40,7 @@ final class NV12Converter {
             kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2, &range, &info,
             kvImageARGB8888, kvImage420Yp8_CbCr8, vImage_Flags(kvImageNoFlags))
         guard err == kvImageNoError else {
-            Log.encoder.error("NV12Converter: GenerateConversion failed (\(err))")
+            LogTo.encoder.error("NV12Converter: GenerateConversion failed (\(err))")
             return nil
         }
     }
@@ -94,7 +94,7 @@ final class NV12Converter {
         let err = vImageConvert_ARGB8888To420Yp8_CbCr8(
             &src, &yp, &cbcr, &info, permute, vImage_Flags(kvImageNoFlags))
         guard err == kvImageNoError else {
-            Log.encoder.error("NV12Converter: convert failed (\(err))")
+            LogTo.encoder.error("NV12Converter: convert failed (\(err))")
             return nil
         }
         return nv12

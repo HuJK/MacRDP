@@ -36,6 +36,13 @@ import CoreGraphics
 protocol TileClassifier: AnyObject {
     var name: String { get }
     var requiresDirtyRects: Bool { get }
+    /// Cadence the engine should use while THIS classifier is the active one
+    /// (when to run / how often). Lives with the classifier so two classifiers
+    /// can't accidentally share a cadence.
+    var analysis: Config.TileConfig.AnalysisCadence { get }
+    /// Post-classification stabilization (hysteresis + settle) the engine
+    /// applies to THIS classifier's output. Same reason — no sharing.
+    var switching: Config.TileConfig.SwitchingConfig { get }
     /// Re-size internal state for a new grid (resolution change).
     func reset(grid: TileGrid)
     /// Per-tile decision for one frame. `dirtyRects` is guaranteed non-nil when
@@ -46,12 +53,14 @@ protocol TileClassifier: AnyObject {
         -> (active: [Bool], desired: [UInt8])
 }
 
-/// Build one classifier by name, or nil if the name is unknown.
-func makeTileClassifier(named name: String, cfg: Config.HybridConfig) -> TileClassifier? {
+/// Build one classifier by name, or nil if the name is unknown. Each
+/// classifier gets only ITS sub-config from `tile`; the nested layout in
+/// `Config.swift` is the source of truth for which knobs are whose.
+func makeTileClassifier(named name: String, tile: Config.TileConfig) -> TileClassifier? {
     switch name.lowercased() {
-    case "blobdr":      return BlobDRClassifier(cfg: cfg)
-    case "dirtyfreqdr": return DirtyFreqDRClassifier(cfg: cfg)
-    case "pixelrate":   return PixelRateClassifier(cfg: cfg)
+    case "blobdr":      return BlobDRClassifier(cfg: tile.blobDR)
+    case "dirtyfreqdr": return DirtyFreqDRClassifier(cfg: tile.dirtyFreqDR)
+    case "pixelrate":   return PixelRateClassifier(cfg: tile.pixelRate)
     default:            return nil
     }
 }
@@ -192,8 +201,10 @@ private func classifyByRegionArea(active: [Bool], grid g: TileGrid,
 final class BlobDRClassifier: TileClassifier {
     let name = "blobDR"
     let requiresDirtyRects = true
-    private let cfg: Config.HybridConfig
-    init(cfg: Config.HybridConfig) { self.cfg = cfg }
+    private let cfg: Config.TileConfig.BlobDRConfig
+    var analysis:  Config.TileConfig.AnalysisCadence { cfg.analysis }
+    var switching: Config.TileConfig.SwitchingConfig { cfg.switching }
+    init(cfg: Config.TileConfig.BlobDRConfig) { self.cfg = cfg }
     func reset(grid: TileGrid) {}
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
         -> (active: [Bool], desired: [UInt8]) {
@@ -211,9 +222,11 @@ final class BlobDRClassifier: TileClassifier {
 final class DirtyFreqDRClassifier: TileClassifier {
     let name = "dirtyFreqDR"
     let requiresDirtyRects = true
-    private let cfg: Config.HybridConfig
+    private let cfg: Config.TileConfig.DirtyFreqDRConfig
     private let history = BitHistory()
-    init(cfg: Config.HybridConfig) { self.cfg = cfg }
+    var analysis:  Config.TileConfig.AnalysisCadence { cfg.analysis }
+    var switching: Config.TileConfig.SwitchingConfig { cfg.switching }
+    init(cfg: Config.TileConfig.DirtyFreqDRConfig) { self.cfg = cfg }
     func reset(grid: TileGrid) { history.reset(grid.tileCount) }
     func classify(grid: TileGrid, primed: Bool, dirtyRects: [CGRect]?, pixel: CVPixelBuffer)
         -> (active: [Bool], desired: [UInt8]) {
@@ -223,7 +236,7 @@ final class DirtyFreqDRClassifier: TileClassifier {
         let active = primed ? touched : [Bool](repeating: true, count: grid.tileCount)
         history.push(touched)
         let desired = history.desired(active: active,
-                                      windowFrames: cfg.coverageHistoryFrames,
+                                      windowFrames: cfg.historyFrames,
                                       enterFraction: cfg.videoFractionEnter,
                                       exitFraction: cfg.videoFractionExit)
         return (active, desired)
@@ -330,11 +343,13 @@ final class CPUPixelRateBackend: PixelRateBackend {
 final class PixelRateClassifier: TileClassifier {
     let name = "pixelRate"
     let requiresDirtyRects = false
-    private let cfg: Config.HybridConfig
+    private let cfg: Config.TileConfig.PixelRateConfig
     private let history = BitHistory()
     private let backend: PixelRateBackend
+    var analysis:  Config.TileConfig.AnalysisCadence { cfg.analysis }
+    var switching: Config.TileConfig.SwitchingConfig { cfg.switching }
 
-    init(cfg: Config.HybridConfig, backend: PixelRateBackend = CPUPixelRateBackend()) {
+    init(cfg: Config.TileConfig.PixelRateConfig, backend: PixelRateBackend = CPUPixelRateBackend()) {
         self.cfg = cfg
         self.backend = backend
     }
@@ -350,9 +365,9 @@ final class PixelRateClassifier: TileClassifier {
         backend.coverage(grid: grid, primed: primed, pixel: pixel, into: &coverage)
         let active = activeMask(coverage, primed: primed, threshold: cfg.tileActiveCoverage)
         // Per-pixel coverage IS a true magnitude, so threshold it into the bit.
-        history.push(coverage.map { $0 > cfg.coverageHighThreshold })
+        history.push(coverage.map { $0 > cfg.perFrameCoverageThreshold })
         let desired = history.desired(active: active,
-                                      windowFrames: cfg.coverageHistoryFrames,
+                                      windowFrames: cfg.historyFrames,
                                       enterFraction: cfg.videoFractionEnter,
                                       exitFraction: cfg.videoFractionExit)
         return (active, desired)

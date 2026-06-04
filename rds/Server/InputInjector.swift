@@ -282,7 +282,7 @@ final class InputInjector: @unchecked Sendable {
         updateModifierState(combined: combined, down: down)
 
         guard let mac = Self.scancodeToVirtualKey[combined] ?? Self.scancodeToVirtualKey[UInt32(scancode)] else {
-            Log.input.debug("unmapped scancode \(scancode, format: .hex, privacy: .public) extended=\(extended, privacy: .public)")
+            LogTo.input.debug("unmapped scancode \(String(scancode, radix: 16)) extended=\(extended)")
             return
         }
         guard let e = CGEvent(keyboardEventSource: nil,
@@ -342,7 +342,7 @@ final class InputInjector: @unchecked Sendable {
             }
         }
         mods = ModifierState()
-        Log.input.notice("Released all sticky modifiers")
+        LogTo.input.notice("Released all sticky modifiers")
     }
 
     /// PS/2 set 1 scan-code to macOS virtual-keycode mapping.

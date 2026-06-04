@@ -2,8 +2,8 @@
 //  CLIOptions.swift
 //  MacRDP
 //
-//  Minimal arg parsing in Phase 0 (no third-party deps). Replace with
-//  swift-argument-parser in Phase 0b once SPM is wired up.
+//  Minimal arg parsing. Phase 1 swap to swift-argument-parser is fine but
+//  not required — the surface here stays small on purpose.
 //
 
 import Foundation
@@ -51,10 +51,12 @@ struct CLIOptions {
       macrdp-server [options]
 
     Options:
-      -c, --config <path>   Path to config JSON (default: search ~/Library/Application Support/MacRDP/, /etc/)
-          --host <addr>     Listen address (default from config, fallback 0.0.0.0)
-          --port <n>        Listen port    (default from config, fallback 3389)
-      -v, --verbose         Verbose logging
+      -c, --config <path>   Path to a YAML config file. Omit to use built-in
+                            defaults; values you set override the defaults.
+                            (See DefaultConfig.swift for the full schema.)
+          --host <addr>     Override listen address (default: from config / 0.0.0.0)
+          --port <n>        Override listen port    (default: from config / 3389)
+      -v, --verbose         Reserved (use config.log.default=debug for verbose)
       -h, --help            This help
     """
 }

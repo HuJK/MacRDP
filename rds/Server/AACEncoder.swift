@@ -133,7 +133,7 @@ final class AACEncoder: CompressedAudioEncoder, @unchecked Sendable {
             }
 
             if let err {
-                Log.audioOut.error("AAC convert error: \(String(describing: err), privacy: .public)")
+                LogTo.audioOut.error("AAC convert error: \(String(describing: err))")
                 return packets
             }
             if outBuf.packetCount == 0 {
@@ -178,7 +178,7 @@ final class AACEncoder: CompressedAudioEncoder, @unchecked Sendable {
         // pcmSec should track wallElapsed closely (we're real-time);
         // packetsPerSec should be ~46.875 (48000/1024); kbps should be
         // around our 128k bitRate setting.
-        Log.audioOut.info("AAC: pcm=\(Int(pcmSec*1000), privacy: .public)ms wall=\(Int(wallElapsed*1000), privacy: .public)ms pkts=\(self.statsPacketsOut, privacy: .public) rate=\(Int(packetsPerSec), privacy: .public)/s avg=\(avgBytes, privacy: .public)B \(Int(kbpsOut), privacy: .public)kbps")
+        LogTo.audioOut.info("AAC: pcm=\(Int(pcmSec*1000))ms wall=\(Int(wallElapsed*1000))ms pkts=\(self.statsPacketsOut) rate=\(Int(packetsPerSec))/s avg=\(avgBytes)B \(Int(kbpsOut))kbps")
         statsLastLogWall = now
         statsLock.unlock()
     }

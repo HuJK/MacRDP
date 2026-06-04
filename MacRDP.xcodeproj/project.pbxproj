@@ -10,6 +10,7 @@
 		A48D80ED2FBF733800AE3557 /* fileprovider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A48D80E02FBF733800AE3557 /* fileprovider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A48D81432FC01EF000AE3557 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A48D80B82FBF550600AE3557 /* UniformTypeIdentifiers.framework */; };
 		A48D82012FC5972C00AE3557 /* virtualcamera.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = A48D81F72FC5972C00AE3557 /* virtualcamera.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B01A001000000000000000A3 /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = B01A001000000000000000A2 /* Yams */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -108,6 +109,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B01A001000000000000000A3 /* Yams in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -184,6 +186,7 @@
 			);
 			name = rds;
 			packageProductDependencies = (
+				B01A001000000000000000A2 /* Yams */,
 			);
 			productName = rds;
 			productReference = A48D80CE2FBF6DE700AE3557 /* MacRDP.app */;
@@ -263,6 +266,9 @@
 			);
 			mainGroup = A47269602FBD9A4F00A5C09A;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				B01A001000000000000000A1 /* XCRemoteSwiftPackageReference "Yams" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A472696A2FBD9A4F00A5C09A /* Products */;
 			projectDirPath = "";
@@ -783,6 +789,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B01A001000000000000000A1 /* XCRemoteSwiftPackageReference "Yams" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/jpsim/Yams.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 5.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B01A001000000000000000A2 /* Yams */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B01A001000000000000000A1 /* XCRemoteSwiftPackageReference "Yams" */;
+			productName = Yams;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A47269612FBD9A4F00A5C09A /* Project object */;
 }

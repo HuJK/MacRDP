@@ -45,8 +45,8 @@ final class H264Encoder {
                 maxKeyFrameInterval: video.keyframeIntervalFrames,
                 maxFps: video.maxFps,
                 hwAcceleration: video.hwAcceleration,
-                dataRateBurstMultiplier: video.dataRateBurstMultiplier,
-                dataRateBurstSeconds: video.dataRateBurstSeconds,
+                dataRateBurstMultiplier: video.dataRate.burstMultiplier,
+                dataRateBurstSeconds: video.dataRate.burstSeconds,
                 maxFrameDelayCount: video.maxFrameDelayCount,
                 pixelFormat: pixelFormat
             )
@@ -173,7 +173,7 @@ final class H264Encoder {
                               allocator: kCFAllocatorDefault,
                               valueOut: &usingHW)
         let hw = (usingHW as? Bool) ?? false
-        Log.encoder.info("H264 session ready \(self.settings.width, privacy: .public)x\(self.settings.height, privacy: .public) @ \(self.settings.maxFps, privacy: .public)fps hw=\(hw, privacy: .public)")
+        LogTo.encoder.info("H264 session ready \(self.settings.width)x\(self.settings.height) @ \(self.settings.maxFps)fps hw=\(hw)")
     }
 
     func invalidate() {

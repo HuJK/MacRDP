@@ -497,7 +497,7 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
         itemToEvent[placeholderItem.id] = sessionID
         let liveCount = events.values.filter { $0.domainSubdir == domainSubdir }.count
         lock.unlock()
-        Log.clip.info("Event '\(sessionID, privacy: .public)' created with placeholder '\(placeholderItem.filename, privacy: .public)'; \(liveCount, privacy: .public) live event(s) for domain")
+        LogTo.clipboard.info("Event '\(sessionID)' created with placeholder '\(placeholderItem.filename)'; \(liveCount) live event(s) for domain")
         for c in cleanups { c() }
         for sid in dismissed { scheduleCleanupCheck(sessionID: sid) }
     }
@@ -591,7 +591,7 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
             e.transferCancelled = true   // snapshot shows cancelled until the row drops
         }
         lock.unlock()
-        Log.clip.notice("Event '\(sessionID, privacy: .public)' transfer cancelled by user (event kept)")
+        LogTo.clipboard.notice("Event '\(sessionID)' transfer cancelled by user (event kept)")
     }
 
     // MARK: - Supersede / end
@@ -658,7 +658,7 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
             if let c = endEventLocked(e, reason: reason) { cleanups.append(c) }
         }
         lock.unlock()
-        Log.clip.info("All events for domain '\(domainSubdir, privacy: .public)' ended (\(victims.count, privacy: .public) victim(s))")
+        LogTo.clipboard.info("All events for domain '\(domainSubdir)' ended (\(victims.count) victim(s))")
         for c in cleanups { c() }
     }
 
@@ -724,7 +724,7 @@ nonisolated final class CopyEventStore: @unchecked Sendable {
         let cleanup = endEventLocked(e, reason: .superseded)
         let remaining = events.values.filter { $0.domainSubdir == e.domainSubdir }.count
         lock.unlock()
-        Log.clip.info("Event '\(sessionID, privacy: .public)' cleaned up; \(remaining, privacy: .public) live event(s) remain for domain")
+        LogTo.clipboard.info("Event '\(sessionID)' cleaned up; \(remaining) live event(s) remain for domain")
         // Fire onCleanup OUTSIDE the lock — typically sends CLIPRDR
         // CB_UNLOCK_CLIPDATA so the client can free the snapshot.
         cleanup?()

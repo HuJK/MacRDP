@@ -48,21 +48,22 @@ final class DisplayControl {
     func handleClientResize(raw: [MonitorLayout]) async {
         let decorated = mapping.decorate(raw)
         guard !decorated.isEmpty else {
-            Log.resize.error("Client resize: no monitors matched our slot mapping (raw=\(raw.count, privacy: .public))")
+            LogTo.resize.error("Client resize: no monitors matched our slot mapping (raw=\(raw.count))")
             return
         }
         let request = MonitorLayoutRequest(version: 1, monitors: decorated)
 
-        guard let template = config.display.resizeHook else {
-            Log.resize.error("Client requested resize but no resize_hook configured")
+        let template = config.display.resize.hook
+        guard !template.isEmpty else {
+            LogTo.resize.error("Client requested resize but display.resize.hook is empty")
             return
         }
         let hook = ResizeHook(template: template,
-                              timeoutSeconds: config.display.resizeTimeoutSeconds)
+                              timeoutSeconds: config.display.resize.timeoutSeconds)
         do {
             try await hook.run(request)
         } catch {
-            Log.resize.error("Resize hook failed: \(String(describing: error), privacy: .public)")
+            LogTo.resize.error("Resize hook failed: \(String(describing: error))")
             return
         }
 
@@ -78,7 +79,7 @@ final class DisplayControl {
             try await pipeline.resize(width: primary.width,
                                       height: primary.height)
         } catch {
-            Log.resize.error("Pipeline resize failed: \(String(describing: error), privacy: .public)")
+            LogTo.resize.error("Pipeline resize failed: \(String(describing: error))")
         }
     }
 }

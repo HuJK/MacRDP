@@ -15,7 +15,7 @@ screen capture, encoding, and audio.
 ## Features
 
 - **Hardware-accelerated video** over the RDP Graphics Pipeline (`RDPGFX`):
-  - H.264 (AVC420 / AVC444) via the VideoToolbox hardware encoder, or
+  - H.264 (AVC420) via the VideoToolbox hardware encoder, or
   - RemoteFX Progressive V2 (CPU, wavelet, great for sparse desktop changes).
 - **Adaptive quality** — per-link profiles (`lan` / `broadband` / `modem`),
   client connection-type hints, and runtime bandwidth autodetect.

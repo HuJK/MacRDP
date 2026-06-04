@@ -184,7 +184,7 @@ final class VirtualCameraSink {
         simpleQueue = cmQueue.takeUnretainedValue()
         discoveryTimer?.cancel()
         discoveryTimer = nil
-        log.info("connected to virtual camera sink \(self.name, privacy: .public)")
+        log.info("connected to virtual camera sink \(self.name)")
     }
 
     // MARK: CoreMediaIO HAL helpers

@@ -198,7 +198,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         }
         timer.resume()
         self.pollTimer = timer
-        Log.clip.info("Clipboard polling started @\(self.config.clipboard.pollIntervalMs, privacy: .public)ms")
+        LogTo.clipboard.info("Clipboard polling started @\(self.config.clipboard.pollIntervalMs)ms")
     }
 
     @MainActor
@@ -263,7 +263,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         var formats: [(id: UInt32, name: String?)] = []
         let types = pb.types ?? []
         let typesDump = types.map { $0.rawValue }.joined(separator: ", ")
-        Log.clip.info("Mac pasteboard changed (cc=\(cc, privacy: .public)) types=[\(typesDump, privacy: .public)]")
+        LogTo.clipboard.info("Mac pasteboard changed (cc=\(cc)) types=[\(typesDump)]")
 
         // Files / folders take precedence and are EXCLUSIVE. A Finder file
         // copy also carries a text rep (the path) and an icon
@@ -297,7 +297,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 outFileGroupDescID = descID
                 formats.append((descID, CFFormatName.fileGroupDescriptorW.rawValue))
                 formats.append((contID, CFFormatName.fileContents.rawValue))
-                Log.clip.info("Advertising file copy (\(urls.count, privacy: .public) root(s); descriptor built on request)")
+                LogTo.clipboard.info("Advertising file copy (\(urls.count) root(s); descriptor built on request)")
                 advertisedFiles = true
             }
         }
@@ -335,7 +335,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let summary = formats.map { f in
             if let n = f.name { return "\(f.id)='\(n)'" } else { return "\(f.id)" }
         }.joined(separator: ", ")
-        Log.clip.info("Advertising \(formats.count, privacy: .public) format(s): [\(summary, privacy: .public)]")
+        LogTo.clipboard.info("Advertising \(formats.count) format(s): [\(summary)]")
         lastSentFormats = formats
         // Allow a couple of retries on CB_RESPONSE_FAIL (Office on
         // Windows briefly holding the clipboard is the usual cause).
@@ -354,7 +354,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             return
         }
         guard formatListRetriesRemaining > 0, !lastSentFormats.isEmpty else {
-            Log.clip.error("FormatList rejected; out of retries. Close Office apps on the client to avoid Windows clipboard contention.")
+            LogTo.clipboard.error("FormatList rejected; out of retries. Close Office apps on the client to avoid Windows clipboard contention.")
             return
         }
         formatListRetriesRemaining -= 1
@@ -362,7 +362,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         // Windows clipboard. Backoff doubles each attempt: 250ms, 500ms, 1s.
         let attempt = 3 - formatListRetriesRemaining
         let delayMs = 250 * (1 << (attempt - 1))
-        Log.clip.notice("FormatList rejected — retrying in \(delayMs, privacy: .public)ms (attempt \(attempt, privacy: .public)/3)")
+        LogTo.clipboard.notice("FormatList rejected — retrying in \(delayMs)ms (attempt \(attempt)/3)")
         let formats = lastSentFormats
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
@@ -417,9 +417,9 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     let raw = Self.findHTMLData(pb)
                     if let raw, let s = Self.decodeHTMLBytes(raw) {
                         payload = Self.encodeCFHTML(htmlFragment: s)
-                        Log.clip.info("Encoded CF_HTML: src=\(raw.count, privacy: .public)B → \(payload.count, privacy: .public)B")
+                        LogTo.clipboard.info("Encoded CF_HTML: src=\(raw.count)B → \(payload.count)B")
                     } else {
-                        Log.clip.error("CF_HTML encode failed — raw=\(raw?.count ?? -1, privacy: .public)B")
+                        LogTo.clipboard.error("CF_HTML encode failed — raw=\(raw?.count ?? -1)B")
                     }
                 case CFFormatName.richTextFormat.rawValue:
                     if let rtf = pb.data(forType: .rtf) {
@@ -437,7 +437,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     pendingLock.unlock()
                     if !cached.isEmpty || roots.isEmpty {
                         payload = Self.encodeFileGroupDescriptorW(cached)
-                        Log.clip.info("Encoded FILEGROUPDESCRIPTORW (cached): \(cached.count, privacy: .public) entries → \(payload.count, privacy: .public) bytes")
+                        LogTo.clipboard.info("Encoded FILEGROUPDESCRIPTORW (cached): \(cached.count) entries → \(payload.count) bytes")
                     } else {
                         // Build the descriptor off the main actor (the tree
                         // walk can be slow), cache it for the FileContents
@@ -453,7 +453,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                             self.outFiles = entries
                             self.pendingLock.unlock()
                             let blob = Self.encodeFileGroupDescriptorW(entries)
-                            Log.clip.info("Encoded FILEGROUPDESCRIPTORW (lazy): \(entries.count, privacy: .public) entries → \(blob.count, privacy: .public) bytes")
+                            LogTo.clipboard.info("Encoded FILEGROUPDESCRIPTORW (lazy): \(entries.count) entries → \(blob.count) bytes")
                             send?(fid, blob)
                         }
                         return   // response delivered asynchronously above
@@ -462,13 +462,13 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     // File bytes never travel through FormatDataResponse;
                     // they come via CB_FILECONTENTS_REQUEST. Respond with
                     // empty data (the client should not be asking).
-                    Log.clip.error("Client asked for FileContents via FormatDataRequest — ignored")
+                    LogTo.clipboard.error("Client asked for FileContents via FormatDataRequest — ignored")
                 default:
                     break
                 }
             }
         }
-        Log.clip.info("Client→server FormatDataRequest fid=\(formatID, privacy: .public) → \(payload.count, privacy: .public) bytes")
+        LogTo.clipboard.info("Client→server FormatDataRequest fid=\(formatID) → \(payload.count) bytes")
         sendFormatDataResponse?(formatID, payload)
     }
 
@@ -493,7 +493,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             if let n = f.name, !n.isEmpty { return "\(f.id)='\(n)'" }
             return "\(f.id)"
         }.joined(separator: ", ")
-        Log.clip.info("Client offered \(formats.count, privacy: .public) format(s): [\(dump, privacy: .public)]")
+        LogTo.clipboard.info("Client offered \(formats.count) format(s): [\(dump)]")
 
         // Echo suppression: a local Mac copy is advertised to the client,
         // which then echoes that same clipboard straight back as a format
@@ -501,9 +501,9 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         // (Finder loses "Paste"). Ignore client format lists that arrive
         // within `echoSuppressMs` of a local pasteboard change.
         if let changedAt = lastLocalChangeUptimeMs {
-            let windowMs = UInt64(max(0, config.clipboard.echoSuppressMs ?? 500))
+            let windowMs = UInt64(max(0, config.clipboard.echo.suppressMs))
             if nowUptimeMs() &- changedAt < windowMs {
-                Log.clip.info("Ignoring client format list within \(windowMs, privacy: .public)ms of a local copy (echo)")
+                LogTo.clipboard.info("Ignoring client format list within \(windowMs)ms of a local copy (echo)")
                 return
             }
         }
@@ -560,13 +560,13 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             pb.clearContents()
             selfWroteChangeCount = pb.changeCount
             lastChangeCount      = pb.changeCount
-            let eager = (config.clipboard.fileFetchMode ?? "eager").lowercased() != "lazy"
+            let eager = config.clipboard.fileFetchMode.lowercased() != "lazy"
             beginFileCopy(descriptorFormatID: descID, eager: eager)
             return
         }
 
         guard !typeMap.isEmpty else {
-            Log.clip.info("Client format list (\(formats.count, privacy: .public)) has no formats we support")
+            LogTo.clipboard.info("Client format list (\(formats.count)) has no formats we support")
             return
         }
 
@@ -585,7 +585,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         lastChangeCount      = pb.changeCount
 
         let summary = typeMap.map { "\($0.key.rawValue)→fid=\($0.value)" }.joined(separator: ", ")
-        Log.clip.info("Client copied → claimed pasteboard with \(typeMap.count, privacy: .public) type(s): \(summary, privacy: .public)")
+        LogTo.clipboard.info("Client copied → claimed pasteboard with \(typeMap.count) type(s): \(summary)")
     }
 
     // MARK: - Files: Client → Mac (unified copy event)
@@ -604,7 +604,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let inbox = AppDelegate.sharedClipboardInbox
         let sessionID = UUID().uuidString
         let placeholderName = "MacRDP_" + sessionID
-        Log.clip.info("File copy begin: session=\(sessionID, privacy: .public) mode=\(eager ? "eager" : "lazy", privacy: .public) placeholder='\(placeholderName, privacy: .public)'")
+        LogTo.clipboard.info("File copy begin: session=\(sessionID) mode=\(eager ? "eager" : "lazy") placeholder='\(placeholderName)'")
 
         // LOCK_CLIPDATA so mstsc preserves THIS event's FGDW snapshot even
         // if the Windows clipboard changes again before paste.
@@ -657,7 +657,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                             modificationMs: Int64(Date().timeIntervalSince1970 * 1000))
                     ])
                 } catch {
-                    Log.clip.error("Lazy publish failed: \(String(describing: error), privacy: .public)")
+                    LogTo.clipboard.error("Lazy publish failed: \(String(describing: error))")
                     return
                 }
                 if let url = await inbox.userVisibleURL(itemID: sessionID, filename: placeholderName) {
@@ -666,9 +666,9 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     pb.writeObjects([url as NSURL])
                     self.selfWroteChangeCount = pb.changeCount
                     self.lastChangeCount      = pb.changeCount
-                    Log.clip.info("Lazy-mode pasteboard claimed: \(url.path, privacy: .public)")
+                    LogTo.clipboard.info("Lazy-mode pasteboard claimed: \(url.path)")
                 } else {
-                    Log.clip.error("Lazy-mode URL resolution failed for placeholder \(placeholderName, privacy: .public)")
+                    LogTo.clipboard.error("Lazy-mode URL resolution failed for placeholder \(placeholderName)")
                 }
             }
         }
@@ -717,7 +717,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         -> (CopyEvent) -> Void {
         return { [weak self] event in
             guard let self else { return }
-            Log.clip.info("Resolver firing for event=\(event.id, privacy: .public) — sending FormatDataRequest")
+            LogTo.clipboard.info("Resolver firing for event=\(event.id) — sending FormatDataRequest")
             // NOTE: progress UI is registered AFTER the tree is built (via
             // `registerItems`, which does NOT force the window open — it
             // appears 500ms after the first byte chunk). Marquee-while-
@@ -734,7 +734,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             guard !entries.isEmpty else {
                 let failedID = event.id
                 let cancelled = CopyEventStore.shared.isSessionCancelled(sessionID: failedID)
-                Log.clip.error("Resolver: no file list (\(cancelled ? "cancelled" : "empty FGDW", privacy: .public)) — serving broken.bin so Finder cleans up the destination")
+                LogTo.clipboard.error("Resolver: no file list (\(cancelled ? "cancelled" : "empty FGDW")) — serving broken.bin so Finder cleans up the destination")
                 // An EMPTY/error enumerate leaves an empty folder at the
                 // paste destination (Finder already created the dest dir and
                 // doesn't roll it back). A FILE read error, on the other
@@ -830,7 +830,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                                                 placeholderName: String) async {
         let inbox = AppDelegate.sharedClipboardInbox
         guard let resolved = CopyEventStore.shared.resolvedTopLevel(sessionID: sessionID) else {
-            Log.clip.notice("Eager: nothing to bind (resolve failed or event gone) for \(sessionID, privacy: .public)")
+            LogTo.clipboard.notice("Eager: nothing to bind (resolve failed or event gone) for \(sessionID)")
             return
         }
         func toPublish(_ m: ManifestItem) -> FileProviderInbox.PublishItem {
@@ -845,7 +845,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         do {
             try await inbox.publish(publishItems)
         } catch {
-            Log.clip.error("Eager publish failed: \(String(describing: error), privacy: .public)")
+            LogTo.clipboard.error("Eager publish failed: \(String(describing: error))")
             return
         }
         // Bind the children (real top-level) URLs — Finder strips the
@@ -866,7 +866,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             if let url = await inbox.userVisibleURL(itemID: it.id, filename: it.filename) {
                 urls.append(url)
             } else {
-                Log.clip.error("No URL resolved for \(it.filename, privacy: .public)")
+                LogTo.clipboard.error("No URL resolved for \(it.filename)")
             }
         }
         guard !urls.isEmpty else { return }
@@ -875,7 +875,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         pb.writeObjects(urls as [NSURL])
         selfWroteChangeCount = pb.changeCount
         lastChangeCount      = pb.changeCount
-        Log.clip.info("Pasteboard claimed with \(urls.count, privacy: .public) FileProvider URL(s)")
+        LogTo.clipboard.info("Pasteboard claimed with \(urls.count) FileProvider URL(s)")
     }
 
     /// MUST NOT MainActor-hop: the data-provider waiting on the
@@ -991,7 +991,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                         let isChildDir = values?.isDirectory ?? false
                         let size = UInt64(values?.fileSize ?? 0)
                         if !isChildDir, size > limit {
-                            Log.clip.error("File exceeds maxFileSizeMiB=\(limitMiB, privacy: .public) — refusing: \(resolved.lastPathComponent, privacy: .public)")
+                            LogTo.clipboard.error("File exceeds maxFileSizeMiB=\(limitMiB) — refusing: \(resolved.lastPathComponent)")
                             return nil
                         }
                         // Build the relative path: <rootName>\<relativeFromRoot, joined by \>
@@ -1009,7 +1009,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 let values = try? root.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
                 let size = UInt64(values?.fileSize ?? 0)
                 if size > limit {
-                    Log.clip.error("File exceeds maxFileSizeMiB=\(limitMiB, privacy: .public) — refusing: \(rootName, privacy: .public)")
+                    LogTo.clipboard.error("File exceeds maxFileSizeMiB=\(limitMiB) — refusing: \(rootName)")
                     return nil
                 }
                 out.append(.init(url: root,
@@ -1103,13 +1103,13 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         pendingLock.unlock()
 
         guard let entry, !entry.isDirectory else {
-            Log.clip.error("FileContentsRequest streamId=\(streamID, privacy: .public) listIndex=\(listIndex, privacy: .public): no such file")
+            LogTo.clipboard.error("FileContentsRequest streamId=\(streamID) listIndex=\(listIndex): no such file")
             sendFileContentsResponse?(streamID, false, Data())
             return
         }
 
         if wantSize {
-            Log.clip.info("FileContentsRequest SIZE listIndex=\(listIndex, privacy: .public) → \(entry.size, privacy: .public) bytes")
+            LogTo.clipboard.info("FileContentsRequest SIZE listIndex=\(listIndex) → \(entry.size) bytes")
             var size = entry.size.littleEndian
             let data = withUnsafeBytes(of: &size) { Data($0) }
             sendFileContentsResponse?(streamID, true, data)
@@ -1128,10 +1128,10 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
 
             try handle?.seek(toOffset: offset)
             let bytes = handle?.readData(ofLength: Int(length)) ?? Data()
-            Log.clip.info("FileContentsRequest RANGE listIndex=\(listIndex, privacy: .public) off=\(offset, privacy: .public) want=\(length, privacy: .public) → \(bytes.count, privacy: .public) bytes")
+            LogTo.clipboard.info("FileContentsRequest RANGE listIndex=\(listIndex) off=\(offset) want=\(length) → \(bytes.count) bytes")
             sendFileContentsResponse?(streamID, true, bytes)
         } catch {
-            Log.clip.error("FileContentsRequest read failed: \(String(describing: error), privacy: .public)")
+            LogTo.clipboard.error("FileContentsRequest read failed: \(String(describing: error))")
             sendFileContentsResponse?(streamID, false, Data())
         }
     }
@@ -1193,7 +1193,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     .replacingOccurrences(of: "\\", with: "/")
                     .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 if normalized.contains("..") {
-                    Log.clip.error("Rejecting suspicious file entry (path traversal): \(winName, privacy: .public)")
+                    LogTo.clipboard.error("Rejecting suspicious file entry (path traversal): \(winName)")
                     continue
                 }
                 let isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0
@@ -1227,7 +1227,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         // Per-request trace so we can correlate the last good
         // request with FreeRDP's channel-death log when chasing
         // wire-level bugs.
-        Log.clip.info("→ FILECONTENTS_REQUEST sid=\(sid, privacy: .public) listIndex=\(listIndex, privacy: .public) off=\(offset, privacy: .public) len=\(length, privacy: .public) clipDataID=\(clipDataID ?? 0, privacy: .public)")
+        LogTo.clipboard.info("→ FILECONTENTS_REQUEST sid=\(sid) listIndex=\(listIndex) off=\(offset) len=\(length) clipDataID=\(clipDataID ?? 0)")
         sendFileContentsRequest?(sid, listIndex, false, offset, length, clipDataID)
 
         let deadline = DispatchTime.now() + .milliseconds(timeoutMs)
@@ -1243,7 +1243,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     /// Bridge thread delivers FILECONTENTS_RESPONSE bytes. Routes to
     /// the pending fetch by streamId. No MainActor hop.
     nonisolated func handleClientFileContentsResponse(streamID: UInt32, data: Data) {
-        Log.clip.info("← FILECONTENTS_RESPONSE sid=\(streamID, privacy: .public) bytes=\(data.count, privacy: .public)")
+        LogTo.clipboard.info("← FILECONTENTS_RESPONSE sid=\(streamID) bytes=\(data.count)")
         pendingLock.lock()
         let fetch = inPendingFiles[streamID]
         fetch?.data = data
@@ -1611,12 +1611,12 @@ extension ClipboardBridge: NSPasteboardItemDataProvider {
         let formatID = claimedTypeMap[type]
         pendingLock.unlock()
         guard let formatID else {
-            Log.clip.error("provideDataForType \(type.rawValue, privacy: .public): no mapping")
+            LogTo.clipboard.error("provideDataForType \(type.rawValue): no mapping")
             item.setData(Data(), forType: type)
             return
         }
         let raw = awaitClientFormatData(formatID: formatID, timeoutMs: 3_000)
-        Log.clip.info("provideDataForType \(type.rawValue, privacy: .public) fid=\(formatID, privacy: .public): \(raw.count, privacy: .public) bytes")
+        LogTo.clipboard.info("provideDataForType \(type.rawValue) fid=\(formatID): \(raw.count) bytes")
 
         switch type {
         case .string:

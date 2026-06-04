@@ -142,7 +142,7 @@ final class DriveDomain {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 NSFileProviderManager.remove(d) { _ in cont.resume() }
             }
-            Log.server.notice("Removed leftover FileProvider domain \(d.identifier.rawValue, privacy: .public)")
+            LogTo.server.notice("Removed leftover FileProvider domain \(d.identifier.rawValue)")
         }
     }
 }
@@ -260,7 +260,7 @@ nonisolated final class DriveStore: @unchecked Sendable {
         drives[driveKey] = Drive(adapter: adapter, deviceID: deviceID,
                                  label: label, domainSubdir: domainSubdir)
         lock.unlock()
-        Log.session.notice("RDPDR mounting drive '\(label, privacy: .public)' id=\(deviceID, privacy: .public) key=\(driveKey, privacy: .public)")
+        LogTo.session.notice("RDPDR mounting drive '\(label)' id=\(deviceID) key=\(driveKey)")
         return (driveKey, label)
     }
 

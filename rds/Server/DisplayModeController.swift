@@ -60,7 +60,7 @@ final class DisplayModeController {
         guard clientPixelW > 0, clientPixelH > 0 else { return nil }
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
         guard let modes = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] else {
-            Log.resize.error("setOnServer: CGDisplayCopyAllDisplayModes returned nil for \(displayID, privacy: .public)")
+            LogTo.resize.error("setOnServer: CGDisplayCopyAllDisplayModes returned nil for \(displayID)")
             return nil
         }
 
@@ -78,7 +78,7 @@ final class DisplayModeController {
             && $0.pixelHeight <= clientPixelH
         }
         guard !fits.isEmpty else {
-            Log.resize.notice("setOnServer: no mode fits \(clientPixelW, privacy: .public)x\(clientPixelH, privacy: .public); leaving display unchanged")
+            LogTo.resize.notice("setOnServer: no mode fits \(clientPixelW)x\(clientPixelH); leaving display unchanged")
             return nil
         }
 
@@ -105,10 +105,10 @@ final class DisplayModeController {
         }
         let rc = CGDisplaySetDisplayMode(displayID, chosen, nil)
         guard rc == .success else {
-            Log.resize.error("setOnServer: CGDisplaySetDisplayMode failed rc=\(rc.rawValue, privacy: .public)")
+            LogTo.resize.error("setOnServer: CGDisplaySetDisplayMode failed rc=\(rc.rawValue)")
             return nil
         }
-        Log.resize.info("setOnServer: display \(displayID, privacy: .public) → \(pw, privacy: .public)x\(ph, privacy: .public)px (wantHiDPI=\(wantHiDPI, privacy: .public))")
+        LogTo.resize.info("setOnServer: display \(displayID) → \(pw)x\(ph)px (wantHiDPI=\(wantHiDPI))")
         return (pw, ph)
     }
 

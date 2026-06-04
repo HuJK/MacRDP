@@ -39,14 +39,14 @@ final class AudioOutPipeline: @unchecked Sendable {
         guard config.audioOut.enabled else { return }
         switch config.audioOut.muteLocalOutput {
         case "never":
-            Log.audioOut.info("Local mute disabled (Mac plays out loud)")
+            LogTo.audioOut.info("Local mute disabled (Mac plays out loud)")
             return
         case "always":
             try createTap(behavior: .muted)
-            Log.audioOut.info("Local Mac audio muted (.muted)")
+            LogTo.audioOut.info("Local Mac audio muted (.muted)")
         default:   // "whileTapped" — kept for backward-compat
             try createTap(behavior: .mutedWhenTapped)
-            Log.audioOut.info("Local Mac audio mute=.mutedWhenTapped (mute only while consumer reads)")
+            LogTo.audioOut.info("Local Mac audio mute=.mutedWhenTapped (mute only while consumer reads)")
         }
     }
 
@@ -69,7 +69,7 @@ final class AudioOutPipeline: @unchecked Sendable {
         var tap: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
         let rc = AudioHardwareCreateProcessTap(desc, &tap)
         guard rc == noErr, tap != AudioObjectID(kAudioObjectUnknown) else {
-            Log.audioOut.error("Mute tap create failed: \(rc, privacy: .public)")
+            LogTo.audioOut.error("Mute tap create failed: \(rc)")
             throw MacRDPError.audioPermissionDenied
         }
         self.tapID = tap

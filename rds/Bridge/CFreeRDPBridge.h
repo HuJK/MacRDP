@@ -294,7 +294,6 @@ typedef struct macrdp_session_config {
     /* H.264 / GFX defaults */
     int32_t     default_bitrate_kbps;
     int32_t     default_max_fps;
-    int32_t     prefer_avc444;         /* 0/1 */
 
     /* GFX flow control: max in-flight frames before send_h264_frame
      * returns MACRDP_E_FRAME_DROPPED. */

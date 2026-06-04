@@ -20,9 +20,11 @@ enum TLSCertificateGenerator {
 
     static func ensureCertificate(config: Config) throws -> (certPath: String,
                                                               keyPath: String) {
-        if let cert = config.auth.certificateFile,
-           let key  = config.auth.privateKeyFile {
-            return (cert, key)
+        // Operator-supplied paths take precedence: empty = auto-manage.
+        let suppliedCert = config.auth.tls.certificateFile
+        let suppliedKey  = config.auth.tls.privateKeyFile
+        if !suppliedCert.isEmpty && !suppliedKey.isEmpty {
+            return (suppliedCert, suppliedKey)
         }
 
         let dir = try appSupportDirectory()
@@ -32,14 +34,14 @@ enum TLSCertificateGenerator {
         let fm = FileManager.default
         if fm.fileExists(atPath: cert.path),
            fm.fileExists(atPath: key.path) {
-            Log.server.info("Using existing TLS cert at \(cert.path, privacy: .public)")
+            LogTo.server.info("Using existing TLS cert at \(cert.path)")
             return (cert.path, key.path)
         }
 
         try generate(certURL: cert, keyURL: key,
-                     rsaKeyBits: config.auth.rsaKeyBits,
-                     validityDays: config.auth.certificateValidityDays)
-        Log.server.notice("Generated new self-signed TLS cert at \(cert.path, privacy: .public)")
+                     rsaKeyBits: config.auth.tls.rsaKeyBits,
+                     validityDays: config.auth.tls.certificateValidityDays)
+        LogTo.server.notice("Generated new self-signed TLS cert at \(cert.path)")
         return (cert.path, key.path)
     }
 

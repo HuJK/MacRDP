@@ -130,13 +130,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil); return
         }
 
+        // Apply per-source log levels from config.log BEFORE the first real
+        // log call so the gate is in effect from line one.
+        LogTo.apply(config.log)
+
         // Crank FreeRDP's WLog up so we see GFX channel byte-level
         // activity alongside our os.Logger output.
         if getenv("WLOG_LEVEL") == nil {
             setenv("WLOG_LEVEL", "DEBUG", 1)
         }
 
-        Log.server.notice("MacRDP server starting on \(config.listen.host, privacy: .public):\(config.listen.port, privacy: .public)")
+        LogTo.server.notice("MacRDP server starting on \(config.listen.host):\(config.listen.port)")
 
         self.pendingConfig = config
 
@@ -147,7 +151,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if missing.isEmpty {
             beginServing(config: config)
         } else {
-            Log.server.notice("Showing permission prompt — \(missing.count, privacy: .public) missing")
+            LogTo.server.notice("Showing permission prompt — \(missing.count) missing")
             let prompt = PermissionPromptWindow()
             prompt.show(requirements: missing,
                         onContinue: { [weak self] in
@@ -155,7 +159,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             self.beginServing(config: cfg)
                         },
                         onQuit: {
-                            Log.server.notice("User quit at permission prompt")
+                            LogTo.server.notice("User quit at permission prompt")
                             NSApp.terminate(nil)
                         })
             self.permissionPrompt = prompt
@@ -183,14 +187,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Clipboard is a transient paste-staging domain; hide it from
             // Finder unless the user opts in via config.
             await AppDelegate.sharedClipboardInbox.register(
-                hidden: !(config.clipboard.showInFinder ?? false))
+                hidden: !config.clipboard.showInFinder)
             // Wire the copy-progress UI: it polls CopyEventStore for
             // progress snapshots (the store wakes it when work starts).
             CopyProgressTracker.shared.configure(
                 domainSubdir: AppDelegate.sharedClipboardInbox.subdir,
-                speedWindowSec: config.clipboard.speedStatsWindowSec ?? 4)
+                speedWindowSec: config.clipboard.speedStatsWindowSec)
             CopyEventStore.shared.cancelReleaseSec =
-                Double(config.clipboard.cancelReleaseMs ?? 3000) / 1000.0
+                Double(config.clipboard.echo.cancelReleaseMs) / 1000.0
             self.finishStartup(config: config)
         }
     }
@@ -205,7 +209,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             let content = try await SCShareableContent.current
             guard let display = content.displays.first else {
-                Log.server.notice("SCStream pre-warm: no displays")
+                LogTo.server.notice("SCStream pre-warm: no displays")
                 return
             }
             let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -221,11 +225,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        sampleHandlerQueue: .global(qos: .utility))
             try await stream.startCapture()
             try await stream.stopCapture()
-            Log.server.info("SCStream pre-warm complete")
+            LogTo.server.info("SCStream pre-warm complete")
         } catch {
             // Don't treat this as fatal — even if pre-warm fails, the
             // real DisplayPipeline will try again on peer connect.
-            Log.server.notice("SCStream pre-warm failed: \(String(describing: error), privacy: .public)")
+            LogTo.server.notice("SCStream pre-warm failed: \(String(describing: error))")
         }
     }
 
@@ -234,10 +238,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // at startup rather than only when a peer connects.
         do {
             let (cert, key) = try TLSCertificateGenerator.ensureCertificate(config: config)
-            Log.server.info("TLS cert: \(cert, privacy: .public)")
-            Log.server.info("TLS key:  \(key, privacy: .public)")
+            LogTo.server.info("TLS cert: \(cert)")
+            LogTo.server.info("TLS key:  \(key)")
         } catch {
-            Log.server.error("TLS cert setup failed: \(String(describing: error), privacy: .public) (will retry on first peer)")
+            LogTo.server.error("TLS cert setup failed: \(String(describing: error)) (will retry on first peer)")
         }
 
         let listener = RDPListener(config: config)
@@ -252,7 +256,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installSignalHandler(SIGINT)
         installSignalHandler(SIGTERM)
 
-        if (pendingConfig?.effectiveTray.enabled ?? true) {
+        if pendingConfig?.tray.enabled == true {
             setupMenuBar()
         }
     }
@@ -269,7 +273,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         self.statusItem = item
-        Log.server.info("Menu-bar status item installed")
+        LogTo.server.info("Menu-bar status item installed")
     }
 
     /// Rebuild the menu each time it opens so the session list is current.
@@ -378,13 +382,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func restartService(_ sender: NSMenuItem) {
         guard let cfg = pendingConfig else { return }
-        Log.server.notice("Restarting service from menu bar")
+        LogTo.server.notice("Restarting service from menu bar")
         listener?.stop()
         listener = nil
         let l = RDPListener(config: cfg)
         self.listener = l
         do { try l.start() }
-        catch { Log.server.error("Restart failed: \(String(describing: error), privacy: .public)") }
+        catch { LogTo.server.error("Restart failed: \(String(describing: error))") }
     }
 
     @objc private func quitService(_ sender: NSMenuItem) {
@@ -421,7 +425,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         signal(sig, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: sig, queue: DispatchQueue.main)
         source.setEventHandler { [weak self] in
-            Log.server.notice("Received signal \(sig, privacy: .public); shutting down")
+            LogTo.server.notice("Received signal \(sig); shutting down")
             MainActor.assumeIsolated {
                 self?.listener?.stop()
                 NSApp.terminate(nil)

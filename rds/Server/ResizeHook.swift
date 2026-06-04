@@ -84,7 +84,7 @@ struct ResizeHook {
                 .replacingOccurrences(of: "{monitor_count}", with: String(request.monitors.count))
         }
 
-        Log.resize.info("Invoking resize hook: \(exe, privacy: .public) \(args.joined(separator: " "), privacy: .public) [monitors=\(request.monitors.count, privacy: .public)]")
+        LogTo.resize.info("Invoking resize hook: \(exe) \(args.joined(separator: " ")) [monitors=\(request.monitors.count)]")
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exe)

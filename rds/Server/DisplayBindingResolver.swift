@@ -76,11 +76,11 @@ enum DisplayBindingResolver {
         if let bindings = configBindings {
             for b in bindings {
                 guard (0..<channelCount).contains(b.rdpSlot) else {
-                    Log.config.error("display.monitors: rdpSlot \(b.rdpSlot, privacy: .public) out of range [0, \(channelCount, privacy: .public)), skipping")
+                    LogTo.config.error("display.monitors: rdpSlot \(b.rdpSlot) out of range [0, \(channelCount)), skipping")
                     continue
                 }
                 if slotsTaken.contains(b.rdpSlot) {
-                    Log.config.error("display.monitors: rdpSlot \(b.rdpSlot, privacy: .public) bound twice, ignoring later entry")
+                    LogTo.config.error("display.monitors: rdpSlot \(b.rdpSlot) bound twice, ignoring later entry")
                     continue
                 }
                 let resolved: UInt32?
@@ -93,11 +93,11 @@ enum DisplayBindingResolver {
                     resolved = (0..<ordered.count).contains(i) ? ordered[i] : nil
                 }
                 guard let id = resolved else {
-                    Log.config.error("display.monitors: macDisplay \(String(describing: b.macDisplay), privacy: .public) unresolved for rdpSlot \(b.rdpSlot, privacy: .public), will auto-fill")
+                    LogTo.config.error("display.monitors: macDisplay \(String(describing: b.macDisplay)) unresolved for rdpSlot \(b.rdpSlot), will auto-fill")
                     continue
                 }
                 if consumed.contains(id) {
-                    Log.config.error("display.monitors: displayID \(id, privacy: .public) bound twice, ignoring rdpSlot \(b.rdpSlot, privacy: .public)")
+                    LogTo.config.error("display.monitors: displayID \(id) bound twice, ignoring rdpSlot \(b.rdpSlot)")
                     continue
                 }
                 mapping.bind(rdpSlot: b.rdpSlot, displayID: id)
@@ -122,7 +122,7 @@ enum DisplayBindingResolver {
         }
 
         if mapping.count < channelCount {
-            Log.config.notice("Bound only \(mapping.count, privacy: .public) of \(channelCount, privacy: .public) requested RDP monitor slot(s); macOS has \(displays.count, privacy: .public) display(s) available")
+            LogTo.config.notice("Bound only \(mapping.count) of \(channelCount) requested RDP monitor slot(s); macOS has \(displays.count) display(s) available")
         }
         return mapping
     }
