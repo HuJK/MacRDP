@@ -526,7 +526,7 @@ struct Config: Codable, Sendable {
         Config(
             listen: .init(host: "0.0.0.0", port: 3389),
             auth: .init(authUserPolicy: "self", username: nil,
-                        passwordPolicy: "none", domain: nil,
+                        passwordPolicy: "local", domain: nil,
                         ntHash: nil,
                         certificateFile: nil, privateKeyFile: nil,
                         certificateValidityDays: 3650,
