@@ -159,11 +159,15 @@ struct macrdp_session {
     /* Sample-time monotonic counter for AAC's audioTimeStamp field
      * (UINT32 wraps at ~89000s @ 48kHz). */
     _Atomic uint32_t       audio_total_samples;
-    /* Playback-progress tracking (RDPSND block confirms). All wTimestamps are
-     * ms-since-activation mod 2^16. Lag = last_sent_ts - confirmed_ts. Used to
-     * drop-to-recover so a stall can't accumulate unbounded latency. */
-    _Atomic uint16_t       audio_last_sent_ts;
-    _Atomic uint16_t       audio_confirmed_ts;
+    /* Playback-progress tracking. Lag is measured per-block via a ring of
+     * monotonic ms timestamps keyed by RDPSND `bBlockNo` (uint8, 256 wrap):
+     * we record now_ms() when block N goes out the wire; the WaveConfirm
+     * for that block tells us "client played N", so lag = now - sent[N].
+     * Monotonic source means no 16-bit wTimestamp wraparound to handle and
+     * no aliasing of >65.5s gaps to small numbers. 0 = never recorded
+     * (init / first-block race), confirm skips the lag update in that case. */
+    _Atomic uint64_t       audio_sent_ms[256];
+    _Atomic uint16_t       audio_confirmed_ts;     /* echoed back, info-only */
     _Atomic uint8_t        audio_confirmed_block;
     _Atomic int32_t        audio_have_confirm;     /* 0 until first confirm */
     _Atomic uint64_t       audio_lag_log_ms;       /* last periodic log time */
@@ -815,11 +819,16 @@ static UINT rdpsnd_confirm_block_cb(RdpsndServerContext *ctx,
     atomic_store(&s->audio_have_confirm, 1);
 
     uint64_t now = now_ms();
-    /* Lag = gap between our latest sent packet and the just-played block. */
-    UINT16 sentTs = atomic_load(&s->audio_last_sent_ts);
-    int lag = (int)(UINT16)(sentTs - wtimestamp);   /* mod-2^16 ms */
-    if (lag < 0) lag = 0;
-    if (lag > 30000) lag = 30000;                   /* guard wrap / client-ahead */
+    /* Per-confirm lag: now − send_ms[bBlockNo]. Monotonic ms (no 16-bit
+     * wTimestamp wrap), so any spike is real. sent==0 means we never
+     * recorded a send for this block id — happens at init or if a confirm
+     * raced the send-side store; skip the lag update for that confirm. */
+    uint64_t sent = atomic_load(&s->audio_sent_ms[confirmBlockNum]);
+    if (sent == 0 || now < sent) {
+        return CHANNEL_RC_OK;
+    }
+    uint64_t elapsed = now - sent;
+    int lag = (elapsed > 30000) ? 30000 : (int)elapsed;
 
     /* Update the 1-second bucket ring of lag minima. */
     if (s->audio_lag_count == 0) {
@@ -882,12 +891,13 @@ static UINT rdpsnd_confirm_block_cb(RdpsndServerContext *ctx,
     return CHANNEL_RC_OK;
 }
 
-/* True if we should DROP this audio packet to bound buffered latency. Records
- * the would-be send timestamp (for lag), then decides from the published
- * floors: drop on sustained DRIFT (floor rising above the reference) — never
- * on jitter — plus an absolute backstop for very slow skew. Codec-independent. */
+/* True if we should DROP this audio packet to bound buffered latency.
+ * Decides purely from the published floors: drop on sustained DRIFT (floor
+ * rising above the reference) — never on jitter — plus an absolute backstop
+ * for very slow skew. Codec-independent. The per-block send-time recording
+ * happens AFTER the send (see *_send_audio_*), not here. */
 static bool rdpsnd_should_drop(struct macrdp_session *s, UINT16 wTimestamp) {
-    atomic_store(&s->audio_last_sent_ts, wTimestamp);
+    (void)wTimestamp;  /* legacy arg; lag is now block-indexed, see confirm cb */
     if (!atomic_load(&s->audio_have_confirm)) return false;   /* let it prime */
     int drift = atomic_load(&s->audio_drift_ms);
     int shortFloor = atomic_load(&s->audio_short_floor_ms);
@@ -1662,8 +1672,8 @@ int32_t macrdp_session_create(int fd,
     atomic_init(&s->audio_start_ms, 0);
     atomic_init(&s->audio_selected_format, MACRDP_AUDIO_FORMAT_PCM);
     atomic_init(&s->audio_selected_format_no, 0);
+    for (int i = 0; i < 256; i++) atomic_init(&s->audio_sent_ms[i], (uint64_t)0);
     atomic_init(&s->audio_total_samples, 0);
-    atomic_init(&s->audio_last_sent_ts, 0);
     atomic_init(&s->audio_confirmed_ts, 0);
     atomic_init(&s->audio_confirmed_block, 0);
     atomic_init(&s->audio_have_confirm, 0);
@@ -2508,6 +2518,13 @@ int32_t macrdp_session_send_audio_pcm(macrdp_session_t s,
     if (rdpsnd_should_drop(s, wTimestamp)) return MACRDP_E_FRAME_DROPPED;
     UINT rc = s->rdpsnd->SendSamples(s->rdpsnd, pcm, nframes, wTimestamp);
     if (rc == CHANNEL_RC_OK) {
+        /* Record per-block send time for the lag metric. FreeRDP incremented
+         * ctx->block_no inside SendSamples, so the block we just put on the
+         * wire was (block_no - 1). Race with confirm is theoretical (write
+         * is microseconds, confirm round-trip is ms+); a missed-record entry
+         * just shows sent==0 in the confirm cb and skips that lag sample. */
+        uint8_t sent_block = (uint8_t)(s->rdpsnd->block_no - 1);
+        atomic_store(&s->audio_sent_ms[sent_block], now_ms());
         atomic_fetch_add(&s->audio_total_samples, (uint32_t)nframes);
     }
     return rc == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL;
@@ -2542,10 +2559,16 @@ int32_t macrdp_session_send_audio_aac(macrdp_session_t s,
     if (rdpsnd_should_drop(s, wTimestamp)) return MACRDP_E_FRAME_DROPPED;
     UINT16 formatNo   = (UINT16)atomic_load(&s->audio_selected_format_no);
     UINT32 audioTS    = (UINT32)(elapsed & 0xFFFFFFFFu);
-    (void)pcm_sample_count;  /* still incremented for diagnostic purposes */
-    atomic_fetch_add(&s->audio_total_samples, pcm_sample_count);
     UINT rc = s->rdpsnd->SendSamples2(s->rdpsnd, formatNo,
                                        aac, bytes, wTimestamp, audioTS);
+    if (rc == CHANNEL_RC_OK) {
+        /* Per-block monotonic send time for the lag metric (see PCM path). */
+        uint8_t sent_block = (uint8_t)(s->rdpsnd->block_no - 1);
+        atomic_store(&s->audio_sent_ms[sent_block], now_ms());
+        atomic_fetch_add(&s->audio_total_samples, pcm_sample_count);
+    } else {
+        (void)pcm_sample_count;
+    }
     return rc == CHANNEL_RC_OK ? MACRDP_OK : MACRDP_E_INTERNAL;
 #else
     (void)s; (void)aac; (void)bytes; (void)pcm_sample_count;

@@ -222,12 +222,18 @@ final class DisplayPipeline {
                 guard let h = audioHandler else { return }
                 let frameCount = CMSampleBufferGetNumSamples(sample)
                 let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
-                let t0 = CACurrentMediaTime()
+                // T_arrive: when SCK actually handed us this buffer. PTS is
+                // when the audio was captured. The gap is hop A latency —
+                // SCK's own capture + buffer delay before we ever see it.
+                let arrived = CACurrentMediaTime()
+                let sckDelayMs = max(0.0, (arrived - pts) * 1000)
+                let t0 = arrived
                 if let pcm = Self.extractInt16StereoPCM(from: sample) {
                     h(pcm)
                 }
                 let dt = CACurrentMediaTime() - t0
-                audioStats.tick(frames: frameCount, ptsSec: pts, sendMs: dt * 1000)
+                audioStats.tick(frames: frameCount, ptsSec: pts,
+                                sckDelayMs: sckDelayMs, sendMs: dt * 1000)
             },
             onStopped: { [weak self] error in
                 Task { @MainActor [weak self] in
@@ -398,8 +404,20 @@ final class DisplayPipeline {
 
     /// Convert an SCK audio CMSampleBuffer (Float32 planar @ configured
     /// sample rate / channel count) into Int16LE interleaved bytes for
-    /// Tracks the audio path: producer rate vs. real-time, chunk size
-    /// distribution, time spent in our send path. Logs every ~2s.
+    /// RDPSND. Tracks the audio path: producer rate vs. real-time, chunk
+    /// size distribution, time spent in our send path, AND the
+    /// PTS→arrival delay from SCK itself (hop A — everything that
+    /// happens before the buffer reaches our callback). Logs every ~2s.
+    ///
+    /// Reading the line:
+    ///   * `sck(avg/max)` — capture→our-callback gap. Steady-state value
+    ///      is SCK's own internal buffer (~10-50ms on a healthy stream);
+    ///      growth means SCK is delivering older audio each tick.
+    ///   * `send(avg/max)` — time we spend in extractPCM + AAC encode +
+    ///      bridge handoff per chunk.
+    ///   * `drift` — cumulative (wallElapsed − ptsElapsed); if it keeps
+    ///      growing the producer / consumer rates have diverged.
+    ///
     /// `@unchecked Sendable` because the proxy closure captures it from
     /// any thread; internal lock serializes the counters.
     fileprivate final class AudioStats: @unchecked Sendable {
@@ -410,11 +428,13 @@ final class DisplayPipeline {
         private var minChunk: Int = .max
         private var maxSendMs: Double = 0
         private var sumSendMs: Double = 0
+        private var maxSCKMs: Double = 0
+        private var sumSCKMs: Double = 0
         private var samples: Int = 0
         private var lastLogWall: Double = 0
         private var firstPTS: Double = -1
 
-        func tick(frames: Int, ptsSec: Double, sendMs: Double) {
+        func tick(frames: Int, ptsSec: Double, sckDelayMs: Double, sendMs: Double) {
             lock.lock()
             let now = CACurrentMediaTime()
             if startWall == 0 { startWall = now; lastLogWall = now }
@@ -424,22 +444,28 @@ final class DisplayPipeline {
             minChunk = min(minChunk, frames)
             maxSendMs = max(maxSendMs, sendMs)
             sumSendMs += sendMs
+            maxSCKMs = max(maxSCKMs, sckDelayMs)
+            sumSCKMs += sckDelayMs
             samples += 1
             if now - lastLogWall >= 2.0 {
                 let wallElapsed = now - startWall
                 let measuredRate = Double(totalFrames) / wallElapsed
                 let ptsElapsed = ptsSec - firstPTS
-                // PTS drift = wall - PTS. If positive and growing, we're
-                // falling behind SCK's queue (SCK delivers older audio
-                // each tick). If negative, we're somehow ahead (unlikely).
                 let drift = wallElapsed - ptsElapsed
                 let avgSend = sumSendMs / Double(samples)
+                let avgSCK  = sumSCKMs  / Double(samples)
+                let snapMinChunk = minChunk == .max ? -1 : minChunk
+                let snapMaxChunk = maxChunk
+                let snapMaxSend  = maxSendMs
+                let snapMaxSCK   = maxSCKMs
                 lock.unlock()
-                LogTo.audioOut.info("Audio: rate=\(Int(measuredRate))Hz drift=\(Int(drift*1000))ms chunk(min/max)=\(self.minChunk == .max ? -1 : self.minChunk)/\(self.maxChunk) send(avg/max)=\(Int(avgSend))/\(Int(self.maxSendMs))ms")
+                LogTo.audioOut.info("Audio: rate=\(Int(measuredRate))Hz drift=\(Int(drift*1000))ms chunk(min/max)=\(snapMinChunk)/\(snapMaxChunk) sck(avg/max)=\(Int(avgSCK))/\(Int(snapMaxSCK))ms send(avg/max)=\(Int(avgSend))/\(Int(snapMaxSend))ms")
                 lock.lock()
                 lastLogWall = now
                 maxChunk = 0; minChunk = .max
-                maxSendMs = 0; sumSendMs = 0; samples = 0
+                maxSendMs = 0; sumSendMs = 0
+                maxSCKMs = 0; sumSCKMs = 0
+                samples = 0
             }
             lock.unlock()
         }
