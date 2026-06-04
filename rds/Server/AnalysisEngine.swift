@@ -41,14 +41,19 @@ final class AnalysisEngine: @unchecked Sendable {
 
     // --- engine-owned state (touched only on `queue`) ---
     //
-    // The engine carries no codec-decision state of its own. Each tick it
-    // takes whatever (active, desired) the classifier returns and publishes
-    // it unchanged. All hysteresis / smoothing lives inside the classifier
-    // (the Schmitt band over its history window).
+    // The engine doesn't decide which codec a tile should use — the
+    // classifier's Schmitt does. But the engine DOES need to know the last
+    // codec it actually shipped to the client per tile, so it can detect
+    // Schmitt-driven transitions (e.g. h264 → progressive after a video
+    // pauses): when that happens for a tile that's not active this frame,
+    // the engine forces a one-shot publish of the new codec. Without this,
+    // the client would keep showing the old codec's frozen frame until the
+    // tile became active again.
     private var grid: TileGrid
     private var primed = false
     private var submitCount: Int = 0
     private var lastAnalysisMs: UInt64 = 0
+    private var lastPublishedDesired: [UInt8] = []   // per-tile last codec shipped
 
     init(tile: Config.TileConfig, store: TileCodecMapStore) {
         self.store = store
@@ -194,13 +199,24 @@ final class AnalysisEngine: @unchecked Sendable {
             dirtyRects: dirtyValid ? dirty : nil, pixel: pixel)
         guard active.count == grid.tileCount, desired.count == grid.tileCount else { return }
 
-        // Pure pass-through: each tile is either skipped (not active this
-        // frame) or sent with the codec the classifier picked. No extra
-        // hysteresis layer, no settle-on-idle override. The classifier's
-        // Schmitt band over its history window is the only enter/exit gate.
+        // Three cases per tile:
+        //   1. active[i] = true → send with classifier-desired codec.
+        //   2. !active[i] but desired[i] changed since we last shipped a
+        //      codec for this tile → Schmitt-driven transition (e.g. video
+        //      paused, h264 history decayed, Schmitt exited to progressive).
+        //      Force ONE publish so the client redraws this tile in the new
+        //      codec; without it the client would keep displaying the old
+        //      h264 frozen frame indefinitely.
+        //   3. otherwise → skip (no work, no bandwidth).
         var newTiles = [UInt8](repeating: TileCodec.skip.rawValue, count: grid.tileCount)
         for i in 0..<grid.tileCount {
-            newTiles[i] = active[i] ? desired[i] : TileCodec.skip.rawValue
+            if active[i] {
+                newTiles[i] = desired[i]
+                lastPublishedDesired[i] = desired[i]
+            } else if desired[i] != lastPublishedDesired[i] {
+                newTiles[i] = desired[i]
+                lastPublishedDesired[i] = desired[i]
+            }
         }
 
         primed = true
@@ -210,7 +226,13 @@ final class AnalysisEngine: @unchecked Sendable {
     // MARK: - Helpers
 
     private func allocState(for g: TileGrid) {
-        // Engine carries no per-tile decision state now; just reset counters.
+        // The client starts every (re-)negotiated surface blank → it's
+        // showing nothing, which is equivalent to "progressive". Seed
+        // lastPublishedDesired to Progressive so a tile's first emit at
+        // h264 counts as a transition, and a tile that never leaves
+        // Progressive never spuriously force-publishes.
+        let n = max(0, g.tileCount)
+        lastPublishedDesired = [UInt8](repeating: TileCodec.progressive.rawValue, count: n)
         submitCount = 0
     }
 
