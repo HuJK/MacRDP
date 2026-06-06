@@ -75,31 +75,39 @@ video:
     # unavailable, the server logs a fault and exits.
     classifiers: [dirtyFreqDR]
 
-    # Each classifier owns its OWN sub-config — including cadence (when to
-    # run). The history-window Schmitt band (videoFractionEnter /
-    # videoFractionExit) is the ONLY enter/exit gate: no engine-side
-    # hysteresis, no "settle on idle" repaint. When a tile stops being
-    # touched the window fills with 0s, the fraction decays past exit, and
-    # the Schmitt flips back to Progressive on its own.
+    # Engine analysis cadence. Shared across the chain — the engine ticks at
+    # one rate whichever classifier wins. Decoupled from the Schmitt window:
+    # window-based classifiers bucket observations by wall-clock (see their
+    # bucketMs / bucketCount below), so this only controls CPU cost. SCK has
+    # already filtered .idle frames upstream, so submit rate ≈ source frame
+    # rate; frameInterval=1 = analyze every .complete. Raise (e.g. 4) when
+    # pixelRate is the active classifier and per-pixel diff hurts CPU.
+    analysis: { frameInterval: 1 }
+
+    # Window-based classifiers (dirtyFreqDR / pixelRate) use a wall-clock
+    # time-bucketed Schmitt: each bucket is `bucketMs` wide and records
+    # whether the tile was touched at all during that slice; the ring holds
+    # `bucketCount` buckets. enter/exit are ABSOLUTE bucket counts (Int,
+    # not fractions). "0.9 of the window" at bucketCount=60 means
+    # videoFramesEnter=54. Require videoFramesEnter > videoFramesExit and
+    # both in [0, bucketCount]. This is the ONLY enter/exit gate — no
+    # engine-side hysteresis, no "settle on idle" repaint. When a tile
+    # stops being touched, buckets scroll out, the count drops past
+    # videoFramesExit, and the Schmitt flips back to Progressive on its own.
     blobDR:
       tileActiveCoverage: 0.02
       largeRegionTiles: 12
-      analysis: { frameInterval: 2, minIntervalMs: 33 }
     dirtyFreqDR:
-      tileActiveCoverage: 0.02
-      historyFrames: 90               # honored verbatim — no silent cap
-      videoFractionEnter: 0.9
-      videoFractionExit: 0.1
-      analysis: { frameInterval: 2, minIntervalMs: 33 }
+      bucketMs:           17       # ≈ 1 frame at 60 fps
+      bucketCount:        60       # window = 1020 ms ≈ 1 s
+      videoFramesEnter:   54       # ≈ 0.9 × 60
+      videoFramesExit:     6       # ≈ 0.1 × 60
     pixelRate:
-      tileActiveCoverage: 0.02
-      perFrameCoverageThreshold: 0.1
-      historyFrames: 30
-      videoFractionEnter: 0.9
-      videoFractionExit: 0.4
-      # pixelRate is the expensive one — dial cadence back when you make it
-      # the active classifier (e.g. frameInterval: 4).
-      analysis: { frameInterval: 2, minIntervalMs: 33 }
+      perFrameCoverageThreshold:  0.1
+      bucketMs:           33       # pixelRate is the expensive one — coarser buckets
+      bucketCount:        30       # window ≈ 1 s
+      videoFramesEnter:   27       # ≈ 0.9 × 30
+      videoFramesExit:    12       # ≈ 0.4 × 30
 
     # Applied to the classifier's OUTPUT regardless of which one ran. Not a
     # per-classifier tuning.
@@ -200,3 +208,17 @@ log:
     input:     notice  # keyboard/mouse injection, sticky modifiers
     resize:    notice  # client DISP requests, mode setter, resize hook
     config:    notice  # config load, display-binding resolution
+
+  # FreeRDP's own WLog tree, separate from `sources` above (lives inside
+  # libfreerdp-c, distinct level names, distinct channel namespace). Applied
+  # via env vars at boot: `default` → WLOG_LEVEL, `filters` → WLOG_FILTER.
+  # Levels: OFF | FATAL | ERROR | WARN | INFO | DEBUG | TRACE.
+  # Process env (WLOG_LEVEL / WLOG_FILTER) still overrides yaml, so a one-
+  # shot `WLOG_FILTER='com.freerdp.gdi:TRACE' MacRDP` keeps working.
+  freerdp:
+    default: DEBUG                  # current bring-up baseline; lower to WARN once stable
+    filters:
+      # Glob suffixes are honored by WLog itself. Examples:
+      # com.freerdp.channels.audin.server: WARN
+      # com.freerdp.channels.audin.*:      WARN
+      # com.freerdp.channels.rdpsnd.*:     WARN

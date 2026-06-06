@@ -22,8 +22,13 @@ import Foundation
 import CoreGraphics
 
 /// Per-tile codec decision. Stored as the raw `UInt8` in the map buffer.
+/// Every analysis publishes one of these for every tile — there is no
+/// "skip / leave it" value. Always painting the full surface trades a bit
+/// of redundant blit bandwidth for never letting the client surface drift
+/// out of sync when a tile's dirty rect is missed or coalesced away.
+/// (Raw value 0 is unused by this enum but appears in HybridCoordinator's
+/// private scratch buffers as a "not this codec" sentinel.)
 enum TileCodec: UInt8 {
-    case skip        = 0   // unchanged since last frame → send via neither codec
     case progressive = 1   // text / static / UI → RemoteFX Progressive
     case h264        = 2   // video / photographic / motion → AVC420
 }
@@ -162,11 +167,6 @@ protocol HybridFrameSink: AnyObject, Sendable {
     /// Send one composed frame. `annexB == nil` means a Progressive-only frame
     /// (no video tiles this frame). May be called from any thread.
     func send(annexB: Data?, isIDR: Bool, pts: CMTime, payload: HybridFramePayload)
-    /// Convergence: on a non-`.complete` (idle) frame, if the last sent frame
-    /// painted an H.264 region, deliver ONE crisp Progressive repaint of that
-    /// region from `pixel` (the now-static content) so it doesn't stay stuck on
-    /// the last lossy H.264 blit. Does NOT run analysis. Called on MainActor.
-    func flushSettle(pixel: CVPixelBuffer, width: Int, height: Int, stride: Int)
     /// Consume a pending IDR request, set when a late H.264 send had every one
     /// of its blit rects filtered out (the AVC NAL was therefore dropped to
     /// avoid stomping newer Progressive paints, which leaves the client decoder
@@ -176,8 +176,11 @@ protocol HybridFrameSink: AnyObject, Sendable {
 }
 
 /// Merge same-codec tiles into rectangles. Greedy per-row run-merge followed
-/// by a vertical merge of identical horizontal spans in adjacent rows.
-/// `.skip` tiles land in neither list (the surface keeps its prior content).
+/// by a vertical merge of identical horizontal spans in adjacent rows. The
+/// published map always carries one of the two real codecs per tile, so
+/// `videoRects + staticRects` covers the full surface — no gaps. Tiles
+/// whose byte happens to match neither codec (HybridCoordinator's private
+/// scratch buffers do this on purpose) land in neither list.
 func coalesce(tiles: [UInt8], grid: TileGrid)
     -> (videoRects: [Rect16], staticRects: [Rect16]) {
     guard grid.cols > 0, grid.rows > 0, tiles.count == grid.tileCount else {

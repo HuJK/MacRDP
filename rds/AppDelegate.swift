@@ -134,11 +134,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // log call so the gate is in effect from line one.
         LogTo.apply(config.log)
 
-        // Crank FreeRDP's WLog up so we see GFX channel byte-level
-        // activity alongside our os.Logger output.
-        if getenv("WLOG_LEVEL") == nil {
-            setenv("WLOG_LEVEL", "DEBUG", 1)
-        }
+        // Push WLog gates from config.log.freerdp into env vars before any
+        // FreeRDP bridge call. Existing WLOG_LEVEL / WLOG_FILTER on the
+        // process still wins, so a one-shot env override at launch
+        // continues to work for ad-hoc debugging.
+        LogTo.applyFreeRDP(config.log.freerdp)
 
         LogTo.server.notice("MacRDP server starting on \(config.listen.host):\(config.listen.port)")
 

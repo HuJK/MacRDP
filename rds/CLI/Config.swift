@@ -152,20 +152,24 @@ struct Config: Codable, Sendable {
 
     /// Per-tile hybrid-codec tunables.
     ///
-    /// Only two kinds of knobs sit at top level:
+    /// Three kinds of knobs sit at top level:
     ///   * **Structural invariants** — the grid partition (`tileSize`) and the
     ///     classifier chain selector (`classifiers`). Both are shared by
     ///     construction, not by accident: there's exactly one tile grid in
     ///     play at a time, and the chain IS the choice of which classifier to
     ///     run; neither is a per-classifier tuning.
+    ///   * **Engine cadence** (`analysis`) — when AnalysisEngine ticks. The
+    ///     engine runs one tile classification per tick regardless of which
+    ///     chain entry wins; the cadence describes the engine, not any
+    ///     particular classifier. (Earlier this lived in three identical
+    ///     copies under each classifier; that was indirection without payoff.)
     ///   * **Encoder-side concerns** (`mask`, `encoder`) — applied to the
     ///     classifier's OUTPUT regardless of which classifier produced it.
     ///
     /// Everything else lives under exactly ONE classifier's sub-block. When
-    /// AnalysisEngine runs classifier X for a tick, every tunable it reads —
-    /// including cadence (when to run) and switching (how to stabilize the
-    /// output) — comes from `hybrid.X.*`. No knob is shared across classifier
-    /// choices, and tuning two classifiers can never collide.
+    /// AnalysisEngine runs classifier X for a tick, only the classifier-
+    /// specific thresholds (Schmitt band, history window, coverage cutoffs)
+    /// come from `hybrid.X.*` — tuning two classifiers can never collide.
     struct TileConfig: Codable, Sendable {
         /// Square tile edge in pixels. The grid is cols×rows where
         /// cols = ceil(width/tileSize), rows = ceil(height/tileSize).
@@ -181,8 +185,19 @@ struct Config: Codable, Sendable {
         /// Recognized entries: "blobDR", "dirtyFreqDR", "pixelRate".
         var classifiers: [String]
 
-        /// Per-classifier sub-configs. Each is self-contained: cadence,
-        /// switching, and every classifier-specific threshold live here.
+        /// When + how often the engine ticks an analysis. Shared across the
+        /// chain: the engine runs one classification per tick whichever
+        /// classifier the chain picks. Decoupled from the Schmitt window —
+        /// window-based classifiers (dirtyFreqDR / pixelRate) bucket
+        /// observations by wall-clock (see their `bucketMs` / `bucketCount`),
+        /// so this cadence only controls CPU cost, NOT how long the window
+        /// covers. Lower `frameInterval` to react faster; raise it to spend
+        /// less CPU.
+        var analysis: AnalysisCadence
+
+        /// Per-classifier sub-configs. Each holds only its classifier's
+        /// thresholds (Schmitt band, history window, coverage cutoffs);
+        /// cadence is shared above.
         var blobDR: BlobDRConfig
         var dirtyFreqDR: DirtyFreqDRConfig
         var pixelRate: PixelRateConfig
@@ -200,17 +215,22 @@ struct Config: Codable, Sendable {
 
         struct AnalysisCadence: Codable, Sendable {
             /// Analyze only every Nth submitted frame (1 = every frame).
+            /// Single CPU knob — wall-clock alignment is the time-bucket
+            /// window's job. SCK pre-filters .idle frames so submits already
+            /// track real content change, and within a bucket multiple
+            /// observations OR idempotently, so an occasional submit burst
+            /// is harmless. Raise (e.g. 4) when pixelRate is the active
+            /// classifier and per-pixel diff dominates CPU.
             var frameInterval: Int
-            /// Floor between two analyses, milliseconds (rate limit under load).
-            var minIntervalMs: Int
         }
 
         // No post-classification "switching" layer: the only enter/exit
         // mechanism is each classifier's own Schmitt-trigger band
-        // (videoFractionEnter / videoFractionExit) running over its history
-        // window. There is no engine-side hysteresisFrames and no
-        // "settle on idle" repaint path; when a tile stops changing, its
-        // window fills with 0s and the Schmitt exits on its own.
+        // (videoFramesEnter / videoFramesExit) running over its time-
+        // bucketed window. There is no engine-side hysteresisFrames and no
+        // "settle on idle" repaint path; when a tile stops being touched,
+        // its buckets scroll out, popcount falls past videoFramesExit, and
+        // the Schmitt flips to Progressive on its own.
 
         /// "blobDR" — dirtyRects → connected-component AREA of touched tiles.
         /// This classifier has no temporal smoothing of its own — it's an
@@ -223,43 +243,46 @@ struct Config: Codable, Sendable {
             /// Connected changed-tile blobs with area (in tiles) ≥ this go to
             /// H.264; smaller blobs → Progressive.
             var largeRegionTiles: Int
-            /// When + how often this classifier runs.
-            var analysis: AnalysisCadence
         }
         typealias BlobDRConfig = BlobDRClassifierConfig
 
-        /// "dirtyFreqDR" — per-tile FREQUENCY of being touched by dirtyRects
-        /// over a recent window (a true touched/not boolean per frame).
+        /// "dirtyFreqDR" — per-tile presence in dirtyRects across the recent
+        /// wall-clock window (true touched/not boolean per analysis tick,
+        /// OR'd into the current time bucket).
         struct DirtyFreqDRClassifierConfig: Codable, Sendable {
-            var tileActiveCoverage: Double
-            /// Window length (analyses) of the per-tile bit history. Honored
-            /// verbatim — no silent cap. Memory grows ~tileCount * window
+            /// Width of one bucket in the time-bucketed history (ms). A
+            /// single bucket is the finest "was the tile touched at all
+            /// during this slice?" question — pick close to one expected
+            /// capture-frame's worth (e.g. 17 ms at 60 fps, 33 ms at 30 fps).
+            var bucketMs: Int
+            /// Number of buckets in the window. Total wall-clock window =
+            /// `bucketMs × bucketCount`. Memory: ~tileCount × bucketCount
             /// bytes (a few hundred KB at 4K/64).
-            var historyFrames: Int
-            /// Schmitt-trigger band on the windowed set-bit fraction.
+            var bucketCount: Int
+            /// Schmitt-trigger band on the absolute count of buckets that
+            /// were marked "touched" inside the window (Int, not fraction).
             ///   * enter ≥ flips to H.264
             ///   * exit  < flips back to Progressive (including the case
-            ///            where the tile fully stops being touched: window
-            ///            fills with 0s, fraction decays past exit)
-            /// Require enter > exit. This is the ONLY enter/exit gate.
-            var videoFractionEnter: Double
-            var videoFractionExit: Double
-            var analysis: AnalysisCadence
+            ///            where the tile fully stops being touched: buckets
+            ///            scroll out, popcount drops past exit)
+            /// Require enter > exit, both in [0, bucketCount]. This is the
+            /// ONLY enter/exit gate.
+            var videoFramesEnter: Int
+            var videoFramesExit: Int
         }
         typealias DirtyFreqDRConfig = DirtyFreqDRClassifierConfig
 
         /// "pixelRate" — full-frame per-pixel RGB comparison, then the same
-        /// windowed-fraction + Schmitt-band shape as dirtyFreqDR (but the
-        /// per-frame bit is a real coverage threshold, not a boolean touch).
+        /// time-bucketed Schmitt as dirtyFreqDR (but the per-analysis bit
+        /// is a real coverage threshold, not a boolean touch).
         struct PixelRateClassifierConfig: Codable, Sendable {
-            var tileActiveCoverage: Double
-            /// Per-frame changed-pixel coverage above which the tile's frame
-            /// counts as "high-change" (fraction 0–1).
+            /// Per-analysis changed-pixel coverage above which the tile's
+            /// frame counts as "high-change" (fraction 0–1).
             var perFrameCoverageThreshold: Double
-            var historyFrames: Int
-            var videoFractionEnter: Double
-            var videoFractionExit: Double
-            var analysis: AnalysisCadence
+            var bucketMs: Int
+            var bucketCount: Int
+            var videoFramesEnter: Int
+            var videoFramesExit: Int
         }
         typealias PixelRateConfig = PixelRateClassifierConfig
 
@@ -552,6 +575,11 @@ struct Config: Codable, Sendable {
         /// at the same level as `default` so an operator copying defaults
         /// can see what's tunable.
         var sources: [String: String]
+        /// FreeRDP's own WLog tree. Lives inside libfreerdp-c and uses its
+        /// own level naming (OFF / FATAL / ERROR / WARN / INFO / DEBUG /
+        /// TRACE) and channel namespace (`com.freerdp.…`), separate from
+        /// the `sources` above. We drive it through env vars at boot.
+        var freerdp: FreeRDPConfig
 
         /// What to prepend to each emitted message. Both knobs default off;
         /// they're useful when piping the unified log out to a plain-text
@@ -565,6 +593,23 @@ struct Config: Codable, Sendable {
             /// `timestamp`: redundant in Console.app (it shows the category
             /// in its own column), useful in compact text dumps.
             var prefix: Bool
+        }
+
+        /// WLog gates applied via env vars before the FreeRDP bridge spins
+        /// up. Env vars set on the process win, so a one-shot
+        /// `WLOG_LEVEL=… WLOG_FILTER=… MacRDP` still overrides yaml for a
+        /// single run. Level names follow WLog's own convention (OFF /
+        /// FATAL / ERROR / WARN / INFO / DEBUG / TRACE) — NOT the
+        /// `LogLevel.parse` set used by `sources`.
+        struct FreeRDPConfig: Codable, Sendable {
+            /// Fallback WLog level for channels not matched by `filters`.
+            /// Maps to `WLOG_LEVEL`.
+            var `default`: String
+            /// Per-channel WLog level. Keys are WLog channel names like
+            /// `com.freerdp.channels.audin.server`; glob suffixes are
+            /// honored by WLog itself (e.g. `com.freerdp.channels.audin.*`).
+            /// Joined into `WLOG_FILTER` as `channel:level,…`.
+            var filters: [String: String]
         }
     }
 }

@@ -83,42 +83,35 @@ enum DefaultConfig {
 
     // MARK: - tile
 
-    // Per-classifier cadence defaults. The numbers happen to be the same
-    // starting point for all three, but they live with their owning
-    // classifier so you can diverge them later without a schema change.
-
-    /// blobDR is cheap (region-area on a dirty-rect bitmap). Run often.
-    static let blobDRAnalysisDefault = Config.TileConfig.AnalysisCadence(
-        frameInterval: 2, minIntervalMs: 33)
-    /// dirtyFreqDR is cheap and reads from a rolling window already.
-    static let dirtyFreqDRAnalysisDefault = Config.TileConfig.AnalysisCadence(
-        frameInterval: 2, minIntervalMs: 33)
-    /// pixelRate is the expensive one (full-frame per-pixel compare). The
-    /// engine still runs it at the same baseline cadence; the operator
-    /// dials it back here when they pick pixelRate as the active classifier.
-    static let pixelRateAnalysisDefault = Config.TileConfig.AnalysisCadence(
-        frameInterval: 2, minIntervalMs: 33)
+    /// Engine analysis cadence. Shared across the chain — the engine ticks
+    /// at one rate regardless of which classifier wins. Decoupled from the
+    /// Schmitt window: window-based classifiers bucket by wall-clock (see
+    /// their `bucketMs` / `bucketCount`), so this knob only controls CPU.
+    /// frameInterval=1 = analyze on every .complete submit (SCK already
+    /// filters idle frames, so submit rate ≈ source frame rate). Raise
+    /// (e.g. 4) when `pixelRate` is the active classifier and per-pixel
+    /// diff dominates CPU.
+    static let tileAnalysisDefault = Config.TileConfig.AnalysisCadence(
+        frameInterval: 1)
 
     static let tileDefault = Config.TileConfig(
         tileSize: 64,
         classifiers: ["dirtyFreqDR"],
+        analysis: tileAnalysisDefault,
         blobDR: Config.TileConfig.BlobDRConfig(
             tileActiveCoverage: 0.02,
-            largeRegionTiles: 12,
-            analysis: blobDRAnalysisDefault),
+            largeRegionTiles: 12),
         dirtyFreqDR: Config.TileConfig.DirtyFreqDRConfig(
-            tileActiveCoverage: 0.02,
-            historyFrames: 30,
-            videoFractionEnter: 0.999,
-            videoFractionExit: 0.001,
-            analysis: dirtyFreqDRAnalysisDefault),
+            bucketMs:          33,
+            bucketCount:       90,
+            videoFramesEnter:  30,
+            videoFramesExit:    1),
         pixelRate: Config.TileConfig.PixelRateConfig(
-            tileActiveCoverage: 0.02,
-            perFrameCoverageThreshold: 0.1,
-            historyFrames: 30,
-            videoFractionEnter: 0.9,
-            videoFractionExit: 0.4,
-            analysis: pixelRateAnalysisDefault),
+            perFrameCoverageThreshold:  0.1,
+            bucketMs:           33,   // ≈ 1 frame at 30 fps (pixelRate is the expensive one)
+            bucketCount:        30,   // window ≈ 1 s
+            videoFramesEnter:   27,   // ≈ 0.9 × 30
+            videoFramesExit:    12),  // ≈ 0.4 × 30
         mask: Config.TileConfig.MaskConfig(
             enable: false,
             colorBGRA: 0xFF00_0000,  // opaque black
@@ -215,7 +208,7 @@ enum DefaultConfig {
     /// on when piping the unified log out to a plain-text stream.
     static let logFormatDefault = Config.LogConfig.FormatConfig(
         timestamp: false,
-        prefix:    false)
+        prefix:    true)
 
     /// Every known log source listed at the baseline level. Keeping the
     /// roster here (instead of an empty dict + "see Logging.swift") means
@@ -236,8 +229,18 @@ enum DefaultConfig {
         "config":    "notice",  // config load, display-binding resolution
     ]
 
+    /// WLog defaults. `default: DEBUG` preserves the legacy AppDelegate
+    /// behaviour (we wanted GFX-channel byte-level visibility for bring-up);
+    /// add per-channel overrides in `filters` to silence noisy subsystems
+    /// without dropping the global level. Empty `filters` = no WLOG_FILTER
+    /// is set (i.e. all channels at `default`).
+    static let freerdpLogDefault = Config.LogConfig.FreeRDPConfig(
+        default: "DEBUG",
+        filters: [:])
+
     static let logDefault = Config.LogConfig(
         default: "notice",
         format:  logFormatDefault,
-        sources: logSourcesDefault)
+        sources: logSourcesDefault,
+        freerdp: freerdpLogDefault)
 }

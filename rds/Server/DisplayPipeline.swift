@@ -551,25 +551,14 @@ final class DisplayPipeline {
         guard CMSampleBufferIsValid(sample) else { return }
 
         // SCK delivers at the configured fps even when nothing changed.
-        // The frame's status attachment tells us if it's a real new
-        // frame (.complete), unchanged (.idle), occluded, etc. Drop
-        // anything that isn't actual new content — saves the entire
-        // encode pass + a wire round-trip, and lowers the latency tail
-        // for the *next* real change.
-        if !isCompleteFrame(sample) {
-            // Idle frame (content unchanged). Use it to converge: if the client
-            // is still showing a former H.264 region, repaint it once via
-            // Progressive so it doesn't stay stuck on the last lossy blit.
-            // No analysis here — idle frames carry no dirtyRects.
-            if let sink = hybridSink, !paused, !shouldDropCapture(),
-               let pixel = CMSampleBufferGetImageBuffer(sample) {
-                sink.flushSettle(pixel: pixel,
-                                 width: CVPixelBufferGetWidth(pixel),
-                                 height: CVPixelBufferGetHeight(pixel),
-                                 stride: CVPixelBufferGetBytesPerRow(pixel))
-            }
-            return
-        }
+        // The frame's status attachment tells us if it's a real new frame
+        // (.complete), unchanged (.idle), occluded, etc. Drop anything
+        // that isn't actual new content — saves the entire encode pass +
+        // a wire round-trip, and lowers the latency tail for the *next*
+        // real change. The hybrid Schmitt is now wall-clock-bucketed
+        // (TimeBucketHistory), so a tile that stops being touched exits
+        // H.264 naturally on the next .complete; no idle-driven repaint.
+        if !isCompleteFrame(sample) { return }
 
         guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
 

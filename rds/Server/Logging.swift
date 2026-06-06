@@ -188,6 +188,31 @@ enum LogTo {
         "config":    config,
     ]
 
+    /// Push `config.log.freerdp` into WLog's env-var gates (WLOG_LEVEL,
+    /// WLOG_FILTER) before the FreeRDP bridge initialises. Process-set env
+    /// already present wins — this lets a one-shot
+    /// `WLOG_LEVEL=… WLOG_FILTER=… MacRDP` override yaml for a single run
+    /// without editing the file.
+    ///
+    /// Level strings are passed verbatim to WLog (it does its own
+    /// case-insensitive parse for OFF/FATAL/ERROR/WARN/INFO/DEBUG/TRACE);
+    /// we don't validate here so a typo lands in the wlog "unknown level"
+    /// diag rather than being silently dropped on our side.
+    static func applyFreeRDP(_ cfg: Config.LogConfig.FreeRDPConfig) {
+        if getenv("WLOG_LEVEL") == nil {
+            setenv("WLOG_LEVEL", cfg.default, 1)
+        }
+        if getenv("WLOG_FILTER") == nil, !cfg.filters.isEmpty {
+            // Sort by channel name so the resulting filter string is
+            // deterministic across runs (Dictionary iteration order isn't).
+            let joined = cfg.filters
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value)" }
+                .joined(separator: ",")
+            setenv("WLOG_FILTER", joined, 1)
+        }
+    }
+
     /// Apply user-config log settings. Sets global format, sets every known
     /// source's `minLevel` to `cfg.default`, then applies per-source
     /// overrides. Unknown source names and unknown level names log a warning
