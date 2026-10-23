@@ -44,7 +44,7 @@ The two share an App Group (`group.com.mac-rdp.rds`) and a small set of duplicat
 model files (`SharedManifest.swift`, `FileProviderXPCProtocol.swift`).
 
 FreeRDP itself is vendored as a **git submodule** (`ThirdParty/FreeRDP`, pinned to
-release `3.26.0`) and built as static server libraries by
+release `3.32.2`) and built as static server libraries by
 [`scripts/vendor-freerdp.sh`](scripts/vendor-freerdp.sh) — only the server channels
 MacRDP needs are enabled; the client, X11/Wayland, and most extra codecs are
 disabled.

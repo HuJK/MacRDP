@@ -18,6 +18,8 @@
 #
 # Adding a new fix = create a new `hujk/fix/<bug>` branch off master; this
 # script picks it up automatically (it merges every hujk/fix/* branch).
+# A fix upstream has absorbed is retired by renaming it to
+# `hujk/upstreamed/<bug>`; with no fixes left, macrdp-fork is just master.
 #
 set -euo pipefail
 
@@ -40,17 +42,13 @@ FIXES=()
 while IFS= read -r _b; do
   [ -n "$_b" ] && FIXES+=("$_b")
 done < <(git for-each-ref --format='%(refname:short)' 'refs/heads/hujk/fix/*' | sort)
-if [ "${#FIXES[@]}" -eq 0 ]; then
-  echo "error: no hujk/fix/* branches found." >&2
-  exit 1
-fi
-
 echo "Base:    $BASE ($(git rev-parse --short "$BASE"))"
-echo "Fixes:   ${FIXES[*]}"
+echo "Fixes:   ${FIXES[*]:-none}"
 
-# Fresh integration branch from BASE, then merge each fix.
+# Fresh integration branch from BASE, then merge each fix. (The ${...+...}
+# form keeps bash 3.2's `set -u` happy when FIXES is empty.)
 git checkout -B "$INTEGRATION" "$BASE" >/dev/null
-for fix in "${FIXES[@]}"; do
+for fix in ${FIXES[@]+"${FIXES[@]}"}; do
   if ! git merge --no-ff --no-edit "$fix" >/dev/null 2>&1; then
     git merge --abort 2>/dev/null || true
     echo "error: merging '$fix' into $INTEGRATION conflicts." >&2

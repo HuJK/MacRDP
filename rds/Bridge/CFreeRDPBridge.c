@@ -1036,6 +1036,7 @@ static UINT cliprdr_send_server_caps(CliprdrServerContext *ctx) {
     if (ctx->hasHugeFileSupport)    general.generalFlags |= CB_HUGE_FILE_SUPPORT_ENABLED;
 
     CLIPRDR_CAPABILITIES caps = { 0 };
+    caps.common.msgType    = CB_CLIP_CAPS;
     caps.cCapabilitiesSets = 1;
     caps.capabilitySets    = (CLIPRDR_CAPABILITY_SET *)&general;
     return ctx->ServerCapabilities(ctx, &caps);
@@ -1593,13 +1594,18 @@ static BOOL configure_settings(rdpSettings *s,
     if (!freerdp_settings_set_bool(s, FreeRDP_RdpSecurity, TRUE))   return FALSE;
     if (!freerdp_settings_set_bool(s, FreeRDP_TlsSecurity, TRUE))   return FALSE;
     /* NLA: validate the client's NTLM proof against the NT-hash in our SAM
-     * file. Off → no authentication (open). */
+     * file. Off → no authentication (open). ExtSecurity (HYBRID_EX, NLA plus
+     * the early user authorization PDU) must follow it: since FreeRDP 3.32 a
+     * server selects HYBRID_EX whenever the client offers it and ExtSecurity
+     * is set, and it defaults to TRUE, so mstsc would be pushed into NLA. */
     if (cfg->enable_nla && cfg->ntlm_sam_file_path) {
         if (!freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, TRUE)) return FALSE;
+        if (!freerdp_settings_set_bool(s, FreeRDP_ExtSecurity, TRUE)) return FALSE;
         if (!freerdp_settings_set_string(s, FreeRDP_NtlmSamFile, cfg->ntlm_sam_file_path))
             return FALSE;
     } else {
         if (!freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, FALSE)) return FALSE;
+        if (!freerdp_settings_set_bool(s, FreeRDP_ExtSecurity, FALSE)) return FALSE;
     }
     if (!freerdp_settings_set_uint32(s, FreeRDP_EncryptionLevel,
                                      ENCRYPTION_LEVEL_CLIENT_COMPATIBLE)) return FALSE;

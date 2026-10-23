@@ -93,6 +93,9 @@ cmd_build() {
      [ ! -f "$REPO_ROOT/$SUBMODULE_PATH/.git" ]; then
     cmd_init
   fi
+  # WITH_JSON_DISABLED: since 3.32 WinPR picks up whatever cJSON / json-c /
+  # jansson it finds (Homebrew, conda) and the app would have to link it too;
+  # nothing MacRDP uses needs WinPR's JSON.
   mkdir -p "$BUILD_DIR"
   cmake -S "$REPO_ROOT/$SUBMODULE_PATH" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -130,6 +133,7 @@ cmd_build() {
     -DWITH_SOXR=OFF \
     -DWITH_OPUS=OFF \
     -DWITH_MANPAGES=OFF \
+    -DWITH_JSON_DISABLED=ON \
     -DWITH_INTERNAL_RC4=ON \
     -DWITH_INTERNAL_MD4=ON \
     -DWITH_INTERNAL_MD5=ON \
