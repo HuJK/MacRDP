@@ -220,16 +220,18 @@ final class InputInjector: @unchecked Sendable {
     }
 
     /// Per MS-RDPBCGR § 2.2.8.1.1.3.1.1.3 (Pointer Event PDU):
-    ///   - low 8 bits = magnitude (typically WHEEL_DELTA = 120 per notch)
-    ///   - PTRFLAGS_WHEEL_NEGATIVE (0x0100) = sign bit (down/left)
+    ///   - WheelRotationMask (0x01FF) = a 9-bit two's-complement rotation
+    ///     (WHEEL_DELTA = 120 per notch)
+    ///   - PTRFLAGS_WHEEL_NEGATIVE (0x0100) is that value's sign bit, so a
+    ///     negative rotation must be sign-extended, not negated: two notches
+    ///     down (-240) arrive as 0x110, not as 0x1F0.
     /// We map to pixel-unit scrolls — apps render those as the same smooth
     /// motion a Mac wheel mouse / trackpad would produce, regardless of
     /// per-app "line height". 1 notch → ~pixelsPerNotch screen pixels.
     private func postWheel(flags: UInt16) {
         let pixelsPerNotch = self.wheelPixelsPerNotch
-        let magnitude = Int(flags & 0xFF)
-        var raw = magnitude
-        if flags & PTRFLAGS.WHEEL_NEGATIVE != 0 { raw = -raw }
+        var raw = Int(flags & PTRFLAGS.WHEEL_ROTATION_MASK)
+        if flags & PTRFLAGS.WHEEL_NEGATIVE != 0 { raw -= 0x200 }
         var pixels = raw * pixelsPerNotch / 120
         if pixels == 0 && raw != 0 {
             pixels = raw > 0 ? pixelsPerNotch : -pixelsPerNotch
