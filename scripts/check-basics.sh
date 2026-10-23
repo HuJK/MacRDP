@@ -14,7 +14,8 @@
 #   resize    dynamic resolution: DISP layouts from FreeRDP's client in the
 #             VM (brew install freerdp), then mstsc window sizes (known to
 #             fail: mstsc sends MacRDP no layouts, reported as XFAIL)
-#   text image files   clipboard, both directions
+#   text image files   clipboard, both directions (files mac->win: XFAIL, mstsc
+#             pastes nothing; files win->mac needs MacRDP's File Provider on)
 #   nla       nthash login policy over NLA: right password in, wrong one out
 #             (restarts MacRDP with a temporary config, then restores it)
 #
@@ -23,7 +24,7 @@
 # go to $OUT (default $MACRDP_VM_ROOT/runs/basics-<time>).
 #
 # Expects MacRDP running in the VM (scripts/tart-vm.sh up/deploy/start) and
-# connects mstsc if needed (scripts/win-client.sh), full screen by default.
+# opens a fresh mstsc session (scripts/win-client.sh), full screen by default.
 # Needs `guestcheck` in the VM: ./scripts/tart-vm.sh tool tools/guestcheck/guestcheck.swift
 #
 set -uo pipefail
@@ -103,11 +104,24 @@ check_files() {
   settle
   paths="$(vm /usr/local/bin/guestcheck clip-files-get 2>&1)"
   vm sh -c 'rm -rf /tmp/clipdst && mkdir -p /tmp/clipdst'
+  # Lazy mode (the default fileFetchMode) puts one MacRDP_<id> folder on
+  # the pasteboard and fetches the real items when it's read, so a Finder
+  # paste lands them inside that folder; compare its contents. guestcheck
+  # cp reads File Provider placeholders, which plain cp under tart exec
+  # can't (EDEADLK).
   while IFS= read -r p; do
-    [[ -n "$p" ]] && vm /bin/cp -R "$p" /tmp/clipdst/ 2>&1 | head -2
+    case "$p" in
+      */MacRDP_*) vm sh -c "rmdir /tmp/clipdst && /usr/local/bin/guestcheck cp '$p' /tmp/clipdst" 2>&1 | head -2 ;;
+      ?*) vm /usr/local/bin/guestcheck cp "$p" "/tmp/clipdst/${p##*/}" 2>&1 | head -2 ;;
+    esac
   done <<< "$paths"
   got="$(vm_manifest /tmp/clipdst)"
   [[ "$got" == "$want" ]] && ok=1 || ok=0
+  # macOS creates the clipboard's File Provider domain disabled until the
+  # user switches MacRDP on under System Settings > General > Login Items &
+  # Extensions > File Providers (shown only once a visible domain exists,
+  # clipboard.showInFinder); until then no URL ever reaches the pasteboard.
+  [[ "$paths" == *"no file URLs"* ]] && paths+=" (MacRDP's File Provider switched off?)"
   result "files win->mac" $ok "$(echo "$got" | wc -l | tr -d ' ') files; pasteboard: $(echo "$paths" | tr '\n' ' ')"
   [[ $ok == 1 ]] || diff <(echo "$want") <(echo "$got") | sed 's/^/      /'
 
@@ -126,7 +140,10 @@ check_files() {
   got="$(win paste 'C:\\Users\\hujkconsole\\macrdp-test\\clipdst' 180 |
     tr -d '\r\357\273\277' | sed 's|\\|/|g' | sort)"
   [[ "$got" == "$want" ]] && ok=1 || ok=0
-  result "files mac->win" $ok "$(echo "$got" | grep -c '|') files"
+  # Known: mstsc fetches FileGroupDescriptorW but its clipboard object
+  # rejects FileContents for every lindex (DV_E_FORMATETC), so Explorer
+  # pastes nothing and never asks for the bytes.
+  known "files mac->win" $ok "$(echo "$got" | grep -c '|') files"
   [[ $ok == 1 ]] || diff <(echo "$want") <(echo "$got") | sed 's/^/      /'
 }
 
@@ -366,7 +383,10 @@ check_nla() {
 
 # MARK: - Run
 
-"$WINSH" connect >/dev/null || exit 1
+# A fresh session, not whatever mstsc was left in: a stalled one, or one
+# whose server has since restarted (its title still names the host, so
+# connect would take it as connected), fails every check after it.
+"$WINSH" disconnect >/dev/null && "$WINSH" connect >/dev/null || exit 1
 for c in "${CHECKS[@]}"; do
   case "$c" in text|image|files|nla) stop_sink ;; esac
   "check_$c"

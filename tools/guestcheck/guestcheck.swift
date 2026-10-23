@@ -11,6 +11,8 @@
 //   guestcheck clip-files-get            # file URLs on the pasteboard, one path per line
 //   guestcheck clip-files-set <path>...   # first path only, see below; prefer finder-copy
 //   guestcheck finder-copy <dir>         # Finder: open <dir>, select all, copy (as a user would)
+//   guestcheck cp <src> <dst>            # copy a file or tree, fetching File Provider placeholders
+//                                        # (`tart exec` children may not, and get EDEADLK)
 //   guestcheck sck-record <secs> <out>   # system audio via ScreenCaptureKit, as MacRDP gets it:
 //                                        # 48 kHz stereo float32 interleaved, raw
 //   guestcheck sink <secs> <log>         # full-screen test pattern that logs input (JSON lines):
@@ -99,6 +101,21 @@ case "finder-copy":
     usleep(500_000)
     let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
     for u in urls { print(u.path) }
+
+case "cp":
+    guard args.count == 3 else { fail("usage: guestcheck cp <src> <dst>") }
+    // Processes started through the guest agent don't materialize dataless
+    // (File Provider) files: reading MacRDP's lazy clipboard folder fails
+    // with EDEADLK. Opt in, as Finder does.
+    guard setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
+                         IOPOL_MATERIALIZE_DATALESS_FILES_ON) == 0 else {
+        fail("setiopolicy_np: \(String(cString: strerror(errno)))")
+    }
+    do {
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: args[1]), to: URL(fileURLWithPath: args[2]))
+    } catch {
+        fail("cp: \(error.localizedDescription)")
+    }
 
 case "sck-record":
     guard args.count == 3, let secs = Double(args[1]) else { fail("usage: guestcheck sck-record <secs> <out>") }

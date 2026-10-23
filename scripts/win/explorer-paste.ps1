@@ -1,5 +1,7 @@
 # Paste the clipboard into a folder the way a user does: open it in
-# Explorer and press Ctrl+V. Runs in the desktop session (through
+# Explorer and paste (the file view's own Paste command, which Ctrl+V and
+# the context menu run; posted to it, as a full-screen mstsc keeps the
+# keyboard focus). Runs in the desktop session (through
 # session-run.ps1). Reads explorer-paste.json ({"dir", "timeout"}) next to
 # this script, waits until the folder stops changing, closes the window and
 # writes "relative\path|size|sha256" lines to explorer-paste.txt.
@@ -8,14 +10,20 @@ $req = Get-Content (Join-Path $dir 'explorer-paste.json') -Raw -Encoding UTF8 | 
 $dest = $req.dir
 New-Item -ItemType Directory -Force $dest | Out-Null
 Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices;
-public static class K {
-  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort vk, scan; public uint flags, time; public IntPtr extra; }
-  [StructLayout(LayoutKind.Explicit)] public struct INPUT { [FieldOffset(0)] public uint type; [FieldOffset(8)] public KEYBDINPUT ki; }
-  [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] i, int size);
-  public static void Scan(ushort s, bool up) {
-    INPUT i = new INPUT { type = 1 }; i.ki.scan = s; i.ki.flags = 0x8u | (up ? 0x2u : 0u);
-    SendInput(1, new[] { i }, Marshal.SizeOf(typeof(INPUT)));
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class V {
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  public static IntPtr Find(IntPtr top, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumChildWindows(top, (h, l) => {
+      var sb = new StringBuilder(256); GetClassName(h, sb, 256);
+      if (sb.ToString() == cls) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
   }
 }
 '@
@@ -27,13 +35,18 @@ for ($i = 0; $i -lt 20 -and -not $window; $i++) {
   $window = $shell.Windows() | Where-Object { $_.Document.Folder.Self.Path -eq $dest } | Select-Object -First 1
 }
 Start-Sleep -Milliseconds 800
-[K]::Scan(0x1D, $false); [K]::Scan(0x2F, $false); [K]::Scan(0x2F, $true); [K]::Scan(0x1D, $true)   # Ctrl+V
+$view = if ($window) { [V]::Find([IntPtr]$window.HWND, 'SHELLDLL_DefView') } else { [IntPtr]::Zero }
+if ($view -eq [IntPtr]::Zero) {
+  "no explorer file view" | Out-File -Encoding utf8 (Join-Path $dir 'explorer-paste.txt'); exit 1
+}
+[V]::PostMessage($view, 0x0111, [IntPtr]0x7012, [IntPtr]::Zero) | Out-Null   # WM_COMMAND FCIDM_SHVIEW_PASTE
 
 $deadline = (Get-Date).AddSeconds($(if ($req.timeout) { $req.timeout } else { 60 }))
-$last = ''; $stable = 0
+$last = ''; $stable = 0; $idleUntil = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline -and $stable -lt 6) {
   Start-Sleep -Milliseconds 500
   $now = (Get-ChildItem $dest -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  if (-not $now -and (Get-Date) -gt $idleUntil) { break }   # the paste never started
   if ($now -and $now -eq $last) { $stable++ } else { $stable = 0 }
   $last = $now
 }

@@ -75,6 +75,7 @@ cmd_setup() {
 
 cmd_connect() {
   local host="${1:-$("$REPO_ROOT/scripts/tart-vm.sh" ip)}" i tmp
+  [[ -n "$host" ]] || die "no host: pass one, or start the Tart VM"
   if connected "$host"; then echo "mstsc already connected to $host"; return; fi
   ps "Get-Process mstsc -ErrorAction SilentlyContinue | Stop-Process -Force; exit 0"
   tmp="$(mktemp -d)"
@@ -103,7 +104,9 @@ sub="${1:-}"; shift || true
 case "$sub" in
   setup)      cmd_setup ;;
   connect)    cmd_connect "$@" ;;
-  disconnect) ps "Get-Process mstsc -ErrorAction SilentlyContinue | Stop-Process -Force; exit 0" ;;
+  disconnect) ps "Get-Process mstsc -ErrorAction SilentlyContinue | Stop-Process -Force
+                 for (\$i = 0; \$i -lt 20 -and (Get-Process mstsc -ErrorAction SilentlyContinue); \$i++) { Start-Sleep -Milliseconds 250 }
+                 if (Get-Process mstsc -ErrorAction SilentlyContinue) { 'mstsc is still running'; exit 1 }; exit 0" ;;
   windows)    windows ;;
   screenshot) [[ -n "${1:-}" ]] || die "usage: $0 screenshot <png>"; desktop shot.ps1; get shot.png "$1"; echo "$1" ;;
   mstsc-shot) [[ -n "${1:-}" ]] || die "usage: $0 mstsc-shot <png>"

@@ -53,8 +53,18 @@ die() { echo "error: $*" >&2; exit 1; }
 gexec() { "$TART" exec "$@"; }
 
 exists() { "$TART" get "$1" >/dev/null 2>&1; }
-# The default DHCP-lease resolver only knows NAT guests; ask the agent.
-vm_ip() { "$TART" ip "$1" --resolver agent; }
+# The default DHCP-lease resolver only knows NAT guests; ask the agent. It
+# can miss for a moment (seen right after restarting MacRDP), so retry and
+# fall back to the host's ARP table, which knows bridged guests too.
+vm_ip() {
+  local i
+  for i in 1 2 3; do
+    "$TART" ip "$1" --resolver agent 2>/dev/null && return
+    "$TART" ip "$1" --resolver arp 2>/dev/null && return
+    sleep 1
+  done
+  "$TART" ip "$1" --resolver agent
+}
 running() { "$TART" get "$1" --format json 2>/dev/null | grep -q '"State" : "running"'; }
 
 wait_agent() {
