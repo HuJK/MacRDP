@@ -301,6 +301,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        // Files copied on Windows can't reach the pasteboard while the user
+        // has MacRDP's File Provider switched off (FileProviderSwitch).
+        let inbox = AppDelegate.sharedClipboardInbox
+        if inbox.userEnabled == false {
+            menu.addItem(.separator())
+            let fp = NSMenuItem(title: "Allow Pasting Files from Windows…",
+                                action: #selector(openFileProviderSettings(_:)), keyEquivalent: "")
+            fp.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
+            fp.toolTip = "Turn on MacRDP under File Providers in System Settings"
+            fp.target = self
+            menu.addItem(fp)
+        }
+
         menu.addItem(.separator())
         let restart = NSMenuItem(title: "Restart Service", action: #selector(restartService(_:)), keyEquivalent: "")
         restart.target = self
@@ -378,6 +391,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .camera(let id, let deviceID, let name):
             listener?.openCamera(sessionID: id, deviceID: deviceID, name: name)
         }
+    }
+
+    @objc private func openFileProviderSettings(_ sender: NSMenuItem) {
+        FileProviderSwitch.openSettings()
     }
 
     @objc private func restartService(_ sender: NSMenuItem) {

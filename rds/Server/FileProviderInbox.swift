@@ -12,7 +12,7 @@
 //    - (future) RDPDR drives  → "drive-<X>" domains
 //
 
-import Foundation
+import AppKit
 import FileProvider
 import os
 
@@ -25,6 +25,13 @@ final class FileProviderInbox {
     let subdir: String
 
     private var manager: NSFileProviderManager?
+
+    /// Whether MacRDP's File Provider is switched on for this user (see
+    /// `FileProviderSwitch`); nil until known. Set at registration and by
+    /// URL lookups — not re-read from the domain list later: in a running
+    /// process that keeps reporting the old value after the user flips the
+    /// switch, while lookups see the change at once.
+    private(set) var userEnabled: Bool?
 
     /// Cached XPC connection to the extension (opened via
     /// NSFileProviderService). Lives across publish calls; reopened on
@@ -54,7 +61,32 @@ final class FileProviderInbox {
     /// `hidden` registers the domain without showing it in Finder's
     /// sidebar (still fully functional — storage on disk, paste URLs
     /// resolve). Used for the clipboard staging domain.
+    ///
+    /// A domain macOS created switched off is re-added visible: System
+    /// Settings lists an app under File Providers only while it has a
+    /// visible domain, so a hidden one leaves the user no switch to turn on.
+    /// It stays visible until the next launch.
     func register(hidden: Bool = false) async {
+        await add(hidden: hidden)
+        await readUserEnabled()
+        guard userEnabled == false else { return }
+        LogTo.clipboard.error("FileProvider domain \(domainIdentifier.rawValue) is switched off — \(FileProviderSwitch.howTo)")
+        if hidden {
+            LogTo.clipboard.notice("Showing FileProvider domain \(domainIdentifier.rawValue) in Finder until it is switched on")
+            await add(hidden: false)
+        }
+    }
+
+    private func readUserEnabled() async {
+        let id = domainIdentifier
+        userEnabled = await withCheckedContinuation { cont in
+            NSFileProviderManager.getDomainsWithCompletionHandler { domains, _ in
+                cont.resume(returning: domains.first { $0.identifier == id }?.userEnabled)
+            }
+        }
+    }
+
+    private func add(hidden: Bool) async {
         let domain = NSFileProviderDomain(
             identifier: domainIdentifier,
             displayName: domainDisplayName)
@@ -358,17 +390,91 @@ final class FileProviderInbox {
     /// the manifest, (c) build its own index of every item — that
     /// can easily take 10–20 s the first time on slower Macs. Once
     /// the index is built subsequent lookups are instant.
+    ///
+    /// Gives up at once when the File Provider is switched off: the
+    /// lookup then fails with `domainDisabled` however long we wait.
     func userVisibleURL(itemID: String, filename: String) async -> URL? {
         guard let manager else { return nil }
         let id = NSFileProviderItemIdentifier(itemID)
         // 100, 200, 400, 800, 1600, 2 × 2 s, 5 × 5 s ≈ 32 s total.
         let delaysMs: [UInt64] = [100, 200, 400, 800, 1600, 2000, 2000, 5000, 5000, 5000, 5000, 5000]
-        for delay in delaysMs {
-            if let url = try? await manager.getUserVisibleURL(for: id) {
+        for delay in delaysMs + [0] {
+            do {
+                let url = try await manager.getUserVisibleURL(for: id)
+                userEnabled = true
                 return url
+            } catch let error as NSError where error.domain == NSFileProviderErrorDomain
+                        && error.code == NSFileProviderError.Code.domainDisabled.rawValue {
+                userEnabled = false
+                LogTo.clipboard.error("No URL for '\(filename)': FileProvider domain \(domainIdentifier.rawValue) is switched off — \(FileProviderSwitch.howTo)")
+                return nil
+            } catch {
+                // Not indexed yet; retry.
             }
-            try? await Task.sleep(nanoseconds: delay * 1_000_000)
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay * 1_000_000) }
         }
-        return try? await manager.getUserVisibleURL(for: id)
+        return nil
+    }
+}
+
+/// The per-user File Provider switch: System Settings › General › Login
+/// Items & Extensions › Extensions › File Providers › MacRDP. macOS creates
+/// MacRDP's domains with it off (macOS 26 does on a fresh install) and then
+/// refuses every item URL, so files copied on Windows never reach the
+/// pasteboard and nothing tells the user why.
+@MainActor
+enum FileProviderSwitch {
+    static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!
+    static let howTo = "turn on MacRDP in System Settings › General › Login Items & Extensions › Extensions › By Category › File Providers ⓘ"
+    private static var explained = false
+
+    static func openSettings() {
+        NSWorkspace.shared.open(settingsURL)
+    }
+
+    /// Explain it to the user, once per run, when a file paste runs into it.
+    /// Non-modal: `runModal` would stall main-actor work (the clipboard, the
+    /// session's display tasks) for as long as the alert is up.
+    static func explainOnce() {
+        guard !explained else { return }
+        explained = true
+        let alert = NSAlert()
+        alert.messageText = "Turn on MacRDP's File Provider to paste files from Windows"
+        alert.informativeText = """
+            Files copied on Windows reach this Mac through MacRDP's File Provider, \
+            which macOS keeps switched off until you allow it.
+
+            In System Settings › General › Login Items & Extensions, choose By Category \
+            under Extensions, click ⓘ next to File Providers and turn on MacRDP. \
+            Then copy the files on Windows again.
+            """
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Not Now")
+        alert.layout()
+        for (i, button) in alert.buttons.enumerated() {
+            button.tag = i
+            button.target = buttonTarget
+            button.action = #selector(ButtonTarget.clicked(_:))
+        }
+        // Above other apps' windows without activating MacRDP (a menu-bar
+        // app), like PermissionPromptWindow; and still shown while inactive.
+        alert.window.level = .floating
+        alert.window.hidesOnDeactivate = false
+        alert.window.center()
+        alert.window.orderFrontRegardless()
+        self.alert = alert
+    }
+
+    private static var alert: NSAlert?
+    private static let buttonTarget = ButtonTarget()
+
+    private final class ButtonTarget: NSObject {
+        @objc func clicked(_ sender: NSButton) {
+            MainActor.assumeIsolated {
+                FileProviderSwitch.alert?.window.orderOut(nil)
+                FileProviderSwitch.alert = nil
+                if sender.tag == 0 { FileProviderSwitch.openSettings() }
+            }
+        }
     }
 }

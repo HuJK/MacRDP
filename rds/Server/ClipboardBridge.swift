@@ -667,6 +667,8 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     self.selfWroteChangeCount = pb.changeCount
                     self.lastChangeCount      = pb.changeCount
                     LogTo.clipboard.info("Lazy-mode pasteboard claimed: \(url.path)")
+                } else if inbox.userEnabled == false {
+                    FileProviderSwitch.explainOnce()   // the inbox logged it
                 } else {
                     LogTo.clipboard.error("Lazy-mode URL resolution failed for placeholder \(placeholderName)")
                 }
@@ -865,6 +867,9 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         for it in items {
             if let url = await inbox.userVisibleURL(itemID: it.id, filename: it.filename) {
                 urls.append(url)
+            } else if inbox.userEnabled == false {
+                FileProviderSwitch.explainOnce()   // the inbox logged it
+                return
             } else {
                 LogTo.clipboard.error("No URL resolved for \(it.filename)")
             }
