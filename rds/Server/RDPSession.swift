@@ -150,6 +150,9 @@ final class RDPSession {
 
     // Per-session subsystems (populated when peer activates).
     private var displayPipeline: DisplayPipeline?
+    /// The pipeline's async start. DISP resizes wait for it: a client may
+    /// send its first monitor layout before capture is up.
+    private var pipelineStart: Task<Void, Never>?
     #if MACRDP_BRIDGE_AVAILABLE
     /// Hybrid per-tile codec coordinator (owns the tile map + analysis
     /// engine). Held for the session lifetime; nil for non-hybrid codecs.
@@ -777,7 +780,7 @@ final class RDPSession {
         self.displayControl = DisplayControl(
             config: config, pipeline: pipeline, mapping: displayMapping)
         let w = width, h = height
-        Task { @MainActor in
+        pipelineStart = Task { @MainActor in
             do {
                 try await pipeline.start(displayID: primary, width: w, height: h)
             } catch {
@@ -815,6 +818,7 @@ final class RDPSession {
         let scale = primary.scale
         LogTo.resize.info("Client DISP request: slot=\(slot) \(w)x\(h) scale=\(scale) policy=\(policy.rawValue)")
         guard let pipeline = displayPipeline else { return }
+        let started = pipelineStart
 
         switch policy {
         case .none:
@@ -824,6 +828,7 @@ final class RDPSession {
             // GPU resample the captured frame to the client size (aspect-fit);
             // pipeline.resize skips when the fit is already exact.
             Task { @MainActor in
+                await started?.value
                 do { try await pipeline.resize(width: w, height: h) }
                 catch { LogTo.resize.error("resize failed: \(String(describing: error))") }
             }
@@ -832,6 +837,7 @@ final class RDPSession {
             let displayID = displayMapping.displayID(forSlot: slot) ?? CGMainDisplayID()
             let ctrl = displayModeController
             Task { @MainActor in
+                await started?.value
                 let fit = ctrl?.applyBestFit(displayID: displayID,
                                              clientPixelW: w, clientPixelH: h,
                                              desktopScale: scale)

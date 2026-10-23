@@ -189,6 +189,7 @@ struct macrdp_session {
      * resize). */
     DispServerContext     *disp;
     bool                   disp_open;
+    UINT32                 disp_channel_id;   /* to spot its DVC creation response */
     /* CLIPRDR — bidirectional clipboard sync (CB_FORMAT_LIST etc.). */
     CliprdrServerContext  *cliprdr;
     bool                   cliprdr_open;
@@ -373,6 +374,27 @@ static UINT disp_monitor_layout_cb(DispServerContext *ctx,
     return CHANNEL_RC_OK;
 }
 
+static BOOL disp_channel_id_assigned_cb(DispServerContext *ctx, UINT32 channelId) {
+    struct macrdp_session *s = (struct macrdp_session*)ctx->custom;
+    s->disp_channel_id = channelId;
+    return TRUE;
+}
+
+/* The client confirming one of our dynamic channels. For DISP that is when
+ * our capabilities have to go out: FreeRDP leaves the Caps PDU to the
+ * application, and a client sends no monitor layouts without it (FreeRDP's
+ * client only makes its window resizable once the caps arrive). */
+static BOOL dvc_creation_status_cb(void *userdata, UINT32 channelId, INT32 creationStatus) {
+    struct macrdp_session *s = (struct macrdp_session*)userdata;
+    if (s && s->disp && channelId == s->disp_channel_id && creationStatus >= 0) {
+        UINT rc = s->disp->DisplayControlCaps(s->disp);
+        os_log(bridge_log(), "DISP caps sent (max %u monitor(s), area %ux%u): %u",
+               s->disp->MaxNumMonitors, s->disp->MaxMonitorAreaFactorA,
+               s->disp->MaxMonitorAreaFactorB, rc);
+    }
+    return TRUE;
+}
+
 static void try_open_disp(struct macrdp_session *s) {
     if (s->disp_open) return;
     if (!atomic_load(&s->activated)) return;
@@ -395,6 +417,8 @@ static void try_open_disp(struct macrdp_session *s) {
     ctx->MaxMonitorAreaFactorA = 8192;
     ctx->MaxMonitorAreaFactorB = 8192;
     ctx->DispMonitorLayout = disp_monitor_layout_cb;
+    ctx->ChannelIdAssigned = disp_channel_id_assigned_cb;
+    WTSVirtualChannelManagerSetDVCCreationCallback(vcm, dvc_creation_status_cb, s);
 
     UINT rc = ctx->Open(ctx);
     if (rc != CHANNEL_RC_OK) {
