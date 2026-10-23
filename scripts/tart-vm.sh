@@ -92,7 +92,8 @@ build_swift() { # <src.swift> -> prints the binary path
   local src="$1" bin; bin="$BUILD_DIR/bin/$(basename "$1" .swift)"
   if [[ ! -x "$bin" || "$src" -nt "$bin" ]]; then
     mkdir -p "$BUILD_DIR/bin"
-    swiftc -O -target arm64-apple-macos26.0 "$src" -o "$bin"
+    # Explicit: errexit doesn't reach into the $(...) callers run this in.
+    swiftc -O -target arm64-apple-macos26.0 "$src" -o "$bin" || { rm -f "$bin"; return 1; }
   fi
   echo "$bin"
 }
@@ -166,7 +167,7 @@ EOF
 }
 
 cmd_tool() {
-  local bin; bin="$(build_swift "$1")"
+  local bin; bin="$(build_swift "$1")" || die "build failed: $1"
   gexec -i "$VM" sh -c "sudo tee /usr/local/bin/$(basename "$bin") >/dev/null && sudo chmod 755 /usr/local/bin/$(basename "$bin")" < "$bin"
   echo "installed /usr/local/bin/$(basename "$bin")"
 }

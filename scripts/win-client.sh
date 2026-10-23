@@ -8,7 +8,7 @@
 #   ./scripts/win-client.sh disconnect          # close mstsc
 #   ./scripts/win-client.sh windows             # titled windows on the client desktop
 #   ./scripts/win-client.sh screenshot <png>    # the client's desktop
-#   ./scripts/win-client.sh mstsc-shot <png>    # just the mstsc window (PrintWindow)
+#   ./scripts/win-client.sh mstsc-shot <png>    # the remote desktop as mstsc shows it (client area)
 #   ./scripts/win-client.sh input '<json>'      # mouse/keys into mstsc (scripts/win/input.ps1)
 #   ./scripts/win-client.sh clip '<json>'       # read/write the clipboard (scripts/win/clip.ps1)
 #   ./scripts/win-client.sh put <local> <dir>   # upload into macrdp-test\<dir>
@@ -28,6 +28,8 @@
 #   WIN            ssh target (default hujkconsole@192.168.168.41)
 #   RDP_USER       MacRDP login (default admin, the Tart VM's user)
 #   RDP_PASSWORD   (default admin)
+#   RDP_MODE       full (default: full screen at the console's size) or window
+#   RDP_SIZE       WxH session size, e.g. 1280x720 (default: the console's)
 #
 set -euo pipefail
 
@@ -76,7 +78,10 @@ cmd_connect() {
   if connected "$host"; then echo "mstsc already connected to $host"; return; fi
   ps "Get-Process mstsc -ErrorAction SilentlyContinue | Stop-Process -Force; exit 0"
   tmp="$(mktemp -d)"
-  printf '{"host":"%s","user":"%s","password":"%s"}' "$host" "$RDP_USER" "$RDP_PASSWORD" > "$tmp/connect.json"
+  local size="${RDP_SIZE:-}" w=0 h=0
+  [[ -z "$size" ]] || { w="${size%x*}"; h="${size#*x}"; }
+  printf '{"host":"%s","user":"%s","password":"%s","mode":"%s","width":%d,"height":%d}' \
+    "$host" "$RDP_USER" "$RDP_PASSWORD" "${RDP_MODE:-full}" "$w" "$h" > "$tmp/connect.json"
   put "$tmp/connect.json"; rm -rf "$tmp"
   desktop connect.ps1
   for i in $(seq 1 20); do
@@ -102,7 +107,7 @@ case "$sub" in
   windows)    windows ;;
   screenshot) [[ -n "${1:-}" ]] || die "usage: $0 screenshot <png>"; desktop shot.ps1; get shot.png "$1"; echo "$1" ;;
   mstsc-shot) [[ -n "${1:-}" ]] || die "usage: $0 mstsc-shot <png>"
-              desktop winshot.ps1; ps "Get-Content \"$PSDIR\\winshot.txt\""; get mstsc.png "$1"; echo "$1" ;;
+              desktop winshot.ps1; ps "Get-Content \"$PSDIR\\winshot.txt\""; get mstsc-client.png "$1"; echo "$1" ;;
   input)      run_json input.ps1 "${1:?json}" ;;
   clip)       run_json clip.ps1 "${1:?json}" 240 ;;
   paste)      run_json explorer-paste.ps1 "{\"dir\": \"${1:?dir}\", \"timeout\": ${2:-120}}" $(( ${2:-120} + 60 )) ;;

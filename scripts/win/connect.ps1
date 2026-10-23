@@ -21,15 +21,26 @@ if (Test-Path $default) {
   (Get-Item $default -Force).Attributes = 'Normal'   # mstsc keeps it hidden
 }
 
-# authentication level 0: MacRDP's certificate is self-signed. 1200x700 keeps
-# the whole mstsc window on a 1280x800 console for screenshots.
+# Session size: full screen at the console's real pixel size, the way a user
+# connects; connect.json may ask for {"mode": "window", "width", "height"}.
+# Dynamic resolution on, so window and full-screen switches resize the
+# session (DISP). authentication level 0: MacRDP's certificate is self-signed.
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class Dpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
+[Dpi]::SetProcessDPIAware() | Out-Null
+$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$full = $cfg.mode -ne 'window'
+$width = if ($cfg.width) { $cfg.width } else { $screen.Width }
+$height = if ($cfg.height) { $cfg.height } else { $screen.Height }
 @(
   "username:s:$($cfg.user)",
   "prompt for credentials:i:0",
   "authentication level:i:0",
-  "screen mode id:i:1",
-  "desktopwidth:i:1200",
-  "desktopheight:i:700",
+  "screen mode id:i:$(if ($full) { 2 } else { 1 })",
+  "desktopwidth:i:$width",
+  "desktopheight:i:$height",
+  "dynamic resolution:i:1",
+  "smart sizing:i:0",
   "session bpp:i:32",
   "audiomode:i:0",
   "redirectclipboard:i:1",

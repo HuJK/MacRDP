@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
 #
-# check-basics.sh — end-to-end checks of clipboard redirection between the
-# Windows mstsc client and MacRDP in the Tart VM: text, image, and files with
-# a nested folder, in both directions. Each check prints PASS or FAIL.
+# check-basics.sh — end-to-end regression checks between the Windows mstsc
+# client and MacRDP in the Tart VM. Each check prints PASS or FAIL.
 #
-#   ./scripts/check-basics.sh            # all checks
-#   ./scripts/check-basics.sh text image # a subset: text image files
+#   ./scripts/check-basics.sh               # all checks
+#   ./scripts/check-basics.sh display mouse # a subset
+#
+# Checks:
+#   display   mstsc's picture vs the Mac's screen (PSNR, colour bars) and liveness
+#   keyboard  scancode typing          unicode   TS_UNICODE_EVENT typing
+#   mouse     move/click mapping       wheel     scroll direction and size
+#   cursor    pointer shapes reach the client
+#   resize    dynamic resolution: DISP layouts from FreeRDP's client in the
+#             VM (brew install freerdp), then mstsc window sizes (known to
+#             fail: mstsc sends MacRDP no layouts, reported as XFAIL)
+#   text image files   clipboard, both directions
+#   nla       nthash login policy over NLA: right password in, wrong one out
+#             (restarts MacRDP with a temporary config, then restores it)
+#
+# The input and display checks run against `guestcheck sink`, a full-screen
+# test pattern in the VM that logs what it receives. Artifacts (captures)
+# go to $OUT (default $MACRDP_VM_ROOT/runs/basics-<time>).
 #
 # Expects MacRDP running in the VM (scripts/tart-vm.sh up/deploy/start) and
-# connects mstsc if needed (scripts/win-client.sh). Needs `guestcheck` in the
-# VM: ./scripts/tart-vm.sh tool tools/guestcheck/guestcheck.swift
+# connects mstsc if needed (scripts/win-client.sh), full screen by default.
+# Needs `guestcheck` in the VM: ./scripts/tart-vm.sh tool tools/guestcheck/guestcheck.swift
 #
 set -uo pipefail
 
@@ -17,13 +32,22 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VMSH="$REPO_ROOT/scripts/tart-vm.sh"
 WINSH="$REPO_ROOT/scripts/win-client.sh"
 WINDIR='$env:USERPROFILE\macrdp-test'
-CHECKS=("$@"); [[ ${#CHECKS[@]} -gt 0 ]] || CHECKS=(text image files)
+CHECKS=("$@"); [[ ${#CHECKS[@]} -gt 0 ]] ||
+  CHECKS=(display keyboard unicode mouse wheel cursor resize text image files nla)
+OUT="${OUT:-${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/runs/basics-$(date +%Y%m%d-%H%M%S)}"
+IMGCMP="${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/build/bin/imgcmp"
+mkdir -p "$OUT"
 failures=0
 
 vm() { "$VMSH" exec "$@"; }
 win() { "$WINSH" "$@"; }
 result() { # <name> <ok> <detail>
   if [[ "$2" == 1 ]]; then echo "PASS  $1  $3"; else echo "FAIL  $1  $3"; failures=$((failures + 1)); fi
+}
+# A check for a known, still open bug: XFAIL doesn't count as a failure,
+# XPASS means the bug is gone and the check should become a result().
+known() { # <name> <ok> <detail>
+  if [[ "$2" == 1 ]]; then echo "XPASS $1  $3"; else echo "XFAIL $1  $3"; fi
 }
 # Clipboard ownership travels as a format list; give it a moment to land.
 settle() { sleep 2; }
@@ -106,7 +130,247 @@ check_files() {
   [[ $ok == 1 ]] || diff <(echo "$want") <(echo "$got") | sed 's/^/      /'
 }
 
+# MARK: - Test pattern, geometry, input
+
+SINK_LOG=/tmp/sink.log
+SINK_LINES=0
+
+# Start the full-screen pattern (if it isn't up) and give it focus.
+start_sink() {
+  if ! vm /usr/bin/pgrep -f "guestcheck sink" >/dev/null; then
+    "$VMSH" exec /usr/local/bin/guestcheck sink 1800 "$SINK_LOG" >/dev/null 2>&1 &
+    local i
+    for i in $(seq 1 20); do
+      vm /usr/bin/grep -q '"ready"' "$SINK_LOG" 2>/dev/null && break
+      sleep 1
+    done
+  fi
+  # A click in a quiet area makes the sink the key window, as a user would.
+  input "{\"move\": [$(cx 0.6), $(cy 0.9)], \"click\": true}" >/dev/null
+  sleep 1
+}
+stop_sink() { vm /usr/bin/pkill -f "guestcheck sink" >/dev/null 2>&1 || true; }
+
+# Remember the end of the sink log; sink_events prints what came after.
+mark() { SINK_LINES="$(vm sh -c "wc -l < $SINK_LOG" | tr -d ' ')"; }
+sink_events() { vm /usr/bin/tail -n "+$((SINK_LINES + 1))" "$SINK_LOG"; }
+
+# input.ps1 with a JSON request; prints its log (client geometry first).
+input() { win input "$1" | tr -d '\r'; }
+
+# mstsc's client size, refreshed by geometry(); client-pixel helpers for
+# fractions of it.
+CW=1920 CH=1080
+geometry() {
+  local g; g="$(input '{}' | sed -n 's/.*clientSize=\([0-9]*\)x\([0-9]*\).*/\1 \2/p')"
+  CW="${g% *}" CH="${g#* }"
+}
+cx() { python3 -I -c "print(round($1 * $CW))"; }
+cy() { python3 -I -c "print(round($1 * $CH))"; }
+
+# The session size MacRDP last settled on ("Desktop size override → WxH").
+session_size() {
+  "$VMSH" logs "${1:-30}" | sed -n 's/.*Desktop size override → \([0-9]*x[0-9]*\).*/\1/p' | tail -1
+}
+
+# Compare mstsc's picture with the Mac's screen. Prints a detail string and
+# returns non-zero on mismatch. The frame counter (top right) is skipped in
+# the PSNR and used for liveness instead.
+compare_display() { # <tag> [WxH: the session, when smaller than mstsc's client area]
+  local tag="$1" a="$OUT/$1-client.png" b="$OUT/$1-client2.png" mac="$OUT/$1-mac.png" f
+  win mstsc-shot "$a" >/dev/null
+  "$VMSH" screenshot "$mac" >/dev/null
+  sleep 1.2
+  win mstsc-shot "$b" >/dev/null
+  if [[ -n "${2:-}" && "$2" != "${CW}x${CH}" ]]; then
+    for f in "$a" "$b"; do sips --cropToHeightWidth "${2#*x}" "${2%x*}" --cropOffset 0 0 "$f" >/dev/null; done
+  fi
+  local psnr live bad="" i
+  psnr="$("$IMGCMP" psnr "$a" "$mac" --skip 0.875 0 1 0.15)"
+  live="$("$IMGCMP" diff "$a" "$b" 0.875 0 1 0.15)"
+  local want=("255 255 255" "255 255 0" "0 255 255" "0 255 0" "255 0 255" "255 0 0" "0 0 255" "0 0 0")
+  for i in 0 1 2 3 4 5 6 7; do
+    local got; got="$("$IMGCMP" mean "$a" "$(python3 -I -c "print($i/8+0.02)")" 0.2 "$(python3 -I -c "print(($i+1)/8-0.02)")" 0.45)"
+    python3 -I -c "import sys; g=[int(v) for v in '$got'.split()]; w=[int(v) for v in '${want[$i]}'.split()]; sys.exit(max(abs(a-b) for a,b in zip(g,w))>40)" ||
+      bad="$bad bar$i=($got)"
+  done
+  local p; p="$(sed 's/psnr=\([0-9.]*\).*/\1/' <<< "$psnr")"
+  echo "$psnr counter-diff=$live${bad:+ wrong-colours:$bad}"
+  python3 -I -c "import sys; sys.exit(not ($p >= 25 and $live > 1.0))" && [[ -z "$bad" ]]
+}
+
+# MARK: - Checks: display and input
+
+check_display() {
+  start_sink; geometry
+  local d ok=1
+  d="$(compare_display display)" || ok=0
+  result "display ${CW}x${CH}" $ok "$d"
+}
+
+check_keyboard() {
+  start_sink; geometry; mark
+  local s='Hello, MacRDP 1234 !@#$%^&*()_+-=[]{};:,.<>/?`~|'
+  input "$(python3 -I -c 'import json,sys; print(json.dumps({"text": sys.argv[1], "enter": True}))' "$s")" >/dev/null
+  sleep 1
+  local got; got="$(sink_events | python3 -I -c '
+import json, sys
+print("".join(e["chars"] for e in map(json.loads, sys.stdin) if e["type"] == "key"), end="")')"
+  [[ "$got" == "$s"$'\r' ]] && ok=1 || ok=0
+  result "keyboard" $ok "got: $(printf %q "$got")"
+}
+
+check_unicode() {
+  start_sink; geometry; mark
+  local s='中文測試✓é€'
+  input "$(python3 -I -c 'import json,sys; print(json.dumps({"unicode": sys.argv[1]}))' "$s")" >/dev/null
+  sleep 1
+  local got; got="$(sink_events | python3 -I -c '
+import json, sys
+print("".join(e["chars"] for e in map(json.loads, sys.stdin) if e["type"] == "key"), end="")')"
+  [[ "$got" == "$s" ]] && ok=1 || ok=0
+  result "unicode" $ok "got: $got"
+}
+
+check_mouse() {
+  start_sink; geometry; mark
+  local pts="0.1,0.15 0.5,0.5 0.9,0.85" pt
+  for pt in $pts; do
+    input "{\"move\": [$(cx "${pt%,*}"), $(cy "${pt#*,}")], \"click\": true}" >/dev/null
+  done
+  input "{\"move\": [$(cx 0.3), $(cy 0.8)], \"rightClick\": true}" >/dev/null
+  sleep 1
+  local d ok=1
+  d="$(sink_events | python3 -I -c '
+import json, sys
+mac_w, mac_h = 1920, 1080
+want = [(0.1, 0.15, "left"), (0.5, 0.5, "left"), (0.9, 0.85, "left"), (0.3, 0.8, "right")]
+got = [e for e in map(json.loads, sys.stdin) if e["type"] == "click"]
+bad = len(got) != len(want)
+out = []
+for (fx, fy, b), e in zip(want, got):
+    ex, ey = round(fx * mac_w), round(fy * mac_h)
+    off = max(abs(e["x"] - ex), abs(e["y"] - ey))
+    bad |= off > 4 or e["button"] != b
+    x, y = e["x"], e["y"]
+    out.append(f"{b}({x},{y})~({ex},{ey})")
+print(" ".join(out) or "no clicks")
+sys.exit(bad)')" || ok=0
+  result "mouse" $ok "$d"
+}
+
+check_wheel() {
+  start_sink; geometry
+  input "{\"move\": [$(cx 0.6), $(cy 0.9)]}" >/dev/null
+  mark; input '{"wheel": 1}' >/dev/null; sleep 1
+  local up; up="$(sink_events | python3 -I -c 'import json,sys; print(sum(e["dy"] for e in map(json.loads, sys.stdin) if e["type"] == "scroll"))')"
+  mark; input '{"wheel": -2}' >/dev/null; sleep 1
+  local down; down="$(sink_events | python3 -I -c 'import json,sys; print(sum(e["dy"] for e in map(json.loads, sys.stdin) if e["type"] == "scroll"))')"
+  # One notch is input.wheelPixelsPerNotch (50) pixels; down is twice as far, the other way.
+  python3 -I -c "import sys; u,d=$up,$down; sys.exit(not (u*d < 0 and 25 <= abs(u) <= 100 and 1.5 <= abs(d/u) <= 2.5))" && ok=1 || ok=0
+  result "wheel" $ok "1 notch up -> dy $up, 2 notches down -> dy $down"
+}
+
+check_cursor() {
+  start_sink; geometry
+  local spots="arrow:0.06,0.3 ibeam:0.15,0.625 hand:0.5,0.625 crosshair:0.85,0.625" s shapes="" seen=""
+  for s in $spots; do
+    local name="${s%%:*}" pt="${s#*:}" c
+    c="$(input "{\"move\": [$(cx "${pt%,*}"), $(cy "${pt#*,}")], \"cursor\": true}" | sed -n 's/^cursor //p')"
+    shapes="$shapes $name[$c]"
+    seen="$seen $(sed -n 's/.*hash=\([0-9a-f]*\).*/\1/p' <<< "$c")"
+  done
+  local distinct; distinct="$(tr ' ' '\n' <<< "$seen" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
+  [[ "$distinct" == 4 ]] && ok=1 || ok=0
+  result "cursor" $ok "$distinct distinct shapes:$shapes"
+}
+
+check_resize() {
+  # MacRDP's side of DISP, with a client known to use it: FreeRDP sends its
+  # window size as soon as our caps arrive, right as capture starts. The
+  # session is the Mac's 16:9 fitted inside it, which it already is.
+  win disconnect >/dev/null
+  local log ok
+  if ! vm test -x /opt/homebrew/bin/sdl-freerdp; then
+    result "resize disp layout (freerdp)" 0 "no FreeRDP client in the VM: brew install freerdp"
+  else
+  vm sh -c '/opt/homebrew/bin/sdl-freerdp /v:127.0.0.1 /u:admin /p:admin /cert:ignore \
+    /dynamic-resolution /size:1024x768 >/tmp/sdl-freerdp.log 2>&1 & sleep 12; pkill -f sdl-freerdp; true'
+  log="$("$VMSH" logs 20)"
+  ok=0
+  grep -q "DISP: client requested 1 monitor(s), primary 1024x768" <<<"$log" &&
+    ! grep -q "resize failed" <<<"$log" && ok=1
+  result "resize disp layout (freerdp)" $ok \
+    "$(grep -o 'DISP caps sent.*\|DISP: client requested.*\|resize failed.*' <<<"$log" | tr '\n' ';')"
+  fi
+
+  # mstsc, as a user drives it: a windowed session that is resized and
+  # maximized. MacRDP keeps the Mac's 16:9 by fitting inside the size mstsc
+  # asks for, so the session can be smaller than the window. mstsc gets the
+  # same DISP caps but has never sent a layout (maximize stops at the
+  # session size), hence known().
+  if ! RDP_MODE=window RDP_SIZE=1280x720 win connect >/dev/null; then
+    result "resize" 0 "windowed connect failed"; return
+  fi
+  sleep 2; start_sink
+  local step d session fit
+  for step in initial 1600x900 1000x700 maximize; do
+    case "$step" in
+      initial) ;;
+      maximize) input '{"maximize": true}' >/dev/null ;;
+      *) input "{\"resizeClient\": [${step%x*}, ${step#*x}]}" >/dev/null ;;
+    esac
+    sleep 4; geometry
+    session="$(session_size "$([[ $step == initial ]] && echo 90 || echo 10)")"
+    fit="$(python3 -I -c "w,h=$CW,$CH; s=min(w/1920,h/1080); print(f'{round(1920*s)}x{round(1080*s)}')")"
+    ok=1
+    [[ "$session" == "$fit" ]] || ok=0
+    [[ $step != maximize || $CW -ge 1900 ]] || ok=0   # a maximized window fills the screen
+    d="$(compare_display "resize-$step" "$session")" || ok=0
+    if [[ $step == initial ]]; then
+      result "resize $step" $ok "client ${CW}x${CH}, session ${session:-?} (expected $fit); $d"
+    else
+      known "resize $step" $ok "client ${CW}x${CH}, session ${session:-?} (expected $fit); $d"
+    fi
+  done
+  # Back to the default full-screen session for the checks that follow.
+  stop_sink; win disconnect >/dev/null; win connect >/dev/null
+}
+
+# MARK: - Check: NLA with the nthash policy
+
+check_nla() {
+  stop_sink
+  local pw="Nla-$RANDOM-$RANDOM-x" hash cfg='$HOME/Library/Application Support/MacRDP/vm.yaml'
+  hash="$(vm sh -c "printf '%s\n' '$pw' | /Applications/MacRDP.app/Contents/MacOS/MacRDP nthash" | tail -1)"
+  vm sh -c "printf '\nauth:\n  passwordPolicy: nthash\n  ntHash: \"$hash\"\n' >> \"$cfg\""
+  "$VMSH" start >/dev/null
+  win disconnect >/dev/null
+
+  local ok=0 proto
+  RDP_PASSWORD="$pw" win connect >/dev/null 2>&1 && sleep 3 &&
+    "$VMSH" logs 20 | grep -q "Peer activated" && ok=1
+  proto="$("$VMSH" wlog 400 | sed -n 's/.*Server Security: \(.*\)/\1/p' | tail -1)"
+  result "nla right password" $ok "server security: ${proto:-?}"
+
+  win disconnect >/dev/null
+  ok=1
+  RDP_PASSWORD="wrong-$pw" win connect >/dev/null 2>&1 && ok=0
+  result "nla wrong password" $ok "$([[ $ok == 1 ]] && echo rejected || echo 'logged in!')"
+
+  # Back to the deployed config and the default login.
+  win disconnect >/dev/null
+  "$VMSH" deploy --no-build >/dev/null && "$VMSH" start >/dev/null
+  win connect >/dev/null
+}
+
+# MARK: - Run
+
 "$WINSH" connect >/dev/null || exit 1
-for c in "${CHECKS[@]}"; do "check_$c"; done
-echo "$failures failure(s)"
+for c in "${CHECKS[@]}"; do
+  case "$c" in text|image|files|nla) stop_sink ;; esac
+  "check_$c"
+done
+stop_sink
+echo "$failures failure(s); artifacts in $OUT"
 exit $((failures > 0))

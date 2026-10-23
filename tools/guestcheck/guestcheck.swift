@@ -13,6 +13,9 @@
 //   guestcheck finder-copy <dir>         # Finder: open <dir>, select all, copy (as a user would)
 //   guestcheck sck-record <secs> <out>   # system audio via ScreenCaptureKit, as MacRDP gets it:
 //                                        # 48 kHz stereo float32 interleaved, raw
+//   guestcheck sink <secs> <log>         # full-screen test pattern that logs input (JSON lines):
+//                                        # typed text, clicks, scrolls; cursor regions for
+//                                        # pointer-shape checks (see SinkView)
 
 import AppKit
 import ScreenCaptureKit
@@ -145,6 +148,158 @@ case "sck-record":
     try fh.close()
     print("\(sink.frames) frames in \(String(format: "%.2f", Date().timeIntervalSince(start))) s")
 
+case "sink":
+    guard args.count == 3, let secs = Double(args[1]) else { fail("usage: guestcheck sink <secs> <log>") }
+    runSink(seconds: secs, logPath: args[2])
+
 default:
     fail("unknown command \(cmd)")
+}
+
+// MARK: - sink
+
+/// Everything a remote-input check needs to read back, one JSON object per
+/// line, appended as it happens so a test can read the log mid-run.
+final class SinkLog {
+    private let fh: FileHandle
+    init(path: String) {
+        FileManager.default.createFile(atPath: path, contents: nil)
+        fh = FileHandle(forWritingAtPath: path)!
+    }
+    func write(_ obj: [String: Any]) {
+        guard var d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
+        d.append(0x0A)
+        fh.write(d)
+    }
+}
+
+/// Borderless windows refuse key status by default; the sink needs it.
+final class SinkWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+/// The test pattern, drawn in screen points with a top-left origin:
+///   - top half: eight SMPTE-style colour bars
+///   - bottom half, left: a horizontal grey ramp; right: 1 px and 4 px checkerboards
+///   - a band of cursor regions (I-beam, pointing hand, crosshair; arrow elsewhere)
+///   - a frame counter in the black bar, top right (x 0.875-1, y 0-0.15),
+///     redrawn every 250 ms so a frozen client picture is detectable
+/// It also logs typed text (keyDown characters, so both scancode and Unicode
+/// injection land here), clicks and scroll deltas.
+final class SinkView: NSView {
+    let log: SinkLog
+    var counter = 0
+    static let counterRegion = (x0: 0.875, y0: 0.0, x1: 1.0, y1: 0.15)
+    static let bars: [NSColor] = [.white, .yellow, .cyan, .green, .magenta, .red, .blue, .black]
+    init(frame: NSRect, log: SinkLog) { self.log = log; super.init(frame: frame) }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// Cursor regions, as fractions of the view: x0, y0, x1, y1.
+    static let cursorRegions: [(String, NSCursor, CGFloat, CGFloat, CGFloat, CGFloat)] = [
+        ("ibeam", .iBeam, 0.05, 0.55, 0.25, 0.70),
+        ("hand", .pointingHand, 0.40, 0.55, 0.60, 0.70),
+        ("crosshair", .crosshair, 0.75, 0.55, 0.95, 0.70),
+    ]
+
+    override func draw(_ dirtyRect: NSRect) {
+        let w = bounds.width, h = bounds.height
+        for (i, c) in Self.bars.enumerated() {
+            c.setFill()
+            NSRect(x: w * CGFloat(i) / 8, y: 0, width: w / 8 + 1, height: h / 2).fill()
+        }
+        // Grey ramp.
+        let steps = 64
+        for i in 0..<steps {
+            NSColor(white: CGFloat(i) / CGFloat(steps - 1), alpha: 1).setFill()
+            NSRect(x: w * 0.5 * CGFloat(i) / CGFloat(steps), y: h / 2, width: w * 0.5 / CGFloat(steps) + 1, height: h / 2).fill()
+        }
+        // Checkerboards (fine detail for the codec).
+        for (x0, cell) in [(w * 0.5, CGFloat(1)), (w * 0.75, CGFloat(4))] {
+            NSColor.white.setFill(); NSRect(x: x0, y: h / 2, width: w * 0.25, height: h / 2).fill()
+            NSColor.black.setFill()
+            var y = h * 0.75
+            while y < h {
+                var x = x0
+                var odd = Int((y - h * 0.75) / cell) % 2 == 1
+                while x < x0 + w * 0.25 {
+                    if odd { NSRect(x: x, y: y, width: cell, height: cell).fill() }
+                    odd.toggle(); x += cell
+                }
+                y += cell
+            }
+        }
+        // Frame counter: big white digits on the black bar.
+        let c = Self.counterRegion
+        NSColor.black.setFill()
+        NSRect(x: w * c.x0, y: h * c.y0, width: w * (c.x1 - c.x0), height: h * (c.y1 - c.y0)).fill()
+        ("\(counter)" as NSString).draw(at: NSPoint(x: w * c.x0 + 10, y: h * c.y0 + 10),
+                                      withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 96, weight: .bold),
+                                                       .foregroundColor: NSColor.white])
+        // Cursor regions, outlined and labelled.
+        for (name, _, x0, y0, x1, y1) in Self.cursorRegions {
+            let r = NSRect(x: w * x0, y: h * y0, width: w * (x1 - x0), height: h * (y1 - y0))
+            NSColor(white: 0.85, alpha: 1).setFill(); r.fill()
+            NSColor.black.setStroke(); NSBezierPath(rect: r).stroke()
+            (name as NSString).draw(at: NSPoint(x: r.minX + 8, y: r.minY + 8),
+                                    withAttributes: [.font: NSFont.systemFont(ofSize: 24), .foregroundColor: NSColor.black])
+        }
+    }
+
+    override func resetCursorRects() {
+        let w = bounds.width, h = bounds.height
+        addCursorRect(bounds, cursor: .arrow)
+        for (_, cursor, x0, y0, x1, y1) in Self.cursorRegions {
+            addCursorRect(NSRect(x: w * x0, y: h * y0, width: w * (x1 - x0), height: h * (y1 - y0)), cursor: cursor)
+        }
+    }
+
+    private func screenPoint(_ e: NSEvent) -> [String: Any] {
+        let p = NSEvent.mouseLocation
+        let h = NSScreen.main?.frame.height ?? 0
+        return ["x": Int(p.x.rounded()), "y": Int((h - p.y).rounded())]
+    }
+
+    override func keyDown(with e: NSEvent) {
+        log.write(["type": "key", "chars": e.characters ?? "", "keyCode": Int(e.keyCode),
+                   "flags": Int(e.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue)])
+    }
+    override func mouseDown(with e: NSEvent) {
+        window?.makeFirstResponder(self)
+        log.write(["type": "click", "button": "left"].merging(screenPoint(e)) { a, _ in a })
+    }
+    override func rightMouseDown(with e: NSEvent) {
+        log.write(["type": "click", "button": "right"].merging(screenPoint(e)) { a, _ in a })
+    }
+    override func scrollWheel(with e: NSEvent) {
+        log.write(["type": "scroll", "dy": Double(e.scrollingDeltaY), "dx": Double(e.scrollingDeltaX),
+                   "precise": e.hasPreciseScrollingDeltas, "inverted": e.isDirectionInvertedFromDevice])
+    }
+}
+
+func runSink(seconds: Double, logPath: String) {
+    let log = SinkLog(path: logPath)
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    guard let screen = NSScreen.main else { fail("no screen") }
+    let win = SinkWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    win.level = .screenSaver
+    let view = SinkView(frame: NSRect(origin: .zero, size: screen.frame.size), log: log)
+    win.contentView = view
+    win.makeKeyAndOrderFront(nil)
+    win.makeFirstResponder(view)
+    app.activate(ignoringOtherApps: true)
+    log.write(["type": "ready", "w": Int(screen.frame.width), "h": Int(screen.frame.height)])
+    Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+        view.counter += 1
+        let c = SinkView.counterRegion, b = view.bounds
+        view.setNeedsDisplay(NSRect(x: b.width * c.x0, y: b.height * c.y0,
+                                    width: b.width * (c.x1 - c.x0), height: b.height * (c.y1 - c.y0)))
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { app.terminate(nil) }
+    app.run()
 }

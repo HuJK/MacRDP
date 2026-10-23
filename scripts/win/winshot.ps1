@@ -1,12 +1,16 @@
 # Screen size, mstsc window state, and a PrintWindow capture of mstsc
-# (works even when CopyFromScreen of the desktop comes back blank). A
-# minimized mstsc is restored without activation for the capture, so the
-# client renders, then minimized again.
+# (works even when CopyFromScreen of the desktop comes back blank): the
+# whole window to mstsc.png and just its client area (the remote desktop)
+# to mstsc-client.png. A minimized mstsc is restored without activation
+# for the capture, so the client renders, then minimized again.
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices;
 public static class W {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
@@ -28,7 +32,11 @@ if ($p) {
   $g = [System.Drawing.Graphics]::FromImage($bmp); $dc = $g.GetHdc()
   $ok = [W]::PrintWindow($p.MainWindowHandle, $dc, 2); $g.ReleaseHdc($dc)
   $bmp.Save((Join-Path $dir 'mstsc.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-  $log += "printwindow=$ok"
+  $c = New-Object W+RECT; [W]::GetClientRect($p.MainWindowHandle, [ref]$c) | Out-Null
+  $o = New-Object W+POINT; [W]::ClientToScreen($p.MainWindowHandle, [ref]$o) | Out-Null
+  $crop = New-Object System.Drawing.Rectangle ($o.X - $r.L), ($o.Y - $r.T), $c.R, $c.B
+  $bmp.Clone($crop, $bmp.PixelFormat).Save((Join-Path $dir 'mstsc-client.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+  $log += "printwindow=$ok client=$($c.R)x$($c.B) at $($crop.X),$($crop.Y)"
   if ($wasMin) { [W]::ShowWindow($p.MainWindowHandle, 7) | Out-Null; $log += "re-minimized" }  # SW_SHOWMINNOACTIVE
 } else { $log += "no mstsc window" }
 $log | Out-File -Encoding ascii (Join-Path $dir 'winshot.txt')
