@@ -985,7 +985,14 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey],
                     options: [.skipsHiddenFiles],
                     errorHandler: { _, _ in true }) {
+                    // Path below the root, one name per level. Built from the
+                    // enumerator's depth, not by cutting root.path off
+                    // url.path: the enumerator hands back symlink-resolved
+                    // URLs (/tmp/x → /private/tmp/x/…), so the prefixes
+                    // needn't match.
+                    var names: [String] = []
                     for case let url as URL in enumerator {
+                        names = Array(names.prefix(max(0, enumerator.level - 1))) + [url.lastPathComponent]
                         let resolved = url.standardizedFileURL
                         let values = try? resolved.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
                         let isChildDir = values?.isDirectory ?? false
@@ -994,10 +1001,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                             LogTo.clipboard.error("File exceeds maxFileSizeMiB=\(limitMiB) — refusing: \(resolved.lastPathComponent)")
                             return nil
                         }
-                        // Build the relative path: <rootName>\<relativeFromRoot, joined by \>
-                        let relFromRoot = url.path.dropFirst(root.path.count)
-                            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                        let winPath = rootName + "\\" + relFromRoot.replacingOccurrences(of: "/", with: "\\")
+                        let winPath = ([rootName] + names).joined(separator: "\\")
                         out.append(.init(url: resolved,
                                          relativePath: winPath,
                                          isDirectory: isChildDir,
