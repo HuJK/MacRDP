@@ -454,7 +454,14 @@ int32_t macrdp_session_map_surface_to_output(
     int32_t          output_origin_x,
     int32_t          output_origin_y);
 
-/* Phase 4 — push PCM (Int16LE stereo @ 48k) to RDPSND.
+/* Sample rate of the PCM and AAC RDPSND formats on the wire. mstsc plays a
+ * 48 kHz stream as if it were 44.1 kHz: pitch drops 8.8% and its buffer
+ * grows 88 ms per second until the drift detector drops audio. So the
+ * Swift side resamples SCK's 48 kHz down to this before PCM sends and AAC
+ * encoding. Opus stays at 48 kHz. */
+#define MACRDP_RDPSND_WIRE_RATE 44100
+
+/* Phase 4 — push PCM (Int16LE stereo @ MACRDP_RDPSND_WIRE_RATE) to RDPSND.
  * Only valid when mstsc selected WAVE_FORMAT_PCM (the on_audio_format_selected
  * callback fired with MACRDP_AUDIO_FORMAT_PCM). */
 int32_t macrdp_session_send_audio_pcm(

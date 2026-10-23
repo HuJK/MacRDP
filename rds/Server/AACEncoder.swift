@@ -8,8 +8,8 @@
 //  in DisplayPipeline stays as a fallback for older clients.
 //
 //  Hardware-accelerated via Apple's built-in AAC encoder on Apple
-//  silicon. Each emitted packet covers 1024 PCM samples (~21.3ms at
-//  48 kHz), which is the AAC-LC frame size.
+//  silicon. Each emitted packet covers 1024 PCM samples (~23.2ms at the
+//  44.1 kHz RDPSND wire rate), which is the AAC-LC frame size.
 //
 
 import Foundation
@@ -34,6 +34,7 @@ final class AACEncoder: CompressedAudioEncoder, @unchecked Sendable {
     private let inputFormat: AVAudioFormat
     private let outputFormat: AVAudioFormat
     private let framesPerPacket: Int
+    private let sampleRate: Double
 
     // Diagnostics — log every 2 seconds so we can see if the encoder
     // is steady or bursting under sustained input.
@@ -86,6 +87,7 @@ final class AACEncoder: CompressedAudioEncoder, @unchecked Sendable {
         self.inputFormat = inFormat
         self.outputFormat = outFormat
         self.framesPerPacket = 1024
+        self.sampleRate = sampleRate
     }
 
     /// Feed one PCM chunk; collect any whole AAC packets the encoder
@@ -174,10 +176,10 @@ final class AACEncoder: CompressedAudioEncoder, @unchecked Sendable {
         let packetsPerSec = Double(statsPacketsOut) / wallElapsed
         let kbpsOut = Double(statsBytesOut * 8) / wallElapsed / 1000.0
         let avgBytes = statsPacketsOut > 0 ? statsBytesOut / statsPacketsOut : 0
-        let pcmSec = Double(statsInputFrames) / 48000.0
+        let pcmSec = Double(statsInputFrames) / sampleRate
         // pcmSec should track wallElapsed closely (we're real-time);
-        // packetsPerSec should be ~46.875 (48000/1024); kbps should be
-        // around our 128k bitRate setting.
+        // packetsPerSec should be ~sampleRate/1024 (43.07 at 44.1 kHz); kbps
+        // should be around our 128k bitRate setting.
         LogTo.audioOut.info("AAC: pcm=\(Int(pcmSec*1000))ms wall=\(Int(wallElapsed*1000))ms pkts=\(self.statsPacketsOut) rate=\(Int(packetsPerSec))/s avg=\(avgBytes)B \(Int(kbpsOut))kbps")
         statsLastLogWall = now
         statsLock.unlock()

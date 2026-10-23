@@ -185,6 +185,9 @@ final class RDPSession {
         #endif
         private let lock = NSLock()
         private var encoder: CompressedAudioEncoder?
+        /// SCK's 48 kHz → the negotiated format's wire rate (PCM and AAC,
+        /// see MACRDP_RDPSND_WIRE_RATE); nil when it is 48 kHz too (Opus).
+        private var resampler: PCMResampler?
         /// True only when the client negotiated raw PCM. When a compressed
         /// format was negotiated but the encoder failed, we must NOT ship raw
         /// PCM (the client would decode it as the compressed format = garbage)
@@ -197,15 +200,19 @@ final class RDPSession {
         init() {}
         #endif
 
-        func setEncoder(_ enc: CompressedAudioEncoder?, allowRawPCM: Bool) {
-            lock.lock(); encoder = enc; rawPCMOK = allowRawPCM; lock.unlock()
+        func setEncoder(_ enc: CompressedAudioEncoder?, allowRawPCM: Bool,
+                        resampler rs: PCMResampler?) {
+            lock.lock(); encoder = enc; rawPCMOK = allowRawPCM; resampler = rs; lock.unlock()
         }
 
-        func ingest(_ pcm: Data) {
+        func ingest(_ pcm48k: Data) {
             lock.lock()
             let enc = encoder
             let pcmOK = rawPCMOK
+            let rs = resampler
             lock.unlock()
+            let pcm = rs?.process(pcm48k) ?? pcm48k
+            if pcm.isEmpty { return }
             #if MACRDP_BRIDGE_AVAILABLE
             if let enc {
                 for p in enc.encode(pcm: pcm) {
@@ -383,21 +390,25 @@ final class RDPSession {
             self?.clipboard?.handleClientFormatDataResponse(formatID: fid, data: data)
         }
         // RDPSND format negotiation result. Engages the AAC encoder if
-        // mstsc picked WAVE_FORMAT_AAC_MS; otherwise keeps PCM path.
+        // mstsc picked WAVE_FORMAT_AAC_MS; otherwise keeps PCM path. PCM and
+        // AAC go out at MACRDP_RDPSND_WIRE_RATE, resampled from SCK's 48 kHz
+        // (DisplayPipeline's cfg.sampleRate); Opus stays at 48 kHz.
         sinks.onAudioFormatSelected = { [weak self] fmt in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                let wireRate = Double(MACRDP_RDPSND_WIRE_RATE)
                 switch fmt {
                 case .aac:
                     do {
-                        let enc = try AACEncoder()
-                        self.audioPath?.setEncoder(enc, allowRawPCM: false)
-                        LogTo.audioOut.notice("Audio: AAC-LC selected (HW-accelerated encoder)")
+                        let rs = try PCMResampler(from: 48_000, to: wireRate)
+                        let enc = try AACEncoder(sampleRate: wireRate)
+                        self.audioPath?.setEncoder(enc, allowRawPCM: false, resampler: rs)
+                        LogTo.audioOut.notice("Audio: AAC-LC selected (HW-accelerated encoder, \(Int(wireRate)) Hz)")
                     } catch {
                         // AAC negotiated but encoder unavailable → drop (don't
                         // mislabel raw PCM as AAC).
                         LogTo.audioOut.error("AAC encoder init failed, dropping audio: \(String(describing: error))")
-                        self.audioPath?.setEncoder(nil, allowRawPCM: false)
+                        self.audioPath?.setEncoder(nil, allowRawPCM: false, resampler: nil)
                     }
                 case .opus:
                     do {
@@ -405,15 +416,22 @@ final class RDPSession {
                         let frames = max(120, 48 * max(1, ao.opus.frameMs))   // 48 samples/ms @ 48k
                         let enc = try OpusEncoder(bitRate: max(8, ao.opus.bitrateKbps) * 1000,
                                                   framesPerPacket: frames)
-                        self.audioPath?.setEncoder(enc, allowRawPCM: false)
+                        self.audioPath?.setEncoder(enc, allowRawPCM: false, resampler: nil)
                         LogTo.audioOut.notice("Audio: Opus selected (AudioToolbox encoder)")
                     } catch {
                         LogTo.audioOut.error("Opus encoder init failed, dropping audio: \(String(describing: error))")
-                        self.audioPath?.setEncoder(nil, allowRawPCM: false)
+                        self.audioPath?.setEncoder(nil, allowRawPCM: false, resampler: nil)
                     }
                 case .pcm:
-                    self.audioPath?.setEncoder(nil, allowRawPCM: true)
-                    LogTo.audioOut.notice("Audio: PCM selected")
+                    do {
+                        let rs = try PCMResampler(from: 48_000, to: wireRate)
+                        self.audioPath?.setEncoder(nil, allowRawPCM: true, resampler: rs)
+                        LogTo.audioOut.notice("Audio: PCM selected (\(Int(wireRate)) Hz)")
+                    } catch {
+                        // Never ship 48 kHz labelled as the wire rate.
+                        LogTo.audioOut.error("PCM resampler init failed, dropping audio: \(String(describing: error))")
+                        self.audioPath?.setEncoder(nil, allowRawPCM: false, resampler: nil)
+                    }
                 }
             }
         }

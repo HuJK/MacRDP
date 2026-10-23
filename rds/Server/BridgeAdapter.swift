@@ -306,7 +306,7 @@ final class BridgePeer: @unchecked Sendable {
         _ = macrdp_session_send_pointer_hidden(s)
     }
 
-    /// Push a chunk of Int16LE stereo @ 48 kHz PCM to RDPSND.
+    /// Push a chunk of Int16LE stereo PCM at MACRDP_RDPSND_WIRE_RATE to RDPSND.
     @discardableResult
     func sendAudioPCM(_ pcm: Data) -> Bool {
         guard let s = session else { return false }

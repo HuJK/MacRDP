@@ -157,7 +157,7 @@ struct macrdp_session {
     _Atomic int32_t        audio_selected_format;     /* MACRDP_AUDIO_FORMAT_* */
     _Atomic uint32_t       audio_selected_format_no;  /* index in client_formats */
     /* Sample-time monotonic counter for AAC's audioTimeStamp field
-     * (UINT32 wraps at ~89000s @ 48kHz). */
+     * (UINT32 wraps at ~97000s @ 44.1kHz). */
     _Atomic uint32_t       audio_total_samples;
     /* Playback-progress tracking. Lag is measured per-block via a ring of
      * monotonic ms timestamps keyed by RDPSND `bBlockNo` (uint8, 256 wrap):
@@ -939,13 +939,14 @@ static void try_open_rdpsnd(struct macrdp_session *s) {
     }
 
     if (s->cfg.audio_codec == 2) {
-        /* AAC-LC 48k stereo @ 128 kbps. mstsc needs the HEAACWAVEINFO
-         * extension data to decode our raw AAC frames. cbSize=14 payload:
+        /* AAC-LC 44.1k stereo @ 128 kbps (see MACRDP_RDPSND_WIRE_RATE).
+         * mstsc needs the HEAACWAVEINFO extension data to decode our raw
+         * AAC frames. cbSize=14 payload:
          *   wPayloadType (UINT16 LE) = 0   (Raw — no ADTS framing)
          *   wAudioProfileLevelIndication (UINT16 LE) = 0x29 (AAC-LC L2)
          *   wStructType / wReserved1 / dwReserved2 = 0
-         *   AudioSpecificConfig (2 bytes) = 0x11 0x90
-         *     = AOT=2 (LC), samplingFreqIndex=3 (48k), channelConfig=2 (stereo) */
+         *   AudioSpecificConfig (2 bytes) = 0x12 0x10
+         *     = AOT=2 (LC), samplingFreqIndex=4 (44.1k), channelConfig=2 (stereo) */
         static const size_t kAacExtraLen = 14;
         BYTE *aacExtra = (BYTE *)calloc(1, kAacExtraLen);
         if (!aacExtra) {
@@ -954,11 +955,12 @@ static void try_open_rdpsnd(struct macrdp_session *s) {
             return;
         }
         aacExtra[2] = 0x29;          /* wAudioProfileLevelIndication low byte */
-        aacExtra[12] = 0x11;         /* AudioSpecificConfig byte 0 */
-        aacExtra[13] = 0x90;         /* AudioSpecificConfig byte 1 */
+        _Static_assert(MACRDP_RDPSND_WIRE_RATE == 44100, "AudioSpecificConfig encodes 44.1 kHz");
+        aacExtra[12] = 0x12;         /* AudioSpecificConfig byte 0 */
+        aacExtra[13] = 0x10;         /* AudioSpecificConfig byte 1 */
         fmts[0].wFormatTag      = WAVE_FORMAT_AAC_MS;
         fmts[0].nChannels       = 2;
-        fmts[0].nSamplesPerSec  = 48000;
+        fmts[0].nSamplesPerSec  = MACRDP_RDPSND_WIRE_RATE;
         fmts[0].wBitsPerSample  = 16;
         fmts[0].nBlockAlign     = 4;
         fmts[0].nAvgBytesPerSec = 16000;     /* 128 kbps */
@@ -978,15 +980,15 @@ static void try_open_rdpsnd(struct macrdp_session *s) {
         fmts[0].data            = NULL;
     }
 
-    /* PCM 16-bit 48 kHz stereo — always present (primary for "pcm", else
+    /* PCM 16-bit 44.1 kHz stereo — always present (primary for "pcm", else
      * the fallback for older / non-Opus clients). */
     const int pcmIdx = wantCompressed ? 1 : 0;
     fmts[pcmIdx].wFormatTag      = WAVE_FORMAT_PCM;
     fmts[pcmIdx].nChannels       = 2;
-    fmts[pcmIdx].nSamplesPerSec  = 48000;
+    fmts[pcmIdx].nSamplesPerSec  = MACRDP_RDPSND_WIRE_RATE;
     fmts[pcmIdx].wBitsPerSample  = 16;
     fmts[pcmIdx].nBlockAlign     = 4;
-    fmts[pcmIdx].nAvgBytesPerSec = 48000 * 4;
+    fmts[pcmIdx].nAvgBytesPerSec = MACRDP_RDPSND_WIRE_RATE * 4;
     fmts[pcmIdx].cbSize          = 0;
     fmts[pcmIdx].data            = NULL;
 
