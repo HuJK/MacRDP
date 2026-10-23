@@ -1,0 +1,18 @@
+# MacRDP config for the Tart test VM (see scripts/tart-vm.sh).
+#
+# Only the overrides the VM needs; everything else falls back to
+# rds/CLI/DefaultConfig.swift. VZ guests do get the VideoToolbox hardware
+# H.264 encoder, so video.hwAcceleration stays at its `required` default.
+
+log:
+  # Logs are read through `log stream` over `tart exec`, which drops
+  # Console.app's timestamp/category columns.
+  format:
+    timestamp: true
+    prefix: true
+  # Clipboard traffic at info, for scripts/check-basics.sh failures; audio
+  # out at info for its SCK rate line (nominal vs delivered sample rate),
+  # which tools/latency/audio-out-latency.sh runs read.
+  sources:
+    clipboard: info
+    audio.out: info
