@@ -15,6 +15,8 @@
 //                                        # (`tart exec` children may not, and get EDEADLK)
 //   guestcheck sck-record <secs> <out>   # system audio via ScreenCaptureKit, as MacRDP gets it:
 //                                        # 48 kHz stereo float32 interleaved, raw
+//   guestcheck status-menu <bundle-id> [item]  # open an app's menu-bar (status item) menu,
+//                                        # print its items, press the first containing [item]
 //   guestcheck input-record <device> <secs> <out>  # an input device (e.g. "BlackHole 2ch",
 //                                        # where MacRDP plays the client's mic), same raw
 //                                        # layout; prints the device's sample rate
@@ -23,6 +25,7 @@
 //                                        # pointer-shape checks (see SinkView)
 
 import AppKit
+import ApplicationServices
 import AVFoundation
 import CoreAudio
 import ScreenCaptureKit
@@ -169,6 +172,48 @@ case "sck-record":
     try await stream.stopCapture()
     try fh.close()
     print("\(sink.frames) frames in \(String(format: "%.2f", Date().timeIntervalSince(start))) s")
+
+case "status-menu":
+    // Through Accessibility, which the guest agent (our parent) holds.
+    guard args.count >= 2,
+          let app = NSRunningApplication.runningApplications(withBundleIdentifier: args[1]).first else {
+        fail("usage: guestcheck status-menu <bundle-id> [item] (app must be running)")
+    }
+    func attr(_ el: AXUIElement, _ name: String) -> AnyObject? {
+        var v: AnyObject?
+        return AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success ? v : nil
+    }
+    func kids(_ el: AXUIElement) -> [AXUIElement] { (attr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? [] }
+    func title(_ el: AXUIElement) -> String { (attr(el, kAXTitleAttribute) as? String) ?? "" }
+    let root = AXUIElementCreateApplication(app.processIdentifier)
+    guard let bar = attr(root, "AXExtrasMenuBar"), let item = kids(bar as! AXUIElement).first else {
+        fail("\(args[1]) has no status item")
+    }
+    // The menu is rebuilt each time it opens; wait for it, and for [item].
+    var target: AXUIElement?
+    var titles: [String] = []
+    func walk(_ el: AXUIElement) {
+        if (attr(el, kAXRoleAttribute) as? String) == "AXMenuItem", !title(el).isEmpty {
+            titles.append(title(el))
+            if target == nil, args.count > 2, title(el).contains(args[2]) { target = el }
+        }
+        kids(el).forEach(walk)
+    }
+    for attempt in 1...3 {
+        AXUIElementPerformAction(item, kAXPressAction as CFString)
+        for _ in 0..<15 where target == nil && (titles.isEmpty || args.count > 2) {
+            usleep(200_000)
+            titles = []; walk(item)
+        }
+        if args.count <= 2 { break }
+        if let t = target, AXUIElementPerformAction(t, kAXPressAction as CFString) == .success { break }
+        AXUIElementPerformAction(item, kAXCancelAction as CFString)
+        target = nil
+        if attempt == 3 { titles.forEach { print($0) }; fail("could not press a menu item containing \(args[2])") }
+        usleep(500_000)
+    }
+    titles.forEach { print($0) }
+    if let target { print("pressed \(title(target))") } else { AXUIElementPerformAction(item, kAXCancelAction as CFString) }
 
 case "input-record":
     guard args.count == 4, let secs = Double(args[2]) else {

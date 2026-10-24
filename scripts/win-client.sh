@@ -13,6 +13,7 @@
 #   ./scripts/win-client.sh clip '<json>'       # read/write the clipboard (scripts/win/clip.ps1)
 #   ./scripts/win-client.sh put <local> <dir>   # upload into macrdp-test\<dir>
 #   ./scripts/win-client.sh paste <dir> [secs]  # paste into <dir> in Explorer (scripts/win/explorer-paste.ps1)
+#   ./scripts/win-client.sh vcam                # start the test webcam (scripts/win/vcam.ps1)
 #   ./scripts/win-client.sh audio-default [render|capture <name>]  # list audio devices, or make
 #                                               # one the default (scripts/win/audio-default.ps1)
 #   ./scripts/win-client.sh build <file.cs>     # compile a C# tool there (csc, C# 5)
@@ -120,6 +121,7 @@ case "$sub" in
   put)        [[ $# -eq 2 ]] || die "usage: $0 put <local> <dir>"
               ps "New-Item -ItemType Directory -Force \"$PSDIR\\$2\" | Out-Null"
               scp -q -r -o BatchMode=yes "$1" "$WIN:$RDIR/$2/" ;;
+  vcam)       desktop vcam.ps1; ps "Get-Content \"$PSDIR\\vcam.txt\"" ;;
   audio-default) if [[ $# -ge 2 ]]; then run_json audio-default.ps1 "{\"flow\": \"$1\", \"name\": \"$2\"}"
               else run_json audio-default.ps1 '{}'; fi ;;
   build)      [[ -n "${1:-}" ]] || die "usage: $0 build <file.cs>"; cmd_build "$1" ;;

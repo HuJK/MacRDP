@@ -27,6 +27,7 @@ if (Test-Path $default) {
 # session (DISP). authentication level 0: MacRDP's certificate is self-signed.
 # audiocapturemode 1 ("Record from this computer") redirects the default
 # recording device; without it mstsc refuses MacRDP's AUDIN channel.
+# camerastoredirect * offers every camera (RDPECAM), plugged in later too.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class Dpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
 [Dpi]::SetProcessDPIAware() | Out-Null
@@ -46,6 +47,7 @@ $height = if ($cfg.height) { $cfg.height } else { $screen.Height }
   "session bpp:i:32",
   "audiomode:i:0",
   "audiocapturemode:i:1",
+  "camerastoredirect:s:*",
   "redirectclipboard:i:1",
   "connection type:i:7",
   "networkautodetect:i:1",

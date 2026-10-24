@@ -20,6 +20,8 @@
 #   mic       client microphone: tone bursts played into VB-Cable on Windows
 #             reach the Mac's BlackHole at the right pitch and spacing
 #             (needs BlackHole in the VM: brew install --cask blackhole-2ch)
+#   camera    client webcam: VCamSample's test pattern on the client (scripts/win/
+#             vcam.ps1) streams over RDPECAM into MacRDP's camera view
 #   nla       nthash login policy over NLA: right password in, wrong one out
 #             (restarts MacRDP with a temporary config, then restores it)
 #
@@ -38,7 +40,7 @@ VMSH="$REPO_ROOT/scripts/tart-vm.sh"
 WINSH="$REPO_ROOT/scripts/win-client.sh"
 WINDIR='$env:USERPROFILE\macrdp-test'
 CHECKS=("$@"); [[ ${#CHECKS[@]} -gt 0 ]] ||
-  CHECKS=(display keyboard unicode mouse wheel cursor resize text image files mic nla)
+  CHECKS=(display keyboard unicode mouse wheel cursor resize text image files mic camera nla)
 OUT="${OUT:-${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/runs/basics-$(date +%Y%m%d-%H%M%S)}"
 IMGCMP="${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/build/bin/imgcmp"
 mkdir -p "$OUT"
@@ -392,6 +394,33 @@ check_mic() {
          END { print b + 0 }')"
   ok=0; [[ $n -ge 6 && $bad == 0 ]] && ok=1
   result "mic win->mac" $ok "$n bursts, $bad off; $(head -1 "$OUT/mic-record.txt")"
+}
+
+# MARK: - Check: camera
+
+check_camera() {
+  # mstsc offers every camera (connect.ps1: camerastoredirect); the client
+  # runs VCamSample, a virtual camera drawing a test pattern. mstsc lists
+  # cameras when it connects, so reconnect after making sure it runs.
+  # Opening the camera from MacRDP's menu starts its RDPECAM stream into
+  # the camera view, and the session log counts the samples.
+  local vcam log fps t0
+  vcam="$(win vcam | tr -d '\r')"
+  [[ "$vcam" == running* ]] || { result "camera win->mac" 0 "no test webcam on the client: $vcam"; return; }
+  win disconnect >/dev/null && win connect >/dev/null
+  sleep 4
+  t0=$(date +%s)
+  if ! vm /usr/local/bin/guestcheck status-menu com.mac-rdp.rds "Windows Virtual Camera" >/dev/null; then
+    result "camera win->mac" 0 "no client camera in MacRDP's menu"; return
+  fi
+  sleep 12
+  log="$("$VMSH" logs $(( $(date +%s) - t0 + 3 )))"
+  fps="$(sed -n 's/.*Camera [^:]*: \([0-9.]*\) fps.*/\1/p' <<<"$log" | tail -1)"
+  ok=0
+  [[ -n "$fps" ]] && ! grep -q "decoding failed" <<<"$log" &&
+    awk -v f="$fps" 'BEGIN { exit !(f >= 10) }' && ok=1
+  result "camera win->mac" $ok \
+    "$(grep -o 'streaming H.264 [0-9x]*' <<<"$log" | tail -1), ${fps:-no} samples/s$(grep -q 'decoding failed' <<<"$log" && echo ', decoding failed')"
 }
 
 # MARK: - Check: NLA with the nthash policy
