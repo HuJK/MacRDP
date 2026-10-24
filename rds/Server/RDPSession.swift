@@ -160,6 +160,7 @@ final class RDPSession {
     private func virtualCameraInUse(_ id: String, _ inUse: Bool) {
         guard let cam = virtualCameras[id], cam.inUse != inUse else { return }
         cam.inUse = inUse
+        cam.decoder.forwardsFrames = inUse
         LogTo.session.notice("Camera \(id): \(inUse ? "in use on the Mac, starting its stream" : "no longer in use")")
         if inUse { acquireCamera(id) } else { releaseCamera(id) }
     }
@@ -586,7 +587,10 @@ final class RDPSession {
             Task { @MainActor [weak self] in
                 self?.noteCameraSample(camID, data)
                 self?.cameraViews[camID]?.enqueue(data)
-                if let cam = self?.virtualCameras[camID], cam.inUse { cam.decoder.decode(data) }
+                // Every sample, in use or not: the decoder needs the stream's
+                // start (parameter sets, keyframe), which may come while only
+                // the camera view is reading it.
+                self?.virtualCameras[camID]?.decoder.decode(data)
             }
         }
         sinks.onRdpdrDirEntry = { token, isEntry, ioStatus, name, attrs, size, mtime in

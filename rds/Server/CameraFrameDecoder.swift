@@ -109,11 +109,22 @@ struct H264SampleBuilder {
 }
 
 /// Decodes one camera's samples on its own queue and hands 1280x720 32BGRA
-/// frames to `onFrame` (on that queue).
+/// frames to `onFrame` (on that queue) while `forwardsFrames` is on.
+///
+/// Feed it every sample of the stream, used or not: the client sends its
+/// parameter sets and keyframe only when the stream starts, so a decoder that
+/// joins later (another viewer started the stream) has nothing to decode.
 final class CameraFrameDecoder: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.mac-rdp.rds.camera.decode")
     private let onFrame: (CVPixelBuffer) -> Void
+    private let forwardLock = NSLock()
+    private var _forwardsFrames = false
+    /// Hand decoded frames to `onFrame` (scaled); off = decode only.
+    var forwardsFrames: Bool {
+        get { forwardLock.lock(); defer { forwardLock.unlock() }; return _forwardsFrames }
+        set { forwardLock.lock(); _forwardsFrames = newValue; forwardLock.unlock() }
+    }
     private var builder = H264SampleBuilder()
     private var session: VTDecompressionSession?
     private var sessionFormat: CMFormatDescription?
@@ -132,13 +143,20 @@ final class CameraFrameDecoder: @unchecked Sendable {
 
     func decode(_ annexB: Data) {
         queue.async { [self] in
+            stats.samples += 1
+            defer { logStats() }
             guard let sample = builder.sampleBuffer(for: annexB),
-                  let fmt = builder.formatDescription, makeSession(for: fmt), let session else { return }
+                  let fmt = builder.formatDescription, makeSession(for: fmt), let session else {
+                stats.unusable += 1
+                return
+            }
             let status = VTDecompressionSessionDecodeFrame(
                 session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
             ) { [self] status, _, image, _, _ in
-                guard status == noErr, let image else { return }
-                if let frame = scaled(image) { onFrame(frame) }
+                guard status == noErr, let image else { stats.lastError = status; stats.errors += 1; return }
+                stats.decoded += 1
+                guard forwardsFrames else { return }
+                if let frame = scaled(image) { stats.forwarded += 1; onFrame(frame) } else { stats.unscaled += 1 }
             }
             if status != noErr {
                 failures += 1
@@ -147,6 +165,23 @@ final class CameraFrameDecoder: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Per-5 s counts, logged while frames are forwarded (or failing).
+    private struct Stats {
+        var samples = 0, unusable = 0, decoded = 0, errors = 0, forwarded = 0, unscaled = 0
+        var lastError: OSStatus = 0
+        var since = CFAbsoluteTimeGetCurrent()
+    }
+    private var stats = Stats()
+
+    private func logStats() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - stats.since >= 5 else { return }
+        if stats.forwarded > 0 || stats.errors > 0 || stats.unscaled > 0 || forwardsFrames {
+            LogTo.session.notice("Camera decoder: \(self.stats.samples) samples, \(self.stats.unusable) without parameter sets, \(self.stats.decoded) decoded, \(self.stats.errors) errors (last \(self.stats.lastError)), \(self.stats.forwarded) forwarded, \(self.stats.unscaled) not scaled")
+        }
+        stats = Stats(since: now)
     }
 
     /// (Re)create the decoder when the stream's parameter sets change.

@@ -97,6 +97,10 @@ typedef struct macrdp_camera_media {
     bool                       streaming;
     _Atomic bool               open_requested;
     _Atomic bool               stop_requested;
+    uint64_t                   samples;       /* sample responses (camera thread only) */
+    _Atomic uint64_t           last_sample_ms;  /* last sample response (or stream start) */
+    uint64_t                   last_nudge_ms;   /* last watchdog re-request (peer thread) */
+    uint32_t                   nudges;          /* watchdog re-requests since the last sample */
 } macrdp_camera_media;
 #endif
 
@@ -680,8 +684,10 @@ static UINT cam_media_media_type_list_response_cb(
     if (rc != CHANNEL_RC_OK) return rc;
     cm->state = 3;
     cm->streaming = true;
-    os_log(bridge_log(), "RDPECAM '%{public}s': streaming H.264 %ux%u",
-           cm->device_id ? cm->device_id : "?", cm->fmt.Width, cm->fmt.Height);
+    os_log(bridge_log(), "RDPECAM '%{public}s': streaming H.264 %ux%u at %u/%u fps",
+           cm->device_id ? cm->device_id : "?", cm->fmt.Width, cm->fmt.Height,
+           cm->fmt.FrameRateNumerator, cm->fmt.FrameRateDenominator);
+    atomic_store(&cm->last_sample_ms, now_ms());
 
     CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));
     req.StreamIndex = cm->stream_index;
@@ -696,17 +702,30 @@ static UINT cam_media_sample_response_cb(CameraDeviceServerContext *ctx,
     if (pdu->Sample && pdu->SampleSize > 0 && s->cbs.on_camera_frame) {
         s->cbs.on_camera_frame(s->swift_ctx, cm->device_id, pdu->Sample, pdu->SampleSize);
     }
-    if (atomic_load(&cm->stop_requested)) return CHANNEL_RC_OK;
+    cm->samples++;
+    atomic_store(&cm->last_sample_ms, now_ms());
+    if (atomic_load(&cm->stop_requested)) {
+        os_log(bridge_log(), "RDPECAM '%{public}s': stop requested, not pulling after %llu samples",
+               cm->device_id ? cm->device_id : "?", (unsigned long long)cm->samples);
+        return CHANNEL_RC_OK;
+    }
     CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));   /* pull the next frame */
     req.StreamIndex = cm->stream_index;
-    return ctx->SampleRequest(ctx, &req);
+    UINT rc = ctx->SampleRequest(ctx, &req);
+    if (rc != CHANNEL_RC_OK) {
+        os_log_error(bridge_log(), "RDPECAM '%{public}s': SampleRequest failed (%u) after %llu samples",
+                     cm->device_id ? cm->device_id : "?", rc, (unsigned long long)cm->samples);
+    }
+    return rc;
 }
 
 static UINT cam_media_sample_error_cb(CameraDeviceServerContext *ctx,
                                       const CAM_SAMPLE_ERROR_RESPONSE *pdu) {
     macrdp_camera_media *cm = (macrdp_camera_media*)ctx->userdata;
-    (void)pdu;
     if (!cm || atomic_load(&cm->stop_requested)) return CHANNEL_RC_OK;
+    os_log(bridge_log(), "RDPECAM '%{public}s': sample error 0x%X after %llu samples, pulling again",
+           cm->device_id ? cm->device_id : "?", pdu ? (unsigned)pdu->ErrorCode : 0u,
+           (unsigned long long)cm->samples);
     CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));   /* keep pulling */
     req.StreamIndex = cm->stream_index;
     return ctx->SampleRequest(ctx, &req);
@@ -777,6 +796,31 @@ static void cam_media_close_free(macrdp_camera_media *cm) {
 }
 
 /* Peer-thread pump: process Swift-requested camera start/stop. */
+/* The pull loop keeps exactly one SampleRequest outstanding, so a single lost
+ * request or response stalls the stream for good. If no sample arrived for
+ * MACRDP_CAMERA_STALL_MS, ask again (at most once per that interval, and
+ * give up after MACRDP_CAMERA_MAX_NUDGES: the client stopped answering). */
+#define MACRDP_CAMERA_STALL_MS   500u
+#define MACRDP_CAMERA_MAX_NUDGES 20u
+static void cam_media_watchdog(macrdp_camera_media *cm) {
+    uint64_t now = now_ms();
+    uint64_t last = atomic_load(&cm->last_sample_ms);
+    if (last == 0 || now - last < MACRDP_CAMERA_STALL_MS) { cm->nudges = 0; return; }
+    if (cm->nudges >= MACRDP_CAMERA_MAX_NUDGES) return;
+    if (now - cm->last_nudge_ms < MACRDP_CAMERA_STALL_MS) return;
+    cm->last_nudge_ms = now;
+    cm->nudges++;
+    CAM_SAMPLE_REQUEST req; memset(&req, 0, sizeof(req));
+    req.StreamIndex = cm->stream_index;
+    UINT rc = cm->ctx->SampleRequest(cm->ctx, &req);
+    if (cm->nudges == 1 || cm->nudges == MACRDP_CAMERA_MAX_NUDGES) {
+        os_log(bridge_log(), "RDPECAM '%{public}s': no sample for %llu ms after %llu, re-requested (%u, rc=%u)%s",
+               cm->device_id ? cm->device_id : "?", (unsigned long long)(now - last),
+               (unsigned long long)cm->samples, cm->nudges, rc,
+               cm->nudges == MACRDP_CAMERA_MAX_NUDGES ? "; giving up" : "");
+    }
+}
+
 static void pump_cameras(struct macrdp_session *s) {
     os_unfair_lock_lock(&s->cameras_lock);
     for (int i = 0; i < MACRDP_MAX_CAMERAS; ++i) {
@@ -788,6 +832,8 @@ static void pump_cameras(struct macrdp_session *s) {
         } else if (atomic_load(&cm->open_requested) && !cm->opened) {
             atomic_store(&cm->open_requested, false);
             cam_media_open(cm);
+        } else if (cm->streaming && cm->ctx) {
+            cam_media_watchdog(cm);
         }
     }
     os_unfair_lock_unlock(&s->cameras_lock);
