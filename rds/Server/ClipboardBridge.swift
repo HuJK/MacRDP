@@ -67,6 +67,11 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
     /// MainActor-only — pasteboard changeCount we set ourselves (to
     /// suppress the echo on the next poll tick).
     private var selfWroteChangeCount: Int = -1
+    /// MainActor-only — session of the newest client file copy. Its
+    /// pasteboard claim is async (File Provider URL lookup), and mstsc often
+    /// sends the same FormatList twice ~20 ms apart, so an older copy's claim
+    /// can finish last; only the newest copy may claim the pasteboard.
+    private var latestFileCopy: String?
 
     /// Outgoing custom-format ids we've assigned during this session.
     /// Stable across re-advertisements so the client can cache name→id
@@ -257,8 +262,10 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         if cc == selfWroteChangeCount { return }
 
         // A genuine local copy: start the echo-suppression window so the
-        // client's echo of this clipboard doesn't clobber it.
+        // client's echo of this clipboard doesn't clobber it, nor a client
+        // file copy's late pasteboard claim.
         lastLocalChangeUptimeMs = nowUptimeMs()
+        latestFileCopy = nil
 
         var formats: [(id: UInt32, name: String?)] = []
         let types = pb.types ?? []
@@ -507,6 +514,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                 return
             }
         }
+        latestFileCopy = nil   // any new client copy outranks a pending file claim
 
         let ids = Dictionary(uniqueKeysWithValues:
             formats.compactMap { f -> (UInt32, String?)? in (f.id, f.name) })
@@ -604,6 +612,7 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         let inbox = AppDelegate.sharedClipboardInbox
         let sessionID = UUID().uuidString
         let placeholderName = "MacRDP_" + sessionID
+        latestFileCopy = sessionID
         LogTo.clipboard.info("File copy begin: session=\(sessionID) mode=\(eager ? "eager" : "lazy") placeholder='\(placeholderName)'")
 
         // LOCK_CLIPDATA so mstsc preserves THIS event's FGDW snapshot even
@@ -661,6 +670,10 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
                     return
                 }
                 if let url = await inbox.userVisibleURL(itemID: sessionID, filename: placeholderName) {
+                    guard self.latestFileCopy == sessionID else {
+                        LogTo.clipboard.info("Lazy-mode claim for \(sessionID) skipped: a newer copy owns the pasteboard")
+                        return
+                    }
                     let pb = NSPasteboard.general
                     pb.clearContents()
                     pb.writeObjects([url as NSURL])
@@ -852,12 +865,12 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
         }
         // Bind the children (real top-level) URLs — Finder strips the
         // placeholder parent path on paste, so real names land.
-        await self.resolveAndWriteFileURLs(inbox: inbox,
+        await self.resolveAndWriteFileURLs(inbox: inbox, sessionID: sessionID,
                                            items: resolved.children.map(toPublish))
     }
 
     @MainActor
-    private func resolveAndWriteFileURLs(inbox: FileProviderInbox,
+    private func resolveAndWriteFileURLs(inbox: FileProviderInbox, sessionID: String,
                                           items: [FileProviderInbox.PublishItem]) async {
         // Caller filters which items go on the pasteboard (we used
         // to hard-code parentID == nil, but with session-folder
@@ -875,6 +888,10 @@ final class ClipboardBridge: NSObject, @unchecked Sendable {
             }
         }
         guard !urls.isEmpty else { return }
+        guard latestFileCopy == sessionID else {
+            LogTo.clipboard.info("Eager claim for \(sessionID) skipped: a newer copy owns the pasteboard")
+            return
+        }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.writeObjects(urls as [NSURL])
