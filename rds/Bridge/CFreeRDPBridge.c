@@ -257,6 +257,16 @@ static HANDLE vcm_from_session(struct macrdp_session *s) {
 
 /* -------- GFX callbacks ------------------------------------------- */
 
+/* Whether a capset lets us send AVC420: 8.1 opts in with AVC420_ENABLED,
+ * 10.x opts out with AVC_DISABLED, 8.0 has no AVC. */
+static bool gfx_capset_allows_avc(const RDPGFX_CAPSET *c) {
+    switch (c->version) {
+    case RDPGFX_CAPVERSION_8:  return false;
+    case RDPGFX_CAPVERSION_81: return (c->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) != 0;
+    default:                   return (c->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0;
+    }
+}
+
 static UINT gfx_caps_advertise(RdpgfxServerContext *ctx,
                                const RDPGFX_CAPS_ADVERTISE_PDU *capsAdv) {
     struct macrdp_session *s = (struct macrdp_session*)ctx->custom;
@@ -265,9 +275,10 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *ctx,
     }
 
     /* Iterate from newest to oldest, pick the first one the client
-     * offered. We send AVC420-only PDUs, but newer versions accept that
-     * — they just also support more (which we don't use). Mirrors the
-     * shadow server's algorithm. */
+     * offered, preferring capsets that allow AVC420 (every frame we send
+     * uses it). Newer versions accept AVC420-only PDUs — they just also
+     * support more (which we don't use). Mirrors the shadow server's
+     * algorithm. */
     static const uint32_t supported[] = {
         RDPGFX_CAPVERSION_107, RDPGFX_CAPVERSION_106, RDPGFX_CAPVERSION_106_ERR,
         RDPGFX_CAPVERSION_105, RDPGFX_CAPVERSION_104, RDPGFX_CAPVERSION_103,
@@ -275,34 +286,45 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *ctx,
         RDPGFX_CAPVERSION_81,  RDPGFX_CAPVERSION_8,
     };
     const RDPGFX_CAPSET *chosen = NULL;
-    for (size_t k = 0; k < sizeof(supported)/sizeof(supported[0]) && !chosen; ++k) {
-        for (UINT16 i = 0; i < capsAdv->capsSetCount; ++i) {
-            if (capsAdv->capsSets[i].version == supported[k]) {
-                chosen = &capsAdv->capsSets[i];
-                break;
+    for (int needAvc = 1; needAvc >= 0 && !chosen; --needAvc) {
+        for (size_t k = 0; k < sizeof(supported)/sizeof(supported[0]) && !chosen; ++k) {
+            for (UINT16 i = 0; i < capsAdv->capsSetCount; ++i) {
+                const RDPGFX_CAPSET *c = &capsAdv->capsSets[i];
+                if (c->version == supported[k] && (!needAvc || gfx_capset_allows_avc(c))) {
+                    chosen = c;
+                    break;
+                }
             }
         }
     }
+
+    char offered[512] = { 0 };
+    size_t used = 0;
+    for (UINT16 i = 0; i < capsAdv->capsSetCount && used < sizeof(offered); ++i) {
+        int n = snprintf(offered + used, sizeof(offered) - used, "%s0x%X/0x%X",
+                         i ? " " : "", capsAdv->capsSets[i].version,
+                         capsAdv->capsSets[i].flags);
+        if (n < 0) break;
+        used += (size_t)n;
+    }
     if (!chosen) {
         os_log(bridge_log(),
-               "GFX caps: client offered no version we recognise, refusing");
+               "GFX caps: client offered no version we recognise (%{public}s), refusing",
+               offered);
         return ERROR_INVALID_DATA;
     }
-
-    RDPGFX_CAPSET reply = *chosen;
-    /* Tell the client what subset of its offered flags we'll honour.
-     *   - For 8.1, AVC420 is signalled by SETTING AVC420_ENABLED.
-     *   - For 10.x+, AVC support is signalled by CLEARING AVC_DISABLED.
-     *   - We don't do AVC444, so we leave AVC_DISABLED clear (we DO support AVC, just only 420).
-     *   - Drop optional bits we don't implement (thin client, small cache, scaledmap_disable).
-     */
-    if (reply.version == RDPGFX_CAPVERSION_81) {
-        reply.flags |= RDPGFX_CAPS_FLAG_AVC420_ENABLED;
+    if (!gfx_capset_allows_avc(chosen)) {
+        os_log_error(bridge_log(),
+                     "GFX caps: client offers no capset with AVC420 (%{public}s); frames will not decode",
+                     offered);
     }
-    reply.flags &= ~(UINT32)RDPGFX_CAPS_FLAG_AVC_DISABLED;
-    reply.flags &= ~(UINT32)RDPGFX_CAPS_FLAG_AVC_THINCLIENT;
-    reply.flags &= ~(UINT32)RDPGFX_CAPS_FLAG_THINCLIENT;
-    reply.flags &= ~(UINT32)RDPGFX_CAPS_FLAG_SMALL_CACHE;
+
+    /* Confirm the capset exactly as offered: the confirm must be one of
+     * the client's own capsets. Clearing flags we don't use (thin client,
+     * small cache — we never use the cache) made a capset the client never
+     * sent, and the iOS Windows App, offering 10.4 with such flags, hung
+     * up right after the confirm (0x200d). */
+    RDPGFX_CAPSET reply = *chosen;
 
     RDPGFX_CAPS_CONFIRM_PDU confirm = { 0 };
     confirm.capsSet = &reply;
@@ -310,8 +332,8 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *ctx,
     if (rc == CHANNEL_RC_OK) {
         s->gfx_caps_confirmed = true;
         os_log(bridge_log(),
-               "GFX caps confirmed: version=0x%X flags=0x%X (client offered %u capset(s))",
-               reply.version, reply.flags, capsAdv->capsSetCount);
+               "GFX caps confirmed: version=0x%X flags=0x%X (client offered %{public}s)",
+               reply.version, reply.flags, offered);
     }
     return rc;
 }
