@@ -35,6 +35,9 @@ final class RDPSession {
     private var micSpectrum: MicSpectrumWindowController?
     /// Open camera view windows, keyed by RDPECAM device id.
     private var cameraViews: [String: CameraViewWindowController] = [:]
+    /// Per-camera sample counts for the periodic log line.
+    private var cameraStats: [String: CameraStats] = [:]
+    private struct CameraStats { var frames = 0, bytes = 0, total = 0; var since = CFAbsoluteTimeGetCurrent() }
     /// Reference counts per camera id. The media channel is started on the
     /// first acquirer and only stopped when the last releases it — so a local
     /// view and (future) virtual-camera consumer can share one stream without
@@ -117,6 +120,30 @@ final class RDPSession {
         }
         cameraViews[id]?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Log a camera's first sample (size, H.264 NAL unit types), then its
+    /// rate and sample size every 5 s.
+    private func noteCameraSample(_ id: String, _ data: Data) {
+        var st = cameraStats[id] ?? CameraStats()
+        if st.total == 0 {
+            var types: [UInt8] = []
+            data.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+                var i = 0
+                while i + 3 < b.count && types.count < 8 {
+                    if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 { types.append(b[i + 3] & 0x1F); i += 3 }
+                    i += 1
+                }
+            }
+            LogTo.session.notice("Camera \(id): first sample \(data.count) B, NAL types \(types)")
+        }
+        st.frames += 1; st.total += 1; st.bytes += data.count
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - st.since >= 5 {
+            LogTo.session.notice("Camera \(id): \(String(format: "%.1f", Double(st.frames) / (now - st.since))) fps, \(st.bytes / st.frames) B/sample, \(st.total) total")
+            st.frames = 0; st.bytes = 0; st.since = now
+        }
+        cameraStats[id] = st
     }
 
     /// Start (or join) a camera's media channel. The channel is opened only on
@@ -511,6 +538,7 @@ final class RDPSession {
         // Decoded H.264 sample for an open camera view → feed its window.
         sinks.onCameraFrame = { [weak self] camID, data in
             Task { @MainActor [weak self] in
+                self?.noteCameraSample(camID, data)
                 self?.cameraViews[camID]?.enqueue(data)
             }
         }

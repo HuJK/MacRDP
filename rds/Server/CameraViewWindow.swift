@@ -8,9 +8,11 @@
 //  camera device. Purpose: confirm "is the client's camera actually coming
 //  through?" from the menu bar.
 //
-//  Each sample is an Annex-B H.264 elementary stream: we split NAL units, cache
-//  SPS/PPS to build a CMVideoFormatDescription, and feed VCL NALs as
-//  length-prefixed (AVCC) CMSampleBuffers tagged display-immediately.
+//  Each sample is one Annex-B H.264 access unit: we split NAL units, cache
+//  SPS/PPS to build a CMVideoFormatDescription, and feed the frame's VCL NALs
+//  (often several slices) as ONE length-prefixed (AVCC) CMSampleBuffer tagged
+//  display-immediately — a buffer per slice decodes as broken frames and the
+//  layer shows nothing.
 //
 
 import AppKit
@@ -52,6 +54,7 @@ private final class CameraVideoView: NSView {
     private var sps: [UInt8]?
     private var pps: [UInt8]?
     private var formatDesc: CMFormatDescription?
+    private var reportedFailure = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -72,11 +75,25 @@ private final class CameraVideoView: NSView {
     }
 
     func enqueue(_ data: Data) {
+        var avcc: [UInt8] = []
+        var newParams = false
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            let buf = UnsafeBufferPointer(start: base, count: raw.count)
-            forEachNAL(buf) { handleNAL($0) }
+            forEachNAL(UnsafeBufferPointer(start: base, count: raw.count)) { nal in
+                guard let first = nal.first else { return }
+                switch first & 0x1F {
+                case 7: sps = Array(nal); newParams = true
+                case 8: pps = Array(nal); newParams = true
+                case 1, 5:   // slices: 4-byte big-endian length + NAL
+                    let len = UInt32(nal.count)
+                    avcc += [UInt8(len >> 24), UInt8((len >> 16) & 0xFF), UInt8((len >> 8) & 0xFF), UInt8(len & 0xFF)]
+                    avcc += nal
+                default: break   // SEI / AUD / etc.
+                }
+            }
         }
+        if newParams { rebuildFormat() }
+        if !avcc.isEmpty { enqueueAccessUnit(avcc) }
     }
 
     /// Walk Annex-B NAL units (3- or 4-byte start codes).
@@ -107,16 +124,6 @@ private final class CameraVideoView: NSView {
         }
     }
 
-    private func handleNAL(_ nal: UnsafeBufferPointer<UInt8>) {
-        guard let first = nal.first else { return }
-        switch first & 0x1F {
-        case 7: sps = Array(nal); rebuildFormat()
-        case 8: pps = Array(nal); rebuildFormat()
-        case 1, 5: enqueueVCL(nal)
-        default: break   // SEI / AUD / etc.
-        }
-    }
-
     private func rebuildFormat() {
         guard let sps, let pps else { return }
         var fmt: CMFormatDescription?
@@ -140,19 +147,8 @@ private final class CameraVideoView: NSView {
         if status == noErr { formatDesc = fmt }
     }
 
-    private func enqueueVCL(_ nal: UnsafeBufferPointer<UInt8>) {
+    private func enqueueAccessUnit(_ avcc: [UInt8]) {
         guard let formatDesc else { return }   // need SPS/PPS first
-
-        // AVCC: 4-byte big-endian length prefix + NAL payload.
-        var avcc = [UInt8](repeating: 0, count: 4 + nal.count)
-        let len = UInt32(nal.count)
-        avcc[0] = UInt8((len >> 24) & 0xFF)
-        avcc[1] = UInt8((len >> 16) & 0xFF)
-        avcc[2] = UInt8((len >> 8) & 0xFF)
-        avcc[3] = UInt8(len & 0xFF)
-        if let src = nal.baseAddress {
-            avcc.withUnsafeMutableBytes { memcpy($0.baseAddress!.advanced(by: 4), src, nal.count) }
-        }
 
         var blockBuffer: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(
@@ -187,7 +183,13 @@ private final class CameraVideoView: NSView {
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
 
-        if displayLayer.status == .failed { displayLayer.flush() }
+        if displayLayer.status == .failed {
+            if !reportedFailure {
+                reportedFailure = true
+                LogTo.session.error("Camera view: decoding failed: \(String(describing: self.displayLayer.error))")
+            }
+            displayLayer.flush()
+        }
         displayLayer.enqueue(sampleBuffer)
     }
 }
