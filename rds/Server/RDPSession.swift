@@ -10,6 +10,7 @@
 
 import AppKit
 import Foundation
+import CryptoKit
 import Darwin
 @preconcurrency import CoreMedia
 import os
@@ -35,6 +36,15 @@ final class RDPSession {
     private var micSpectrum: MicSpectrumWindowController?
     /// Open camera view windows, keyed by RDPECAM device id.
     private var cameraViews: [String: CameraViewWindowController] = [:]
+    /// Client cameras published as Mac cameras (the virtualcamera extension).
+    /// Each one's RDPECAM stream runs only while some app on the Mac reads it.
+    private var virtualCameras: [String: VirtualCamera] = [:]
+    private final class VirtualCamera {
+        let sink: VirtualCameraSink
+        let decoder: CameraFrameDecoder
+        var inUse = false
+        init(sink: VirtualCameraSink, decoder: CameraFrameDecoder) { self.sink = sink; self.decoder = decoder }
+    }
     /// Per-camera sample counts for the periodic log line.
     private var cameraStats: [String: CameraStats] = [:]
     private struct CameraStats { var frames = 0, bytes = 0, total = 0; var since = CFAbsoluteTimeGetCurrent() }
@@ -120,6 +130,38 @@ final class RDPSession {
         }
         cameraViews[id]?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Publish a client camera as a Mac camera. Its device id is derived from
+    /// the user and camera name, so apps keep their selection across
+    /// reconnects.
+    private func addVirtualCamera(id: String, name: String) {
+        guard virtualCameras[id] == nil else { return }
+        let key = Array(SHA256.hash(data: Data("\(clientUsername ?? "")|\(name)".utf8)).prefix(16))
+        let uuid = UUID(uuid: (key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                               key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15]))
+        let sink = VirtualCameraSink(id: uuid.uuidString, name: "\(name) (MacRDP)")
+        let cam = VirtualCamera(sink: sink, decoder: CameraFrameDecoder { [weak sink] frame in sink?.send(frame) })
+        sink.onInUseChanged = { [weak self] inUse in
+            MainActor.assumeIsolated { self?.virtualCameraInUse(id, inUse) }
+        }
+        virtualCameras[id] = cam
+        sink.start()
+    }
+
+    private func removeVirtualCamera(id: String) {
+        guard let cam = virtualCameras.removeValue(forKey: id) else { return }
+        cam.sink.stop()
+        if cam.inUse { releaseCamera(id) }
+    }
+
+    /// The first app on the Mac opened the camera, or the last one let go:
+    /// start or stop pulling it from the client (shared with the camera view).
+    private func virtualCameraInUse(_ id: String, _ inUse: Bool) {
+        guard let cam = virtualCameras[id], cam.inUse != inUse else { return }
+        cam.inUse = inUse
+        LogTo.session.notice("Camera \(id): \(inUse ? "in use on the Mac, starting its stream" : "no longer in use")")
+        if inUse { acquireCamera(id) } else { releaseCamera(id) }
     }
 
     /// Log a camera's first sample (size, H.264 NAL unit types), then its
@@ -302,6 +344,8 @@ final class RDPSession {
         micSpectrum = nil
         for (_, ctrl) in cameraViews { ctrl.close() }
         cameraViews.removeAll()
+        for (_, cam) in virtualCameras { cam.sink.stop() }
+        virtualCameras.removeAll()
         #if MACRDP_BRIDGE_AVAILABLE
         for id in cameraRefs.keys { bridge?.cameraStop(deviceID: id) }
         #endif
@@ -527,12 +571,14 @@ final class RDPSession {
                 guard let self else { return }
                 if !self.cameras.contains(where: { $0.id == camID }) {
                     self.cameras.append((id: camID, name: name))
+                    self.addVirtualCamera(id: camID, name: name)
                 }
             }
         }
         sinks.onCameraRemoved = { [weak self] camID in
             Task { @MainActor [weak self] in
                 self?.cameras.removeAll { $0.id == camID }
+                self?.removeVirtualCamera(id: camID)
             }
         }
         // Decoded H.264 sample for an open camera view → feed its window.
@@ -540,6 +586,7 @@ final class RDPSession {
             Task { @MainActor [weak self] in
                 self?.noteCameraSample(camID, data)
                 self?.cameraViews[camID]?.enqueue(data)
+                if let cam = self?.virtualCameras[camID], cam.inUse { cam.decoder.decode(data) }
             }
         }
         sinks.onRdpdrDirEntry = { token, isEntry, ioStatus, name, attrs, size, mtime in

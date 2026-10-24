@@ -8,11 +8,9 @@
 //  camera device. Purpose: confirm "is the client's camera actually coming
 //  through?" from the menu bar.
 //
-//  Each sample is one Annex-B H.264 access unit: we split NAL units, cache
-//  SPS/PPS to build a CMVideoFormatDescription, and feed the frame's VCL NALs
-//  (often several slices) as ONE length-prefixed (AVCC) CMSampleBuffer tagged
-//  display-immediately — a buffer per slice decodes as broken frames and the
-//  layer shows nothing.
+//  Each sample is one Annex-B H.264 access unit, which H264SampleBuilder (see
+//  CameraFrameDecoder.swift) turns into one sample buffer, shown with
+//  display-immediately.
 //
 
 import AppKit
@@ -51,9 +49,7 @@ final class CameraViewWindowController: NSWindowController, NSWindowDelegate {
 
 private final class CameraVideoView: NSView {
     private let displayLayer = AVSampleBufferDisplayLayer()
-    private var sps: [UInt8]?
-    private var pps: [UInt8]?
-    private var formatDesc: CMFormatDescription?
+    private var builder = H264SampleBuilder()
     private var reportedFailure = false
 
     override init(frame frameRect: NSRect) {
@@ -75,101 +71,7 @@ private final class CameraVideoView: NSView {
     }
 
     func enqueue(_ data: Data) {
-        var avcc: [UInt8] = []
-        var newParams = false
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            forEachNAL(UnsafeBufferPointer(start: base, count: raw.count)) { nal in
-                guard let first = nal.first else { return }
-                switch first & 0x1F {
-                case 7: sps = Array(nal); newParams = true
-                case 8: pps = Array(nal); newParams = true
-                case 1, 5:   // slices: 4-byte big-endian length + NAL
-                    let len = UInt32(nal.count)
-                    avcc += [UInt8(len >> 24), UInt8((len >> 16) & 0xFF), UInt8((len >> 8) & 0xFF), UInt8(len & 0xFF)]
-                    avcc += nal
-                default: break   // SEI / AUD / etc.
-                }
-            }
-        }
-        if newParams { rebuildFormat() }
-        if !avcc.isEmpty { enqueueAccessUnit(avcc) }
-    }
-
-    /// Walk Annex-B NAL units (3- or 4-byte start codes).
-    private func forEachNAL(_ b: UnsafeBufferPointer<UInt8>,
-                            _ body: (UnsafeBufferPointer<UInt8>) -> Void) {
-        let n = b.count
-        func startLen(_ p: Int) -> Int {
-            if p + 3 <= n, b[p] == 0, b[p + 1] == 0, b[p + 2] == 1 { return 3 }
-            if p + 4 <= n, b[p] == 0, b[p + 1] == 0, b[p + 2] == 0, b[p + 3] == 1 { return 4 }
-            return 0
-        }
-        var i = 0
-        var nalStart = -1
-        while i < n {
-            let sc = startLen(i)
-            if sc > 0 {
-                if nalStart >= 0, i > nalStart {
-                    body(UnsafeBufferPointer(rebasing: b[nalStart..<i]))
-                }
-                i += sc
-                nalStart = i
-            } else {
-                i += 1
-            }
-        }
-        if nalStart >= 0, nalStart < n {
-            body(UnsafeBufferPointer(rebasing: b[nalStart..<n]))
-        }
-    }
-
-    private func rebuildFormat() {
-        guard let sps, let pps else { return }
-        var fmt: CMFormatDescription?
-        let status = sps.withUnsafeBufferPointer { sp in
-            pps.withUnsafeBufferPointer { pp in
-                let pointers = [sp.baseAddress!, pp.baseAddress!]
-                let sizes = [sp.count, pp.count]
-                return pointers.withUnsafeBufferPointer { pPtr in
-                    sizes.withUnsafeBufferPointer { sPtr in
-                        CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                            allocator: kCFAllocatorDefault,
-                            parameterSetCount: 2,
-                            parameterSetPointers: pPtr.baseAddress!,
-                            parameterSetSizes: sPtr.baseAddress!,
-                            nalUnitHeaderLength: 4,
-                            formatDescriptionOut: &fmt)
-                    }
-                }
-            }
-        }
-        if status == noErr { formatDesc = fmt }
-    }
-
-    private func enqueueAccessUnit(_ avcc: [UInt8]) {
-        guard let formatDesc else { return }   // need SPS/PPS first
-
-        var blockBuffer: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: avcc.count,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-            offsetToData: 0, dataLength: avcc.count, flags: 0,
-            blockBufferOut: &blockBuffer) == kCMBlockBufferNoErr, let blockBuffer
-        else { return }
-        guard CMBlockBufferReplaceDataBytes(
-            with: avcc, blockBuffer: blockBuffer, offsetIntoDestination: 0,
-            dataLength: avcc.count) == kCMBlockBufferNoErr else { return }
-
-        var sampleBuffer: CMSampleBuffer?
-        var sizes = [avcc.count]
-        guard CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault, dataBuffer: blockBuffer,
-            formatDescription: formatDesc, sampleCount: 1,
-            sampleTimingEntryCount: 0, sampleTimingArray: nil,
-            sampleSizeEntryCount: 1, sampleSizeArray: &sizes,
-            sampleBufferOut: &sampleBuffer) == noErr, let sampleBuffer
-        else { return }
+        guard let sampleBuffer = builder.sampleBuffer(for: data) else { return }
 
         // No PTS — tell the layer to show each frame as it arrives.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(

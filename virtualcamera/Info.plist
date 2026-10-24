@@ -5,9 +5,9 @@
 	<key>CMIOExtension</key>
 	<dict>
 		<key>CMIOExtensionMachServiceName</key>
-		<string>$(TeamIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+		<string>group.com.mac-rdp.rds.virtualcamera</string>
 	</dict>
 	<key>NSSystemExtensionUsageDescription</key>
-	<string>SYSTEM_EXTENSION_USAGE_DESCRIPTION</string>
+	<string>Lets webcams redirected from Remote Desktop clients appear as cameras on this Mac.</string>
 </dict>
 </plist>

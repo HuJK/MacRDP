@@ -8,5 +8,7 @@
 	<string>MacRDP needs system audio recording access to forward the Mac's audio to your RDP client (RDPSND channel).</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>MacRDP captures the display to send to your RDP client.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>MacRDP passes your RDP client's webcam to its virtual camera, so apps on this Mac can use it.</string>
 </dict>
 </plist>

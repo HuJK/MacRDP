@@ -188,6 +188,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Finder unless the user opts in via config.
             await AppDelegate.sharedClipboardInbox.register(
                 hidden: !config.clipboard.showInFinder)
+            // Redirected client webcams appear as Mac cameras through this
+            // extension; installing it is a no-op once the current build's
+            // copy is in place.
+            VirtualCameraInstaller.shared.activate()
             // Wire the copy-progress UI: it polls CopyEventStore for
             // progress snapshots (the store wakes it when work starts).
             CopyProgressTracker.shared.configure(

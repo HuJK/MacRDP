@@ -1,42 +1,47 @@
 //
 //  VirtualCameraManifest.swift
-//  virtualcamera (shared contract — also compile into the rds host target)
+//  MacRDP — shared between rds (main app) and virtualcamera (CMIO extension).
 //
-//  The host app owns the truth about which virtual cameras should currently
-//  exist (one per redirected RDP client webcam). It writes that list into the
-//  shared App Group container and pings a Darwin notification; the camera
-//  extension reads the list and adds/removes CMIO devices to match.
+//  Verbatim copy of virtualcamera/VirtualCameraManifest.swift. The two targets
+//  live in separate synchronized folders, so (like SharedManifest) we keep a
+//  copy in each — if you change one, update the other.
 //
-//  This indirection exists because the extension is launched on-demand by the
-//  system — the host cannot call into it directly, so it leaves the desired
-//  state in shared storage and wakes the extension to re-sync.
+//  The host owns which virtual cameras should currently exist (one per
+//  redirected RDP client webcam). It sets that list, as JSON, on a custom
+//  property of the extension's CMIO provider (plug-in object); the extension
+//  adds/removes CMIO devices to match.
+//
+//  Not a file in the App Group container: the system runs camera extensions
+//  as _cmiodalassistants, whose App Group container is its own
+//  (/var/db/cmiodalassistants/Library/Group Containers/...), not the user's.
+//  Darwin notifications are system-wide, so the extension's in-use signals
+//  still reach the host that way.
 //
 
 import Foundation
 
 enum VirtualCameraShared {
-    static let appGroup = "group.com.mac-rdp.rds"
-    static let manifestFilename = "virtualcameras.json"
+    static let extensionBundleID = "com.mac-rdp.rds.virtualcamera"
 
-    /// Darwin notification posted by the host whenever the manifest changes.
-    static let didChangeNotification = "com.mac-rdp.rds.virtualcamera.manifestChanged"
+    /// Provider property holding the manifest JSON (`CMIOExtensionProperty`
+    /// "4cc_cams_glob_0000"; the host addresses it as selector 'cams').
+    static let camerasPropertyToken = "cams"
 
     /// Suggested name for a single always-on camera, if the host chooses to
     /// keep one present rather than mirroring the client set exactly.
     static let defaultCameraName = "MacRDP Camera"
 
-    static var manifestURL: URL? {
-        FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
-            .appendingPathComponent(manifestFilename)
+    /// Posted by the extension when the first app starts, or the last one
+    /// stops, reading the camera with this id, so the host pulls the client's
+    /// webcam (and lights it) only while something here is using it.
+    static func inUseNotification(id: String, inUse: Bool) -> String {
+        "com.mac-rdp.rds.virtualcamera.\(inUse ? "inUse" : "idle").\(id.uppercased())"
     }
 
-    /// Host calls this after writing the manifest to wake the extension.
-    static func postDidChange() {
+    static func post(_ name: String) {
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
-            CFNotificationName(didChangeNotification as CFString),
-            nil, nil, true)
+            CFNotificationName(name as CFString), nil, nil, true)
     }
 }
 
@@ -45,8 +50,7 @@ struct VirtualCameraManifest: Codable, Equatable {
     struct Camera: Codable, Equatable {
         /// Stable identifier — reused as the CMIO device UID so consumer apps
         /// can remember the user's selection across relaunches. Use a fixed
-        /// UUID string per logical client camera (e.g. derived from the RDP
-        /// camera's device id), not a fresh one each connect.
+        /// UUID string per logical client camera, not a fresh one each connect.
         var id: String
         /// User-visible name shown in the system camera picker.
         var name: String
@@ -56,19 +60,14 @@ struct VirtualCameraManifest: Codable, Equatable {
 
     static let empty = VirtualCameraManifest(cameras: [])
 
-    static func load() -> VirtualCameraManifest {
-        guard let url = VirtualCameraShared.manifestURL,
-            let data = try? Data(contentsOf: url),
-            let manifest = try? JSONDecoder().decode(VirtualCameraManifest.self, from: data)
-        else { return .empty }
-        return manifest
+    init(cameras: [Camera]) { self.cameras = cameras }
+
+    init?(json: String) {
+        guard let m = try? JSONDecoder().decode(Self.self, from: Data(json.utf8)) else { return nil }
+        self = m
     }
 
-    func save() throws {
-        guard let url = VirtualCameraShared.manifestURL else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        let data = try JSONEncoder().encode(self)
-        try data.write(to: url, options: .atomic)
+    var json: String {
+        String(decoding: (try? JSONEncoder().encode(self)) ?? Data("{\"cameras\":[]}".utf8), as: UTF8.self)
     }
 }

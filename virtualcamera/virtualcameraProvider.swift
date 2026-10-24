@@ -46,6 +46,10 @@ private let kSinkPropertyToken = "sink"
 private let customSinkExtensionProperty = CMIOExtensionProperty(
     rawValue: "4cc_" + kSinkPropertyToken + "_glob_0000")
 
+/// Provider property the host sets to the manifest JSON (the devices to show).
+private let customCamerasProviderProperty = CMIOExtensionProperty(
+    rawValue: "4cc_" + VirtualCameraShared.camerasPropertyToken + "_glob_0000")
+
 private let logger = Logger(subsystem: "com.mac-rdp.rds.virtualcamera", category: "Extension")
 
 // MARK: - In-process testing hook
@@ -83,12 +87,15 @@ class virtualcameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
 
     private var _videoDescription: CMFormatDescription!
     private var _placeholderBuffer: CVPixelBuffer?
+    /// The device UID, for the in-use notifications.
+    private var _uid = ""
 
     /// `id` is a stable UUID string (also used as the CMIO device UID so apps
     /// can remember the selection). `localizedName` is shown in the picker.
     init(id: String, localizedName: String) {
         super.init()
         let deviceID = UUID(uuidString: id) ?? UUID()
+        _uid = deviceID.uuidString
         device = CMIOExtensionDevice(
             localizedName: localizedName, deviceID: deviceID,
             legacyDeviceID: deviceID.uuidString, source: self)
@@ -168,6 +175,9 @@ class virtualcameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
 
     func startStreamingSource() {
         _streamingSourceCounter += 1
+        if _streamingSourceCounter == 1, !_hosted {
+            VirtualCameraShared.post(VirtualCameraShared.inUseNotification(id: _uid, inUse: true))
+        }
         guard _sourceTimer == nil else { return }
 
         _sourceTimer = DispatchSource.makeTimerSource(flags: .strict, queue: _sourceTimerQueue)
@@ -192,6 +202,9 @@ class virtualcameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
             _streamingSourceCounter = 0
             _sourceTimer?.cancel()
             _sourceTimer = nil
+            if !_hosted {
+                VirtualCameraShared.post(VirtualCameraShared.inUseNotification(id: _uid, inUse: false))
+            }
         }
     }
 
@@ -461,8 +474,10 @@ class virtualcameraProviderSource: NSObject, CMIOExtensionProviderSource {
 
     private(set) var provider: CMIOExtensionProvider!
 
-    /// Live devices keyed by manifest camera id. Only touched on `_syncQueue`.
+    /// Live devices keyed by manifest camera id, and the manifest they were
+    /// built from. Only touched on `_syncQueue`.
     private var _devices: [String: virtualcameraDeviceSource] = [:]
+    private var _manifest = VirtualCameraManifest.empty
     private let _syncQueue = DispatchQueue(label: "com.mac-rdp.rds.virtualcamera.provider.sync")
 
     /// Non-nil only for in-process (hosted) runs — a single device whose frames
@@ -471,7 +486,8 @@ class virtualcameraProviderSource: NSObject, CMIOExtensionProviderSource {
     private var _hosted: Bool { hostedDeviceSource != nil }
 
     /// - Parameter hostedDelegate: pass non-nil to run in-process for testing
-    ///   (no CMIO publish, no manifest); leave nil for the real extension.
+    ///   (no CMIO publish, no manifest); leave nil for the real extension,
+    ///   which starts with no devices until the host sets the manifest.
     init(clientQueue: DispatchQueue?, hostedDelegate: VirtualCameraHostedDelegate? = nil) {
         super.init()
         provider = CMIOExtensionProvider(source: self, clientQueue: clientQueue)
@@ -482,18 +498,6 @@ class virtualcameraProviderSource: NSObject, CMIOExtensionProviderSource {
             device.hostedDelegate = hostedDelegate
             try? provider.addDevice(device.device)
             hostedDeviceSource = device
-        } else {
-            startManifestObserver()
-            resync()  // build initial device set from the App Group manifest
-        }
-    }
-
-    deinit {
-        if !_hosted {
-            CFNotificationCenterRemoveObserver(
-                CFNotificationCenterGetDarwinNotifyCenter(),
-                Unmanaged.passUnretained(self).toOpaque(),
-                CFNotificationName(VirtualCameraShared.didChangeNotification as CFString), nil)
         }
     }
 
@@ -510,24 +514,13 @@ class virtualcameraProviderSource: NSObject, CMIOExtensionProviderSource {
 
     // MARK: Manifest-driven device set
 
-    private func startManifestObserver() {
-        let observer = Unmanaged.passUnretained(self).toOpaque()
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(), observer,
-            { _, observer, _, _, _ in
-                guard let observer else { return }
-                Unmanaged<virtualcameraProviderSource>.fromOpaque(observer)
-                    .takeUnretainedValue().resync()
-            },
-            VirtualCameraShared.didChangeNotification as CFString, nil, .deliverImmediately)
-    }
-
-    /// Reconcile the live CMIO devices with the desired set in the manifest:
+    /// Reconcile the live CMIO devices with the manifest the host set:
     /// add new cameras, drop removed ones, rebuild renamed ones.
-    private func resync() {
+    private func resync(to manifest: VirtualCameraManifest) {
         _syncQueue.async { [weak self] in
-            guard let self else { return }
-            let desired = VirtualCameraManifest.load().cameras
+            guard let self, manifest != self._manifest else { return }
+            self._manifest = manifest
+            let desired = manifest.cameras
             let desiredIDs = Set(desired.map(\.id))
 
             // Remove devices no longer wanted.
@@ -556,15 +549,29 @@ class virtualcameraProviderSource: NSObject, CMIOExtensionProviderSource {
         }
     }
 
-    var availableProperties: Set<CMIOExtensionProperty> { [.providerManufacturer] }
+    var availableProperties: Set<CMIOExtensionProperty> {
+        [.providerManufacturer, customCamerasProviderProperty]
+    }
 
     func providerProperties(forProperties properties: Set<CMIOExtensionProperty>) throws
         -> CMIOExtensionProviderProperties
     {
         let p = CMIOExtensionProviderProperties(dictionary: [:])
         if properties.contains(.providerManufacturer) { p.manufacturer = "MacRDP" }
+        if properties.contains(customCamerasProviderProperty) {
+            let json = _syncQueue.sync { _manifest.json }
+            p.setPropertyState(CMIOExtensionPropertyState(value: json as NSString),
+                               forProperty: customCamerasProviderProperty)
+        }
         return p
     }
 
-    func setProviderProperties(_ providerProperties: CMIOExtensionProviderProperties) throws {}
+    func setProviderProperties(_ providerProperties: CMIOExtensionProviderProperties) throws {
+        guard let state = providerProperties.propertiesDictionary[customCamerasProviderProperty] else { return }
+        guard !_hosted, let json = state.value as? String, let manifest = VirtualCameraManifest(json: json) else {
+            logger.error("ignoring a camera list that is not a manifest")
+            return
+        }
+        resync(to: manifest)
+    }
 }

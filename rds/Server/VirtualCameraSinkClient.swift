@@ -5,8 +5,8 @@
 //  Host side of the virtual camera. For each redirected RDP client webcam the
 //  host creates one `VirtualCameraSink`:
 //
-//    1. registers the camera in the shared App Group manifest and wakes the
-//       extension (which then publishes a matching CMIO device),
+//    1. registers the camera in the manifest, which goes to the extension as a
+//       property of its CMIO provider (it then publishes a matching device),
 //    2. discovers that CMIO device via the CoreMediaIO HAL (retrying, because
 //       the extension is launched on-demand and the device appears async),
 //    3. opens the device's *sink* stream and feeds it 1280x720 32BGRA frames.
@@ -31,10 +31,24 @@ enum VirtualCameraFormat {
 
 // MARK: - Manifest registry (shared list of cameras the extension should show)
 
-/// Serializes read-modify-write of the shared manifest across all sinks in this
-/// process. Only the host writes it.
+/// The cameras the extension should show, kept here and pushed whole to the
+/// extension's provider on every change. Only the host writes it.
 enum VirtualCameraRegistry {
     private static let lock = NSLock()
+    private static var manifest = VirtualCameraManifest.empty
+    private static var lastSeen: [String] = []   // plug-ins the last lookup saw, for the log
+    private static var usableAfter: Date?
+
+    /// The activation request finished. CoreMediaIO lists its plug-ins once
+    /// per process, at first use, and never picks up an extension the system
+    /// swapped in later (each new build replaces the installed one at launch).
+    /// So stay off CMIO until then, and a moment longer for the new copy to
+    /// register; sinks retry until it's usable.
+    static func extensionActivated() {
+        lock.lock()
+        usableAfter = Date().addingTimeInterval(5)
+        lock.unlock()
+    }
 
     static func add(id: String, name: String) {
         mutate { cameras in
@@ -50,17 +64,76 @@ enum VirtualCameraRegistry {
         mutate { $0.removeAll { $0.id == id } }
     }
 
+    /// Push the current list to the extension again: it starts with no devices
+    /// whenever the system (re)launches it. False while it isn't running.
+    @discardableResult
+    static func publish() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return send(manifest)
+    }
+
     private static func mutate(_ body: (inout [VirtualCameraManifest.Camera]) -> Void) {
         lock.lock()
         defer { lock.unlock() }
-        var manifest = VirtualCameraManifest.load()
         body(&manifest.cameras)
-        do {
-            try manifest.save()
-            VirtualCameraShared.postDidChange()
-        } catch {
-            log.error("failed to write virtual camera manifest: \(error.localizedDescription)")
+        if !send(manifest) {
+            log.info("virtual camera extension not running yet (CMIO objects \(lastSeen, privacy: .public)); cameras published once it is")
         }
+    }
+
+    private static func send(_ manifest: VirtualCameraManifest) -> Bool {
+        guard let usableAfter, Date() >= usableAfter else {
+            lastSeen = ["extension not activated yet"]
+            return false
+        }
+        guard let provider = providerObject() else { return false }
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(fourCC(VirtualCameraShared.camerasPropertyToken)),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+        var json = manifest.json as CFString
+        let status = CMIOObjectSetPropertyData(
+            provider, &address, 0, nil, UInt32(MemoryLayout<CFString>.size), &json)
+        if status != noErr { log.error("setting the virtual camera list failed: \(status)") }
+        return status == noErr
+    }
+
+    /// The extension's provider: the CMIO plug-in object with its bundle id.
+    private static func providerObject() -> CMIOObjectID? {
+        let system = CMIOObjectID(kCMIOObjectSystemObject)
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOObjectPropertyOwnedObjects),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+        var size: UInt32 = 0
+        guard CMIOObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr, size > 0 else {
+            return nil
+        }
+        var objects = [CMIOObjectID](repeating: 0, count: Int(size) / MemoryLayout<CMIOObjectID>.size)
+        var used: UInt32 = 0
+        guard CMIOObjectGetPropertyData(system, &address, 0, nil, size, &used, &objects) == noErr else {
+            return nil
+        }
+        var bundleAddress = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOPlugInPropertyBundleID),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+        var seen: [String] = []
+        let found = objects.first { object in
+            guard CMIOObjectHasProperty(object, &bundleAddress) else { seen.append("\(object):-"); return false }
+            var bundleID: CFString = "" as CFString
+            let status = CMIOObjectGetPropertyData(
+                object, &bundleAddress, 0, nil, UInt32(MemoryLayout<CFString>.size), &used, &bundleID)
+            seen.append("\(object):\(status == noErr ? bundleID as String : "err \(status)")")
+            return status == noErr && bundleID as String == VirtualCameraShared.extensionBundleID
+        }
+        lastSeen = seen
+        return found
+    }
+
+    private static func fourCC(_ s: String) -> UInt32 {
+        s.utf8.reduce(0) { ($0 << 8) | UInt32($1) }
     }
 }
 
@@ -77,7 +150,13 @@ final class VirtualCameraSink {
     private var simpleQueue: CMSimpleQueue?
     private var formatDescription: CMFormatDescription?
     private var discoveryTimer: DispatchSourceTimer?
+    private var misses = 0
     private var started = false
+
+    /// Called on the main queue when the first app starts, or the last one
+    /// stops, reading this camera (the extension's in-use notifications), so
+    /// the client webcam is pulled only while it's used.
+    var onInUseChanged: ((Bool) -> Void)?
 
     /// - Parameters:
     ///   - id: stable UUID string (becomes the CMIO device UID). Reuse the same
@@ -93,6 +172,7 @@ final class VirtualCameraSink {
         queue.async { [self] in
             guard !started else { return }
             started = true
+            observeInUse()   // before the device exists, so no transition is missed
             VirtualCameraRegistry.add(id: id, name: name)
             beginDiscovery()
         }
@@ -111,7 +191,26 @@ final class VirtualCameraSink {
             simpleQueue = nil
             deviceID = 0
             sinkStreamID = 0
+            CFNotificationCenterRemoveEveryObserver(
+                CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque())
             VirtualCameraRegistry.remove(id: id)
+        }
+    }
+
+    private func observeInUse() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        for inUse in [true, false] {
+            CFNotificationCenterAddObserver(
+                center, observer,
+                { _, observer, name, _, _ in
+                    guard let observer, let name else { return }
+                    let sink = Unmanaged<VirtualCameraSink>.fromOpaque(observer).takeUnretainedValue()
+                    let inUse = (name.rawValue as String).contains(".inUse.")
+                    DispatchQueue.main.async { sink.onInUseChanged?(inUse) }
+                },
+                VirtualCameraShared.inUseNotification(id: id, inUse: inUse) as CFString,
+                nil, .deliverImmediately)
         }
     }
 
@@ -158,7 +257,13 @@ final class VirtualCameraSink {
 
     private func tryConnect() {
         guard started, simpleQueue == nil else { return }
-        guard let device = Self.findDevice(uid: id) else { return }  // not published yet
+        guard let device = Self.findDevice(uid: id) else {
+            // Not published yet. Every few seconds, hand the extension the
+            // list again, in case it was (re)launched after we sent it.
+            misses += 1
+            if misses % 6 == 0 { VirtualCameraRegistry.publish() }
+            return
+        }
         guard let sink = Self.sinkStream(of: device) else { return }
 
         let queuePtr = UnsafeMutablePointer<Unmanaged<CMSimpleQueue>?>.allocate(capacity: 1)
