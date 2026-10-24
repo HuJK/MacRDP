@@ -52,6 +52,38 @@ final class Box<T>: @unchecked Sendable {
     func set(_ v: T) { lock.lock(); value = v; lock.unlock() }
 }
 
+/// The camera checks' verdict on a capture: frames, size, and (sampled every
+/// 4th pixel) the share of the last frame that changed since the first (a
+/// live feed moves, a placeholder doesn't) and that is colourful (a grey
+/// placeholder isn't). Saves the last frame as PNG.
+func reportFrames(name: String, frames: Int, elapsed: Double, first: Data,
+                  last frame: CVPixelBuffer, out: String) {
+    CVPixelBufferLockBaseAddress(frame, .readOnly)
+    let w = CVPixelBufferGetWidth(frame), h = CVPixelBufferGetHeight(frame)
+    let stride = CVPixelBufferGetBytesPerRow(frame)
+    let px = CVPixelBufferGetBaseAddress(frame)!.assumingMemoryBound(to: UInt8.self)
+    var changed = 0, colourful = 0, total = 0
+    first.withUnsafeBytes { (old: UnsafeRawBufferPointer) in
+        for y in Swift.stride(from: 0, to: h, by: 4) {
+            for x in Swift.stride(from: 0, to: w, by: 4) {
+                let i = y * stride + x * 4
+                let b = Int(px[i]), g = Int(px[i + 1]), r = Int(px[i + 2])
+                if i + 2 < old.count {
+                    let d: Int = abs(b - Int(old[i])) + abs(g - Int(old[i + 1])) + abs(r - Int(old[i + 2]))
+                    if d > 30 { changed += 1 }
+                }
+                if max(r, g, b) - min(r, g, b) > 40 { colourful += 1 }
+                total += 1
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(frame, .readOnly)
+    guard let png = NSBitmapImageRep(ciImage: CIImage(cvPixelBuffer: frame)).representation(using: .png, properties: [:]),
+          FileManager.default.createFile(atPath: out, contents: png) else { fail("cannot write \(out)") }
+    let pct = { (n: Int) in n * 100 / max(total, 1) }
+    print("\(name): \(frames) frames in \(String(format: "%.1f", elapsed)) s, \(w)x\(h), \(pct(changed))% changed, \(pct(colourful))% colourful")
+}
+
 /// Cameras as apps see them; CMIO extensions' devices are `.external`.
 func videoDevices() -> [AVCaptureDevice] {
     AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external],
@@ -295,33 +327,8 @@ case "camera-grab":
     guard let frame = grab.last.get(), let first = grab.first.get() else {
         fail("\(device.localizedName): no frames in \(secs) s")
     }
-    // Sampled every 4th pixel: the share that changed since the first frame
-    // (a live feed moves, a placeholder doesn't) and the share that is
-    // colourful (a grey placeholder isn't).
-    CVPixelBufferLockBaseAddress(frame, .readOnly)
-    let w = CVPixelBufferGetWidth(frame), h = CVPixelBufferGetHeight(frame)
-    let stride = CVPixelBufferGetBytesPerRow(frame)
-    let px = CVPixelBufferGetBaseAddress(frame)!.assumingMemoryBound(to: UInt8.self)
-    var changed = 0, colourful = 0, total = 0
-    first.withUnsafeBytes { (old: UnsafeRawBufferPointer) in
-        for y in Swift.stride(from: 0, to: h, by: 4) {
-            for x in Swift.stride(from: 0, to: w, by: 4) {
-                let i = y * stride + x * 4
-                let b = Int(px[i]), g = Int(px[i + 1]), r = Int(px[i + 2])
-                if i + 2 < old.count {
-                    let d: Int = abs(b - Int(old[i])) + abs(g - Int(old[i + 1])) + abs(r - Int(old[i + 2]))
-                    if d > 30 { changed += 1 }
-                }
-                if max(r, g, b) - min(r, g, b) > 40 { colourful += 1 }
-                total += 1
-            }
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(frame, .readOnly)
-    guard let png = NSBitmapImageRep(ciImage: CIImage(cvPixelBuffer: frame)).representation(using: .png, properties: [:]),
-          FileManager.default.createFile(atPath: args[3], contents: png) else { fail("cannot write \(args[3])") }
-    let pct = { (n: Int) in n * 100 / max(total, 1) }
-    print("\(device.localizedName): \(grab.frames.get()) frames in \(String(format: "%.1f", elapsed)) s, \(w)x\(h), \(pct(changed))% changed, \(pct(colourful))% colourful")
+    reportFrames(name: device.localizedName, frames: grab.frames.get(), elapsed: elapsed,
+                 first: first, last: frame, out: args[3])
 
 case "input-record":
     guard args.count == 4, let secs = Double(args[2]) else {
