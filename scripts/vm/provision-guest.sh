@@ -31,6 +31,18 @@ for db in "/Library/Application Support/com.apple.TCC/TCC.db" \
               CAST(strftime('%s','now') AS INTEGER));"
   done
 done
+#    GuestCheck.app (tart-vm.sh tool) opens the virtual camera for the camera
+#    check. With AMFI off every binary looks like a platform binary, and tccd
+#    then never prompts for a non-Apple one ("CS_PLATFORM_BINARY set but not
+#    AppleSigned; prompt policy is Deny"), so it can only be granted here.
+for db in "/Library/Application Support/com.apple.TCC/TCC.db" \
+          "$HOME/Library/Application Support/com.apple.TCC/TCC.db"; do
+  sudo /usr/bin/sqlite3 "$db" "INSERT OR REPLACE INTO access
+    (service, client, client_type, auth_value, auth_reason, auth_version,
+     indirect_object_identifier, flags, last_modified)
+    VALUES ('kTCCServiceCamera', 'com.mac-rdp.guestcheck', 0, 2, 0, 1, 'UNUSED', 0,
+            CAST(strftime('%s','now') AS INTEGER));"
+done
 sudo /usr/bin/killall tccd 2>/dev/null || true
 /usr/bin/killall tccd 2>/dev/null || true
 

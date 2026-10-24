@@ -17,6 +17,13 @@
 //                                        # 48 kHz stereo float32 interleaved, raw
 //   guestcheck status-menu <bundle-id> [item]  # open an app's menu-bar (status item) menu,
 //                                        # print its items, press the first containing [item]
+//   guestcheck cameras                   # video capture devices, as an app's camera picker lists them
+//   guestcheck camera-grab <name> <secs> <out.png>  # open the first camera whose name contains
+//                                        # <name>, as an app would; prints frames, size, and how
+//                                        # much of the last frame (saved as PNG) changed since the
+//                                        # first and is colourful. Needs camera access: run it as
+//                                        # /Applications/GuestCheck.app through `open`, which can
+//                                        # be asked once (the guest agent's children can't)
 //   guestcheck input-record <device> <secs> <out>  # an input device (e.g. "BlackHole 2ch",
 //                                        # where MacRDP plays the client's mic), same raw
 //                                        # layout; prints the device's sample rate
@@ -28,11 +35,27 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import CoreAudio
+import CoreImage
 import ScreenCaptureKit
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write((msg + "\n").data(using: .utf8)!)
     exit(1)
+}
+
+/// A value shared with a callback queue.
+final class Box<T>: @unchecked Sendable {
+    private var value: T
+    private let lock = NSLock()
+    init(_ v: T) { value = v }
+    func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: T) { lock.lock(); value = v; lock.unlock() }
+}
+
+/// Cameras as apps see them; CMIO extensions' devices are `.external`.
+func videoDevices() -> [AVCaptureDevice] {
+    AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external],
+                                     mediaType: .video, position: .unspecified).devices
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -214,6 +237,91 @@ case "status-menu":
     }
     titles.forEach { print($0) }
     if let target { print("pressed \(title(target))") } else { AXUIElementPerformAction(item, kAXCancelAction as CFString) }
+
+case "cameras":
+    for d in videoDevices() { print("\(d.localizedName)\t\(d.uniqueID)") }
+
+case "camera-grab":
+    guard args.count == 4, let secs = Double(args[2]) else {
+        fail("usage: guestcheck camera-grab <name> <secs> <out.png>")
+    }
+    // Access first, so the one-time prompt can be raised with no camera around.
+    if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+        // The first time, macOS asks whether we (GuestCheck.app) may use the
+        // camera; wait a while for someone to answer. tccd only asks for a
+        // process that is an app on screen, hence NSApplication.
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let answer = Box<Bool?>(nil)
+        AVCaptureDevice.requestAccess(for: .video) { answer.set($0) }
+        for _ in 0..<600 where answer.get() == nil { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
+    }
+    guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
+        fail("no camera access for the guest agent (\(AVCaptureDevice.authorizationStatus(for: .video).rawValue))")
+    }
+    guard let device = videoDevices().first(where: { $0.localizedName.contains(args[1]) }) else {
+        fail("no camera named like \(args[1]): \(videoDevices().map(\.localizedName))")
+    }
+    final class Grab: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+        let frames = Box(0)
+        let first = Box<Data?>(nil)   // the first frame's pixels, to tell a live feed from a still
+        let last = Box<CVPixelBuffer?>(nil)
+        func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
+            frames.set(frames.get() + 1)
+            guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+            if first.get() == nil {
+                CVPixelBufferLockBaseAddress(pb, .readOnly)
+                first.set(Data(bytes: CVPixelBufferGetBaseAddress(pb)!,
+                               count: CVPixelBufferGetBytesPerRow(pb) * CVPixelBufferGetHeight(pb)))
+                CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+            }
+            last.set(pb)
+        }
+    }
+    let session = AVCaptureSession()
+    let input = try AVCaptureDeviceInput(device: device)
+    let output = AVCaptureVideoDataOutput()
+    output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+    let grab = Grab()
+    output.setSampleBufferDelegate(grab, queue: DispatchQueue(label: "camera-grab"))
+    guard session.canAddInput(input), session.canAddOutput(output) else { fail("cannot capture from \(device.localizedName)") }
+    session.addInput(input)
+    session.addOutput(output)
+    let start = Date()
+    session.startRunning()
+    try await Task.sleep(nanoseconds: UInt64(secs * 1e9))
+    session.stopRunning()
+    let elapsed = Date().timeIntervalSince(start)
+    guard let frame = grab.last.get(), let first = grab.first.get() else {
+        fail("\(device.localizedName): no frames in \(secs) s")
+    }
+    // Sampled every 4th pixel: the share that changed since the first frame
+    // (a live feed moves, a placeholder doesn't) and the share that is
+    // colourful (a grey placeholder isn't).
+    CVPixelBufferLockBaseAddress(frame, .readOnly)
+    let w = CVPixelBufferGetWidth(frame), h = CVPixelBufferGetHeight(frame)
+    let stride = CVPixelBufferGetBytesPerRow(frame)
+    let px = CVPixelBufferGetBaseAddress(frame)!.assumingMemoryBound(to: UInt8.self)
+    var changed = 0, colourful = 0, total = 0
+    first.withUnsafeBytes { (old: UnsafeRawBufferPointer) in
+        for y in Swift.stride(from: 0, to: h, by: 4) {
+            for x in Swift.stride(from: 0, to: w, by: 4) {
+                let i = y * stride + x * 4
+                let b = Int(px[i]), g = Int(px[i + 1]), r = Int(px[i + 2])
+                if i + 2 < old.count {
+                    let d: Int = abs(b - Int(old[i])) + abs(g - Int(old[i + 1])) + abs(r - Int(old[i + 2]))
+                    if d > 30 { changed += 1 }
+                }
+                if max(r, g, b) - min(r, g, b) > 40 { colourful += 1 }
+                total += 1
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(frame, .readOnly)
+    guard let png = NSBitmapImageRep(ciImage: CIImage(cvPixelBuffer: frame)).representation(using: .png, properties: [:]),
+          FileManager.default.createFile(atPath: args[3], contents: png) else { fail("cannot write \(args[3])") }
+    let pct = { (n: Int) in n * 100 / max(total, 1) }
+    print("\(device.localizedName): \(grab.frames.get()) frames in \(String(format: "%.1f", elapsed)) s, \(w)x\(h), \(pct(changed))% changed, \(pct(colourful))% colourful")
 
 case "input-record":
     guard args.count == 4, let secs = Double(args[2]) else {

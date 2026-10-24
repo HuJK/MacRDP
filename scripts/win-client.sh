@@ -68,7 +68,7 @@ run_json() { # <script.ps1> <json> [timeout]
 windows() { desktop windows.ps1 && ps "Get-Content \"$PSDIR\\windows.txt\""; }
 
 
-connected() { windows | grep -qF -- "$1 - Remote Desktop Connection"; }
+connected() { windows | grep -F -- "$1 - Remote Desktop Connection" >/dev/null; }
 
 cmd_setup() {
   ps "New-Item -ItemType Directory -Force \"$PSDIR\\tools\" | Out-Null"
@@ -92,7 +92,7 @@ cmd_connect() {
     # Redirecting the microphone makes mstsc ask whether to trust the host
     # (once: the answer ticks "don't ask me again").
     desktop trust-prompt.ps1
-    ps "Get-Content \"$PSDIR\\trust-prompt.txt\"" | grep -q '^answered' && echo "answered the trust prompt"
+    ps "Get-Content \"$PSDIR\\trust-prompt.txt\"" | grep '^answered' >/dev/null && echo "answered the trust prompt"
     connected "$host" && { echo "mstsc connected to $host"; return; }
   done
   die "mstsc did not connect to $host"

@@ -18,10 +18,14 @@
 #             LTSC test client, whose mstsc pastes no server files at all;
 #             files win->mac needs MacRDP's File Provider on)
 #   mic       client microphone: tone bursts played into VB-Cable on Windows
-#             reach the Mac's BlackHole at the right pitch and spacing
-#             (needs BlackHole in the VM: brew install --cask blackhole-2ch)
+#             come out of the Mac's "MacRDP Microphone" at the right pitch
+#             and spacing (needs MacRDP's audio driver in the VM:
+#             ./scripts/tart-vm.sh audio-driver)
 #   camera    client webcam: VCamSample's test pattern on the client (scripts/win/
-#             vcam.ps1) streams over RDPECAM into MacRDP's camera view
+#             vcam.ps1) streams over RDPECAM into MacRDP's camera view, and
+#             into the Mac camera "… (MacRDP)" (virtual camera extension
+#             approved; GuestCheck.app, from `tart-vm.sh tool`, needs camera
+#             access once)
 #   nla       nthash login policy over NLA: right password in, wrong one out
 #             (restarts MacRDP with a temporary config, then restores it)
 #
@@ -368,7 +372,8 @@ check_mic() {
   # Windows plays LoopbackOnsets' bursts (1 kHz every 2 s) into VB-Cable's
   # "CABLE Input"; its "CABLE Output", made the default recording device,
   # is the mic mstsc redirects (connect.ps1 asks for audiocapturemode). A
-  # fresh session picks the device up. MacRDP plays the mic into BlackHole,
+  # fresh session picks the device up. MacRDP plays the mic into its own
+  # driver's hidden feed device, and it comes out of "MacRDP Microphone",
   # recorded here the way a Mac app would.
   local res n bad
   win audio-default capture "CABLE Output" >/dev/null
@@ -376,7 +381,7 @@ check_mic() {
     win build "$REPO_ROOT/tools/latency/LoopbackOnsets.cs" >/dev/null
   win disconnect >/dev/null && win connect >/dev/null
   sleep 3
-  "$VMSH" exec /usr/local/bin/guestcheck input-record "BlackHole 2ch" 20 /tmp/mic.raw >"$OUT/mic-record.txt" 2>&1 &
+  "$VMSH" exec /usr/local/bin/guestcheck input-record "MacRDP Microphone" 20 /tmp/mic.raw >"$OUT/mic-record.txt" 2>&1 &
   local rec=$!
   sleep 2
   win ps "& \"$WINDIR\\tools\\LoopbackOnsets.exe\" --self-play 15 \"$WINDIR\\runs\\mic\"" >/dev/null
@@ -421,6 +426,20 @@ check_camera() {
     awk -v f="$fps" 'BEGIN { exit !(f >= 10) }' && ok=1
   result "camera win->mac" $ok \
     "$(grep -o 'streaming H.264 [0-9x]*' <<<"$log" | tail -1), ${fps:-no} samples/s$(grep -q 'decoding failed' <<<"$log" && echo ', decoding failed')"
+
+  # The same webcam as a Mac camera (the virtual camera extension): an app
+  # opening it — GuestCheck.app, which needs camera access once — gets the
+  # client's moving test pattern, not the still placeholder.
+  local grab frames changed
+  grab="$(vm sh -c 'rm -f /tmp/vcam.out; /usr/bin/open -W -n /Applications/GuestCheck.app \
+    --stdout /tmp/vcam.out --stderr /tmp/vcam.out \
+    --args camera-grab "Windows Virtual Camera" 8 /tmp/vcam.png; cat /tmp/vcam.out')"
+  vm cat /tmp/vcam.png > "$OUT/vcam.png" 2>/dev/null
+  frames="$(sed -n 's/.*: \([0-9]*\) frames in.*/\1/p' <<<"$grab")"
+  changed="$(sed -n 's/.* \([0-9]*\)% changed.*/\1/p' <<<"$grab")"
+  ok=0
+  [[ ${frames:-0} -ge 40 && ${changed:-0} -ge 1 ]] && ok=1
+  result "camera as Mac camera" $ok "$(tail -1 <<<"$grab")"
 }
 
 # MARK: - Check: NLA with the nthash policy
@@ -435,8 +454,8 @@ check_nla() {
 
   local ok=0 proto t0
   t0=$(date +%s)
-  RDP_PASSWORD="$pw" win connect >/dev/null 2>&1 && sleep 3 &&
-    "$VMSH" logs $(( $(date +%s) - t0 + 5 )) | grep -q "Peer activated" && ok=1
+  RDP_PASSWORD="$pw" win connect >"$OUT/nla-connect.txt" 2>&1 && sleep 3 &&
+    "$VMSH" logs $(( $(date +%s) - t0 + 5 )) | grep "Peer activated" >/dev/null && ok=1
   proto="$("$VMSH" wlog 5000 | sed -n 's/.*Server Security: \(.*\)/\1/p' | tail -1)"
   result "nla right password" $ok "server security: ${proto:-?}"
 

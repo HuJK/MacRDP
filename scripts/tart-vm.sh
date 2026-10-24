@@ -19,6 +19,8 @@
 #   ./scripts/tart-vm.sh alerts            # list open system alerts in the guest
 #   ./scripts/tart-vm.sh exec <cmd...>     # run a command in the guest
 #   ./scripts/tart-vm.sh tool <file.swift> # compile a helper, install it as /usr/local/bin/<name>
+#   ./scripts/tart-vm.sh audio-driver      # build MacRDP's virtual microphone, install it, restart coreaudiod
+#   ./scripts/tart-vm.sh grant-camera      # let GuestCheck.app use the camera (no prompts with AMFI off)
 #   ./scripts/tart-vm.sh ip | down | destroy
 #
 # Environment:
@@ -141,9 +143,11 @@ cmd_deploy() {
   if [[ "${1:-}" != "--no-build" ]]; then
     echo "==> building MacRDP (Debug)"
     mkdir -p "$BUILD_DIR"
+    # A fresh bundle version per build: macOS only replaces an installed
+    # system extension (the virtual camera) with a different version.
     if ! xcodebuild -project "$REPO_ROOT/MacRDP.xcodeproj" -scheme rds -configuration Debug \
-        -destination 'platform=macOS,arch=arm64' -derivedDataPath "$BUILD_DIR/DerivedData" \
-        build >"$BUILD_DIR/xcodebuild.log" 2>&1; then
+        -destination 'platform=macOS,arch=arm64' -derivedDataPath "$BUILD_DIR/DerivedData" -allowProvisioningUpdates \
+        CURRENT_PROJECT_VERSION="$(date +%s)" build >"$BUILD_DIR/xcodebuild.log" 2>&1; then
       grep -E "error:" "$BUILD_DIR/xcodebuild.log" | head -20 >&2
       die "build failed (full log: $BUILD_DIR/xcodebuild.log)"
     fi
@@ -178,8 +182,72 @@ EOF
 
 cmd_tool() {
   local bin; bin="$(build_swift "$1")" || die "build failed: $1"
-  gexec -i "$VM" sh -c "sudo tee /usr/local/bin/$(basename "$bin") >/dev/null && sudo chmod 755 /usr/local/bin/$(basename "$bin")" < "$bin"
+  # Write a new file and rename it over the old: overwriting a binary in
+  # place leaves the kernel's cached code signature stale, and the next run
+  # is SIGKILLed ("load code signature error 2").
+  local dst="/usr/local/bin/$(basename "$bin")"
+  gexec -i "$VM" sh -c "sudo tee $dst.new >/dev/null && sudo chmod 755 $dst.new && sudo mv -f $dst.new $dst" < "$bin"
   echo "installed /usr/local/bin/$(basename "$bin")"
+  if [[ "$(basename "$bin")" == guestcheck ]]; then install_guestcheck_app "$bin"; fi
+}
+
+# guestcheck as an app too, for camera-grab: run through `open` it is its own
+# responsible process, so macOS can ask (once) whether it may use the camera,
+# which it can't for the guest agent's children. Signed with the development
+# identity when there is one, so the grant survives rebuilds.
+install_guestcheck_app() {
+  local app="$BUILD_DIR/GuestCheck.app" id
+  rm -rf "$app" && mkdir -p "$app/Contents/MacOS"
+  cp "$1" "$app/Contents/MacOS/guestcheck"
+  cat > "$app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>com.mac-rdp.guestcheck</string>
+	<key>CFBundleName</key><string>GuestCheck</string>
+	<key>CFBundleExecutable</key><string>guestcheck</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>LSUIElement</key><true/>
+	<key>NSCameraUsageDescription</key><string>MacRDP's tests check that a redirected webcam reaches Mac apps.</string>
+</dict>
+</plist>
+PLIST
+  id="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p' | head -1)"
+  codesign --force --sign "${id:--}" "$app" >/dev/null 2>&1 || die "cannot sign $app"
+  COPYFILE_DISABLE=1 tar -C "$BUILD_DIR" -cf - GuestCheck.app \
+    | gexec -i "$VM" sh -c 'sudo rm -rf /Applications/GuestCheck.app && sudo tar -C /Applications -xf - && sudo chown -R admin:staff /Applications/GuestCheck.app'
+  echo "installed /Applications/GuestCheck.app (signed: ${id:-ad hoc})"
+}
+
+cmd_audio_driver() {
+  local drv
+  drv="$("$REPO_ROOT/scripts/build-audio-driver.sh" "$BUILD_DIR" | tail -1)" || die "driver build failed"
+  drv="${drv%% (signed*}"
+  echo "==> installing $(basename "$drv") into $VM"
+  COPYFILE_DISABLE=1 tar -C "$(dirname "$drv")" -cf - "$(basename "$drv")" \
+    | gexec -i "$VM" sh -c 'd=/Library/Audio/Plug-Ins/HAL; sudo rm -rf "$d/MacRDPAudio.driver" &&
+        sudo tar -C "$d" -xf - && sudo chown -R root:wheel "$d/MacRDPAudio.driver" && sudo killall coreaudiod'
+  # coreaudiod comes back on demand; MacRDP picks the device up when a
+  # session's microphone starts.
+  sleep 3
+  gexec "$VM" /usr/sbin/system_profiler SPAudioDataType | grep -A1 -E '^ +MacRDP' || echo "warning: no MacRDP device listed yet" >&2
+}
+
+# The camera row provision-guest.sh writes, for clones of an older golden.
+cmd_grant_camera() {
+  gexec -i "$VM" sh -s <<'EOF'
+for db in "/Library/Application Support/com.apple.TCC/TCC.db" \
+          "$HOME/Library/Application Support/com.apple.TCC/TCC.db"; do
+  sudo /usr/bin/sqlite3 "$db" "INSERT OR REPLACE INTO access
+    (service, client, client_type, auth_value, auth_reason, auth_version,
+     indirect_object_identifier, flags, last_modified)
+    VALUES ('kTCCServiceCamera', 'com.mac-rdp.guestcheck', 0, 2, 0, 1, 'UNUSED', 0,
+            CAST(strftime('%s','now') AS INTEGER));"
+done
+sudo /usr/bin/killall tccd 2>/dev/null; /usr/bin/killall tccd 2>/dev/null; true
+EOF
+  echo "GuestCheck.app may now use the camera in $VM"
 }
 
 cmd_logs() {
@@ -214,8 +282,10 @@ case "$sub" in
   alerts)     gexec "$VM" /usr/local/bin/axpress UserNotificationCenter __none__ || true ;;
   exec)       gexec "$VM" "$@" ;;
   tool)       [[ -n "${1:-}" ]] || die "usage: $0 tool <file.swift>"; cmd_tool "$1" ;;
+  audio-driver) cmd_audio_driver ;;
+  grant-camera) cmd_grant_camera ;;
   ip)         vm_ip "$VM" ;;
   down)       halt "$VM" ;;
   destroy)    halt "$VM"; "$TART" delete "$VM" ;;
-  *)          sed -n '3,34p' "$0"; exit 1 ;;
+  *)          sed -n '3,37p' "$0"; exit 1 ;;
 esac
