@@ -153,13 +153,16 @@ audioOut:
   lag:
     shortWindowMs: 1000
     refWindowMs: 20000
-    driftAllowanceMs: 80           # 0 disables drift detection
+    driftAllowanceMs: 80           # drift tolerated before dropping; beyond it
+                                    # a growing share of packets is dropped (all
+                                    # of them at 5x). 0 disables drift detection
     maxMs: 0                       # 0 disables hard backstop (recommended).
                                     # The drift detector above already handles
                                     # sustained growth; an absolute cap will
                                     # mis-classify deep client buffers (e.g.
                                     # mstsc PCM ~300-500ms) as "broken" and
-                                    # silence the stream once it kicks in.
+                                    # drop everything above it (audio then only
+                                    # trickles through every 1.5 s).
 
 audioIn:
   enabled: true

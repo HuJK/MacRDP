@@ -171,6 +171,17 @@ struct macrdp_session {
     _Atomic uint8_t        audio_confirmed_block;
     _Atomic int32_t        audio_have_confirm;     /* 0 until first confirm */
     _Atomic uint64_t       audio_lag_log_ms;       /* last periodic log time */
+    _Atomic uint64_t       audio_last_confirm_ms;  /* wall-clock of last confirm */
+    /* Bresenham-style probabilistic-drop accumulator. Each
+     * rdpsnd_should_drop call adds the current `excess` (drift − allowance)
+     * to this; once it crosses `ramp` (= 4 × allowance), drop one packet
+     * and subtract ramp. Drop rate converges to excess / ramp — i.e.
+     * proportional to how far drift exceeds the operator's tolerance.
+     * Single-thread in practice (audio ingest is a per-session serial
+     * queue); _Atomic keeps a hypothetical multi-thread case approximately
+     * right rather than catastrophic. */
+    _Atomic int32_t        audio_drop_acc;
+    _Atomic uint32_t       audio_dropped;          /* packets dropped since the last progress log */
     /* Windowed-floor drift state. Written only by the confirm callback (single
      * channel thread → no lock); the send path reads the published floors. */
     uint16_t               audio_lag_bucket[MACRDP_AUDIO_LAG_BUCKETS]; /* per-1s min, 0xFFFF=empty */
@@ -865,6 +876,11 @@ static UINT rdpsnd_confirm_block_cb(RdpsndServerContext *ctx,
     atomic_store(&s->audio_have_confirm, 1);
 
     uint64_t now = now_ms();
+    /* Stamp BEFORE any early-return below so the send-path escape hatch
+     * (rdpsnd_should_drop) sees a fresh confirm even on the sent==0 race —
+     * the bucket ring is what matters for the drift metric, but
+     * audio_last_confirm_ms only tracks "is the metric alive at all". */
+    atomic_store(&s->audio_last_confirm_ms, now);
     /* Per-confirm lag: now − send_ms[bBlockNo]. Monotonic ms (no 16-bit
      * wTimestamp wrap), so any spike is real. sent==0 means we never
      * recorded a send for this block id — happens at init or if a confirm
@@ -930,9 +946,10 @@ static UINT rdpsnd_confirm_block_cb(RdpsndServerContext *ctx,
     if (now - last >= 2000) {
         atomic_store(&s->audio_lag_log_ms, now);
         os_log(bridge_log(),
-               "RDPSND progress: sent_block=%u played_block=%u lag=%dms shortFloor=%dms drift=%dms",
+               "RDPSND progress: sent_block=%u played_block=%u lag=%dms shortFloor=%dms drift=%dms dropped=%u",
                (unsigned)ctx->block_no, (unsigned)confirmBlockNum,
-               lag, shortFloor, shortFloor - refFloor);
+               lag, shortFloor, shortFloor - refFloor,
+               (unsigned)atomic_exchange(&s->audio_dropped, 0));
     }
     return CHANNEL_RC_OK;
 }
@@ -942,16 +959,69 @@ static UINT rdpsnd_confirm_block_cb(RdpsndServerContext *ctx,
  * rising above the reference) — never on jitter — plus an absolute backstop
  * for very slow skew. Codec-independent. The per-block send-time recording
  * happens AFTER the send (see *_send_audio_*), not here. */
+/* Stale-metric escape hatch threshold. If no confirm in this long, the
+ * windowed floors are frozen at whatever they were when confirms stopped
+ * (typical after the probabilistic drop saturates at p=1), and trusting
+ * them would lock the send path into permanent drop. 1500 ms covers the
+ * deepest documented client jitter buffer (mstsc PCM ~500 ms) plus a
+ * healthy round-trip margin — shorter than any human-noticeable silence
+ * window. */
+#define MACRDP_AUDIO_CONFIRM_STALE_MS 1500u
+
+/* Width of the linear probability ramp, as a multiple of the operator's
+ * driftAllowanceMs. Drift `allowance` → p_drop=0; drift `allowance × (1 +
+ * RAMP_MULT)` → p_drop=1. 4× chosen so the gradient is gentle enough that
+ * normal AAC jitter (allowance + a few tens of ms) is a low single-digit
+ * drop %; aggressive enough that runaway drift gets clamped before it
+ * pegs the encoder/wire pipeline. */
+#define MACRDP_AUDIO_DRIFT_RAMP_MULT 4
+
 static bool rdpsnd_should_drop(struct macrdp_session *s, UINT16 wTimestamp) {
     (void)wTimestamp;  /* legacy arg; lag is now block-indexed, see confirm cb */
     if (!atomic_load(&s->audio_have_confirm)) return false;   /* let it prime */
-    int drift = atomic_load(&s->audio_drift_ms);
+
+    /* Escape hatch: if confirms have stopped (typical after probabilistic
+     * drop saturates at p=1 — sends stop, in-flight blocks drain, no new
+     * confirms, bucket ring frozen, shortFloor / drift stuck at the last
+     * high values, drops continue forever, silence), let this block
+     * through so we can re-prime the metric with a fresh reading. If the
+     * drift was real the next confirm will land high again and we'll
+     * resume dropping after ~one block per stall window — trickle mode,
+     * but never permanent silence. */
+    uint64_t last_confirm = atomic_load(&s->audio_last_confirm_ms);
+    if (last_confirm > 0 && now_ms() - last_confirm > MACRDP_AUDIO_CONFIRM_STALE_MS) {
+        return false;
+    }
+
+    /* Absolute backstop — off by default (cfg.audio_max_lag_ms == 0). Kept
+     * binary on purpose: if the operator opts in, they want a hard stop. */
     int shortFloor = atomic_load(&s->audio_short_floor_ms);
-    if (s->cfg.audio_lag_drift_allowance_ms > 0 &&
-        drift > s->cfg.audio_lag_drift_allowance_ms) {
+    if (s->cfg.audio_max_lag_ms > 0 && shortFloor > s->cfg.audio_max_lag_ms) {
         return true;
     }
-    if (s->cfg.audio_max_lag_ms > 0 && shortFloor > s->cfg.audio_max_lag_ms) {
+
+    /* Drift-driven probabilistic drop. Binary drop here used to be the
+     * primary mechanism and produced silence on every false positive (a
+     * single bucket-aligned jitter spike, a legitimate client-target shift
+     * on network change, normal clock skew). The proportional version
+     * still pushes back on growth — same negative-feedback loop — but
+     * never goes silent: drop rate climbs linearly with excess, so trickle
+     * mode keeps audio audible while the buffer drains. */
+    int allowance = s->cfg.audio_lag_drift_allowance_ms;
+    if (allowance <= 0) return false;
+    int drift = atomic_load(&s->audio_drift_ms);
+    int excess = drift - allowance;
+    if (excess <= 0) return false;
+
+    int ramp = allowance * MACRDP_AUDIO_DRIFT_RAMP_MULT;
+    if (excess >= ramp) return true;        /* saturation — escape hatch will rescue */
+
+    /* Bresenham: add `excess` per call; cross `ramp` → drop one + subtract
+     * ramp. Drop rate ≈ excess/ramp asymptotically; quantisation error is
+     * bounded by 1/ramp (sub-percent at allowance=80, ramp=320). */
+    int old = atomic_fetch_add(&s->audio_drop_acc, excess);
+    if (old + excess >= ramp) {
+        atomic_fetch_sub(&s->audio_drop_acc, ramp);
         return true;
     }
     return false;
@@ -1732,6 +1802,9 @@ int32_t macrdp_session_create(int fd,
     atomic_init(&s->audio_confirmed_block, 0);
     atomic_init(&s->audio_have_confirm, 0);
     atomic_init(&s->audio_lag_log_ms, 0);
+    atomic_init(&s->audio_last_confirm_ms, 0);
+    atomic_init(&s->audio_drop_acc, 0);
+    atomic_init(&s->audio_dropped, 0);
     atomic_init(&s->audio_short_floor_ms, 0);
     atomic_init(&s->audio_drift_ms, 0);
     s->audio_lag_head = 0;
@@ -2569,7 +2642,10 @@ int32_t macrdp_session_send_audio_pcm(macrdp_session_t s,
     uint64_t elapsed = now_ms() - atomic_load(&s->audio_start_ms);
     UINT16 wTimestamp = (UINT16)(elapsed & 0xFFFFu);
     /* Bound buffered latency: skip if the client has fallen too far behind. */
-    if (rdpsnd_should_drop(s, wTimestamp)) return MACRDP_E_FRAME_DROPPED;
+    if (rdpsnd_should_drop(s, wTimestamp)) {
+        atomic_fetch_add(&s->audio_dropped, 1);
+        return MACRDP_E_FRAME_DROPPED;
+    }
     UINT rc = s->rdpsnd->SendSamples(s->rdpsnd, pcm, nframes, wTimestamp);
     if (rc == CHANNEL_RC_OK) {
         /* Record per-block send time for the lag metric. FreeRDP incremented
@@ -2610,7 +2686,10 @@ int32_t macrdp_session_send_audio_aac(macrdp_session_t s,
     uint64_t elapsed = now_ms() - atomic_load(&s->audio_start_ms);
     UINT16 wTimestamp = (UINT16)(elapsed & 0xFFFFu);
     /* Bound buffered latency: skip if the client has fallen too far behind. */
-    if (rdpsnd_should_drop(s, wTimestamp)) return MACRDP_E_FRAME_DROPPED;
+    if (rdpsnd_should_drop(s, wTimestamp)) {
+        atomic_fetch_add(&s->audio_dropped, 1);
+        return MACRDP_E_FRAME_DROPPED;
+    }
     UINT16 formatNo   = (UINT16)atomic_load(&s->audio_selected_format_no);
     UINT32 audioTS    = (UINT32)(elapsed & 0xFFFFFFFFu);
     UINT rc = s->rdpsnd->SendSamples2(s->rdpsnd, formatNo,

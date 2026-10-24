@@ -168,11 +168,11 @@ enum DefaultConfig {
             // catches sustained growth correctly; an absolute cap on
             // shortFloor mis-classifies legitimately deep client jitter
             // buffers (mstsc PCM ≈ 300-500ms, slow links higher) as
-            // "broken", and once shortFloor exceeds the cap the system
-             // dead-locks — drops stop all sends, no sends → no confirms
-             // → shortFloor stuck high → drops continue. Set to >0 only
-             // when you have a specific runaway-skew scenario that drift
-             // alone can't see.
+            // "broken", and once shortFloor exceeds the cap every packet
+             // is dropped — no sends → no confirms → shortFloor stuck high;
+             // only the 1.5 s stale-confirm escape lets audio trickle
+             // through. Set to >0 only when you have a specific
+             // runaway-skew scenario that drift alone can't see.
             maxMs: 0))
 
     // MARK: - audio in

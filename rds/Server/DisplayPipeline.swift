@@ -221,6 +221,7 @@ final class DisplayPipeline {
             onAudioSample: { sample in
                 guard let h = audioHandler else { return }
                 let frameCount = CMSampleBufferGetNumSamples(sample)
+                let nominalRate = Self.nominalSampleRate(of: sample)
                 let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
                 // T_arrive: when SCK actually handed us this buffer. PTS is
                 // when the audio was captured. The gap is hop A latency —
@@ -233,6 +234,7 @@ final class DisplayPipeline {
                 }
                 let dt = CACurrentMediaTime() - t0
                 audioStats.tick(frames: frameCount, ptsSec: pts,
+                                nominalRate: nominalRate,
                                 sckDelayMs: sckDelayMs, sendMs: dt * 1000)
             },
             onStopped: { [weak self] error in
@@ -410,13 +412,26 @@ final class DisplayPipeline {
     /// happens before the buffer reaches our callback). Logs every ~2s.
     ///
     /// Reading the line:
+    ///   * `nominal` — sample rate SCK *claims* in the buffer format
+    ///      descriptor. Should match `cfg.sampleRate = 48000`; if not,
+    ///      SCK silently down/upgraded our request and the resample to
+    ///      the 44.1 kHz wire rate (PCMResampler) starts from the wrong
+    ///      rate.
+    ///   * `rateCum` — cumulative empirical rate (totalFrames /
+    ///      wallElapsed) since the stream started. The TRUTH about how
+    ///      fast SCK is actually delivering samples. > 48000 → over-
+    ///      delivery → client buffer grows; < 48000 → under-delivery →
+    ///      buffer drains.
+    ///   * `rateWin` — same calc over the last ~2s only. Diverges from
+    ///      rateCum when SCK is bursting (rateWin > rateCum during
+    ///      catch-up, < cumulative during stall recovery).
+    ///   * `drift` — cumulative (wallElapsed − ptsElapsed). Same idea as
+    ///      rate but ms-based; grows if PTS clock and wall clock disagree.
     ///   * `sck(avg/max)` — capture→our-callback gap. Steady-state value
     ///      is SCK's own internal buffer (~10-50ms on a healthy stream);
     ///      growth means SCK is delivering older audio each tick.
     ///   * `send(avg/max)` — time we spend in extractPCM + AAC encode +
     ///      bridge handoff per chunk.
-    ///   * `drift` — cumulative (wallElapsed − ptsElapsed); if it keeps
-    ///      growing the producer / consumer rates have diverged.
     ///
     /// `@unchecked Sendable` because the proxy closure captures it from
     /// any thread; internal lock serializes the counters.
@@ -433,12 +448,19 @@ final class DisplayPipeline {
         private var samples: Int = 0
         private var lastLogWall: Double = 0
         private var firstPTS: Double = -1
+        // Frames-at-last-log snapshot for the short-window rate.
+        private var winFramesAtLastLog: Int = 0
+        // Nominal rate from the latest buffer's format desc (should be
+        // constant per stream; latest-wins covers any mid-stream reformat).
+        private var nominalRate: Double = 0
 
-        func tick(frames: Int, ptsSec: Double, sckDelayMs: Double, sendMs: Double) {
+        func tick(frames: Int, ptsSec: Double, nominalRate: Double,
+                  sckDelayMs: Double, sendMs: Double) {
             lock.lock()
             let now = CACurrentMediaTime()
             if startWall == 0 { startWall = now; lastLogWall = now }
             if firstPTS < 0 { firstPTS = ptsSec }
+            if nominalRate > 0 { self.nominalRate = nominalRate }
             totalFrames += frames
             maxChunk = max(maxChunk, frames)
             minChunk = min(minChunk, frames)
@@ -449,7 +471,10 @@ final class DisplayPipeline {
             samples += 1
             if now - lastLogWall >= 2.0 {
                 let wallElapsed = now - startWall
-                let measuredRate = Double(totalFrames) / wallElapsed
+                let rateCum = Double(totalFrames) / wallElapsed
+                let winFrames = totalFrames - winFramesAtLastLog
+                let winSec = now - lastLogWall
+                let rateWin = winSec > 0 ? Double(winFrames) / winSec : 0
                 let ptsElapsed = ptsSec - firstPTS
                 let drift = wallElapsed - ptsElapsed
                 let avgSend = sumSendMs / Double(samples)
@@ -458,10 +483,12 @@ final class DisplayPipeline {
                 let snapMaxChunk = maxChunk
                 let snapMaxSend  = maxSendMs
                 let snapMaxSCK   = maxSCKMs
+                let snapNominal = self.nominalRate
                 lock.unlock()
-                LogTo.audioOut.info("Audio: rate=\(Int(measuredRate))Hz drift=\(Int(drift*1000))ms chunk(min/max)=\(snapMinChunk)/\(snapMaxChunk) sck(avg/max)=\(Int(avgSCK))/\(Int(snapMaxSCK))ms send(avg/max)=\(Int(avgSend))/\(Int(snapMaxSend))ms")
+                LogTo.audioOut.info("Audio: nominal=\(Int(snapNominal))Hz rateCum=\(Int(rateCum))Hz rateWin=\(Int(rateWin))Hz drift=\(Int(drift*1000))ms chunk(min/max)=\(snapMinChunk)/\(snapMaxChunk) sck(avg/max)=\(Int(avgSCK))/\(Int(snapMaxSCK))ms send(avg/max)=\(Int(avgSend))/\(Int(snapMaxSend))ms")
                 lock.lock()
                 lastLogWall = now
+                winFramesAtLastLog = totalFrames
                 maxChunk = 0; minChunk = .max
                 maxSendMs = 0; sumSendMs = 0
                 maxSCKMs = 0; sumSCKMs = 0
@@ -469,6 +496,19 @@ final class DisplayPipeline {
             }
             lock.unlock()
         }
+    }
+
+    /// SCK's nominal sample rate as declared in the buffer's format
+    /// descriptor — the rate SCK CLAIMS each frame represents. Compare
+    /// against the requested 48000 and against the empirical
+    /// `totalFrames / wallElapsed` rate logged in AudioStats: any
+    /// divergence between the three is a smoking gun for buffer-growth
+    /// at the client (we tag the audio as one rate but deliver another).
+    nonisolated static func nominalSampleRate(of sample: CMSampleBuffer) -> Double {
+        guard let fd = CMSampleBufferGetFormatDescription(sample),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)
+        else { return 0 }
+        return asbd.pointee.mSampleRate
     }
 
     /// RDPSND. Returns nil on any extraction failure. Safe from any thread.

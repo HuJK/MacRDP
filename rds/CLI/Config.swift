@@ -471,16 +471,20 @@ struct Config: Codable, Sendable {
         /// Latency is estimated from RDPSND block confirms (sent-vs-played
         /// timestamp gap). To tell *sustained* latency (a stall that won't
         /// drain, or clock skew) from harmless *jitter*, we track the
-        /// windowed MINIMUM of that gap. We drop (skip sending) when the
-        /// short-window floor drifts above the long-window floor — never on
-        /// jitter. Codec-independent (PCM/AAC/Opus).
+        /// windowed MINIMUM of that gap. We drop (skip sending) a share of
+        /// packets that grows with how far the short-window floor drifts
+        /// above the long-window floor — never on jitter, and never into
+        /// lasting silence: once confirms stop for 1.5 s, packets go out
+        /// again to re-measure. Codec-independent (PCM/AAC/Opus).
         struct LagConfig: Codable, Sendable {
             /// Short window: the "current" latency floor.
             var shortWindowMs: Int
             /// Reference window: best achievable floor to compare against.
             var refWindowMs: Int
-            /// Drop while (shortFloor − refFloor) exceeds this. 0 disables
-            /// drift detection.
+            /// Drift (shortFloor − refFloor) tolerated before dropping.
+            /// Beyond it the dropped share rises linearly, from none at the
+            /// allowance to every packet at 5× it. 0 disables drift
+            /// detection.
             var driftAllowanceMs: Int
             /// Hard backstop on the absolute short-window floor (ms).
             /// 0 disables the backstop.

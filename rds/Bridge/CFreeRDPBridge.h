@@ -307,9 +307,12 @@ typedef struct macrdp_session_config {
     /* Preferred RDPSND codec: 0=none, 1=pcm, 2=aac, 3=opus. PCM is always
      * advertised as a fallback for aac/opus. */
     int32_t     audio_codec;
-    /* Drop-to-recover, from RDPSND block-confirm lag. Drift detector: drop
-     * while (shortWindow floor − refWindow floor) > drift_allowance; plus a
-     * hard backstop on the absolute short floor. All ms; 0 disables a part. */
+    /* Drop-to-recover, from RDPSND block-confirm lag. Drift detector: once
+     * (shortWindow floor − refWindow floor) exceeds drift_allowance, drop a
+     * share of packets rising linearly to all of them at 5× the allowance;
+     * plus a hard backstop on the absolute short floor. Either way packets
+     * go out again after 1.5 s without a confirm, to re-measure. All ms;
+     * 0 disables a part. */
     int32_t     audio_lag_short_window_ms;
     int32_t     audio_lag_ref_window_ms;
     int32_t     audio_lag_drift_allowance_ms;
