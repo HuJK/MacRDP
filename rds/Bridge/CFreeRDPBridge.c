@@ -171,6 +171,7 @@ struct macrdp_session {
     _Atomic uint8_t        audio_confirmed_block;
     _Atomic int32_t        audio_have_confirm;     /* 0 until first confirm */
     _Atomic uint64_t       audio_lag_log_ms;       /* last periodic log time */
+    uint64_t               write_blocked_since_ms; /* output backlog start, 0 = none (peer thread) */
     _Atomic uint64_t       audio_last_confirm_ms;  /* wall-clock of last confirm */
     /* Bresenham-style probabilistic-drop accumulator. Each
      * rdpsnd_should_drop call adds the current `excess` (drift − allowance)
@@ -1725,6 +1726,14 @@ static BOOL configure_settings(rdpSettings *s,
         if (!freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, FALSE)) return FALSE;
         if (!freerdp_settings_set_bool(s, FreeRDP_ExtSecurity, FALSE)) return FALSE;
     }
+    /* Never wait for the output buffer to drain inside a write. The peer
+     * thread is the only one reading the socket too, so a write that waits
+     * for a slow client stops us reading it, and a client busy uploading
+     * (webcam samples: 60+ H.264 frames/s) then fills its own send buffer
+     * and stops reading us: both sides wait on each other and the session
+     * freezes. Writes now park in the transport's buffer, and the peer loop
+     * drains it (DrainOutputBuffer) while it keeps reading. */
+    if (!freerdp_settings_set_bool(s, FreeRDP_WaitForOutputBufferFlush, FALSE)) return FALSE;
     if (!freerdp_settings_set_uint32(s, FreeRDP_EncryptionLevel,
                                      ENCRYPTION_LEVEL_CLIENT_COMPATIBLE)) return FALSE;
     if (!freerdp_settings_set_uint32(s, FreeRDP_ColorDepth, 32))     return FALSE;
@@ -1869,6 +1878,21 @@ int32_t macrdp_session_create(int fd,
     return MACRDP_OK;
 }
 
+/* Log output backlogs that took noticeably long to drain (a slow or busy
+ * client), so a stall that used to freeze the session leaves a trace. */
+static void note_write_backlog(struct macrdp_session *s, BOOL blocked) {
+    uint64_t now = now_ms();
+    if (blocked) {
+        if (!s->write_blocked_since_ms) s->write_blocked_since_ms = now;
+    } else if (s->write_blocked_since_ms) {
+        uint64_t took = now - s->write_blocked_since_ms;
+        if (took >= 500) {
+            os_log(bridge_log(), "output backlog drained after %llu ms", (unsigned long long)took);
+        }
+        s->write_blocked_since_ms = 0;
+    }
+}
+
 int32_t macrdp_session_run(macrdp_session_t s)
 {
     if (!s) return MACRDP_E_INVALID_ARG;
@@ -1899,7 +1923,17 @@ int32_t macrdp_session_run(macrdp_session_t s)
             if (gfxHandle) handles[count++] = gfxHandle;
         }
 
-        DWORD waitStatus = WaitForMultipleObjects(count, handles, FALSE, 1000);
+        /* Push out what the transport parked (see WaitForOutputBufferFlush in
+         * configure_settings); while some is left, come back soon instead of
+         * waiting a second for input. */
+        BOOL writeBlocked = peer->IsWriteBlocked(peer);
+        if (writeBlocked) {
+            if (peer->DrainOutputBuffer(peer) < 0) { result = MACRDP_E_DISCONNECTED; break; }
+            writeBlocked = peer->IsWriteBlocked(peer);
+        }
+        note_write_backlog(s, writeBlocked);
+
+        DWORD waitStatus = WaitForMultipleObjects(count, handles, FALSE, writeBlocked ? 5 : 1000);
         if (waitStatus == WAIT_FAILED) { result = MACRDP_E_INTERNAL; break; }
 
         if (!peer->CheckFileDescriptor(peer)) { result = MACRDP_E_DISCONNECTED; break; }
