@@ -8,6 +8,9 @@
 #
 # Checks:
 #   display   mstsc's picture vs the Mac's screen (PSNR, colour bars) and liveness
+#   converge  after the Mac's picture stops changing, every tile of mstsc's
+#             catches up within about one encoder latency (hybrid H.264 /
+#             Progressive tiles that kept switching codec used to lag seconds)
 #   keyboard  scancode typing          unicode   TS_UNICODE_EVENT typing
 #   mouse     move/click mapping       wheel     scroll direction and size
 #   cursor    pointer shapes reach the client
@@ -44,10 +47,13 @@ VMSH="$REPO_ROOT/scripts/tart-vm.sh"
 WINSH="$REPO_ROOT/scripts/win-client.sh"
 WINDIR='$env:USERPROFILE\macrdp-test'
 CHECKS=("$@"); [[ ${#CHECKS[@]} -gt 0 ]] ||
-  CHECKS=(display keyboard unicode mouse wheel cursor resize text image files mic camera nla)
+  CHECKS=(display converge keyboard unicode mouse wheel cursor resize text image files mic camera nla)
 OUT="${OUT:-${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/runs/basics-$(date +%Y%m%d-%H%M%S)}"
 IMGCMP="${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/build/bin/imgcmp"
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$(dirname "$IMGCMP")"
+# Host-side image comparisons, rebuilt when the source is newer.
+[[ "$IMGCMP" -nt "$REPO_ROOT/tools/imgcmp/imgcmp.swift" ]] ||
+  swiftc -O "$REPO_ROOT/tools/imgcmp/imgcmp.swift" -o "$IMGCMP" || exit 1
 failures=0
 
 vm() { "$VMSH" exec "$@"; }
@@ -226,6 +232,55 @@ compare_display() { # <tag> [WxH: the session, when smaller than mstsc's client 
   local p; p="$(sed 's/psnr=\([0-9.]*\).*/\1/' <<< "$psnr")"
   echo "$psnr counter-diff=$live${bad:+ wrong-colours:$bad}"
   python3 -I -c "import sys; sys.exit(not ($p >= 25 and $live > 1.0))" && [[ -z "$bad" ]]
+}
+
+# MARK: - Check: picture convergence
+
+check_converge() {
+  # The hybrid encoder sends a tile as H.264 while it changes and as
+  # Progressive once it is still; the two have different latencies, but no
+  # tile may lag the slower one. `guestcheck scene` moves a sprite over a
+  # detailed background (the tiles along its path keep switching codec),
+  # then holds everything still. MstscSampler samples mstsc's picture all
+  # along; per hold, imgcmp converge finds when the client first shows the
+  # sprite's final position and how long after that the last tile matches
+  # the Mac's picture. No clock sync needed: the hold is found in the
+  # samples themselves.
+  local cycles="${CONVERGE_CYCLES:-6}" move="${CONVERGE_MOVE:-4}" hold="${CONVERGE_HOLD:-5}"
+  local dir=/tmp/macrdp-scene n i res lag bad=0 detail="" secs sampler scene
+  stop_sink
+  win ps "if (-not (Test-Path \"$WINDIR\\tools\\MstscSampler.exe\")) { exit 1 }" >/dev/null ||
+    win build "$REPO_ROOT/tools/converge/MstscSampler.cs" >/dev/null
+  vm sh -c "pkill -f 'guestcheck scene'; rm -rf $dir; true"
+  secs=$((cycles * (move + hold + 6) + 20))
+  vm /usr/local/bin/guestcheck scene "$dir" $((secs + 30)) >/dev/null 2>&1 &
+  scene=$!
+  for i in $(seq 1 50); do vm test -f "$dir/ready" && break; sleep 0.2; done
+  win sample "$secs" 200 >"$OUT/converge-sampler.txt" 2>&1 &
+  sampler=$!
+  sleep 6   # the sampler starts through a scheduled task in the desktop session
+  local held=()
+  for n in $(seq 1 "$cycles"); do
+    vm sh -c "echo $move > $dir/go-$n.tmp && mv $dir/go-$n.tmp $dir/go-$n"
+    for i in $(seq 1 $((move * 5 + 50))); do vm test -f "$dir/held-$n" && break; sleep 0.2; done
+    held[$n]="$(vm cat "$dir/held-$n" 2>/dev/null)"
+    echo "$n ${held[$n]}" >>"$OUT/converge-held.txt"
+    "$VMSH" screenshot "$OUT/converge-$n-mac.png" >/dev/null
+    sleep "$hold"
+  done
+  win sample-stop >/dev/null; wait "$sampler"
+  vm touch "$dir/quit"; wait "$scene"
+  win fetch 'runs/converge/samples.gz' "$OUT/converge-samples.gz" >/dev/null &&
+    gunzip -c "$OUT/converge-samples.gz" >"$OUT/converge-samples"
+  for n in $(seq 1 "$cycles"); do
+    # held-N: unix time, sprite x y (points = pixels here), frame number
+    read -r _ x y _ <<<"${held[$n]:-0 0 0 0}"
+    res="$("$IMGCMP" converge "$OUT/converge-samples" "$OUT/converge-$n-mac.png" "$x" "$y" 320 200 2>&1)"
+    detail+=" #$n:$res;"
+    lag="$(sed -n 's/^lag=\([0-9]*\).*/\1/p' <<<"$res")"
+    [[ -n "$lag" && "$lag" -le "${CONVERGE_MAX_LAG_MS:-500}" ]] || bad=$((bad + 1))
+  done
+  result "converge" $((bad == 0)) "$((cycles - bad))/$cycles holds caught up within ${CONVERGE_MAX_LAG_MS:-500} ms; $(tr -d '\r' <"$OUT/converge-sampler.txt" | tail -1);$detail"
 }
 
 # MARK: - Checks: display and input

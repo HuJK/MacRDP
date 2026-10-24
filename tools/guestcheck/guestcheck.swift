@@ -27,6 +27,8 @@
 //   guestcheck input-record <device> <secs> <out>  # an input device (e.g. "BlackHole 2ch",
 //                                        # where MacRDP plays the client's mic), same raw
 //                                        # layout; prints the device's sample rate
+//   guestcheck scene <dir> <secs>        # full-screen picture moved, then held still, on cue
+//                                        # (files in <dir>, see SceneView): for picture convergence
 //   guestcheck sink <secs> <log>         # full-screen test pattern that logs input (JSON lines):
 //                                        # typed text, clicks, scrolls; cursor regions for
 //                                        # pointer-shape checks (see SinkView)
@@ -380,6 +382,10 @@ case "sink":
     guard args.count == 3, let secs = Double(args[1]) else { fail("usage: guestcheck sink <secs> <log>") }
     runSink(seconds: secs, logPath: args[2])
 
+case "scene":
+    guard args.count == 3, let secs = Double(args[2]) else { fail("usage: guestcheck scene <dir> <secs>") }
+    runScene(dir: args[1], seconds: secs)
+
 default:
     fail("unknown command \(cmd)")
 }
@@ -527,6 +533,119 @@ func runSink(seconds: Double, logPath: String) {
         let c = SinkView.counterRegion, b = view.bounds
         view.setNeedsDisplay(NSRect(x: b.width * c.x0, y: b.height * c.y0,
                                     width: b.width * (c.x1 - c.x0), height: b.height * (c.y1 - c.y0)))
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { app.terminate(nil) }
+    app.run()
+}
+
+// MARK: - scene
+
+/// A full-screen picture that is moved, then held perfectly still, on cue —
+/// for checking that the client's picture catches up once the Mac's stops
+/// changing (the hybrid encoder flips tiles between H.264 while they change
+/// and Progressive once they're still; a tile must never stay behind).
+///
+/// Background: 8 px cells in colours hashed from their position, so every
+/// tile is distinct and a stale one shows. Sprite: 320x200 stripes with a
+/// counter that changes every frame, so the tiles it covers keep changing
+/// while it moves.
+///
+/// Driven by files in `dir`: `go-N` (contents: seconds, default 4) moves the
+/// sprite along path N; when it has stopped and the final frame is drawn,
+/// `held-N` appears. `ready` once the window is up; `quit` ends it.
+final class SceneView: NSView {
+    override var isFlipped: Bool { true }
+    let background: CGImage
+    var sprite = CGPoint(x: 100, y: 100)
+    var frameNumber = 0
+    static let spriteSize = CGSize(width: 320, height: 200)
+
+    init(size: CGSize) {
+        let w = Int(size.width), h = Int(size.height)
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue)!
+        for cy in stride(from: 0, to: h, by: 8) {
+            for cx in stride(from: 0, to: w, by: 8) {
+                var v = UInt32(truncatingIfNeeded: cx &* 73856093 ^ cy &* 19349663)
+                v = (v ^ (v >> 13)) &* 0x5bd1e995
+                ctx.setFillColor(CGColor(srgbRed: CGFloat(v & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255,
+                                         blue: CGFloat((v >> 16) & 0xFF) / 255, alpha: 1))
+                ctx.fill(CGRect(x: cx, y: h - cy - 8, width: 8, height: 8))
+            }
+        }
+        background = ctx.makeImage()!
+        super.init(frame: NSRect(origin: .zero, size: size))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    var spriteRect: NSRect { NSRect(origin: sprite, size: SceneView.spriteSize) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        ctx.translateBy(x: 0, y: bounds.height); ctx.scaleBy(x: 1, y: -1)   // image is bottom-up
+        ctx.draw(background, in: CGRect(origin: .zero, size: bounds.size))
+        ctx.restoreGState()
+        let r = spriteRect
+        guard r.intersects(dirtyRect) else { return }
+        let colors: [NSColor] = [.systemRed, .systemYellow, .systemGreen, .systemTeal, .systemBlue, .systemPurple]
+        for i in 0..<12 {
+            colors[(i + frameNumber) % colors.count].setFill()
+            NSRect(x: r.minX + CGFloat(i) * r.width / 12, y: r.minY, width: r.width / 12 + 1, height: r.height).fill()
+        }
+        let text = String(format: "%05d", frameNumber) as NSString
+        text.draw(at: NSPoint(x: r.minX + 40, y: r.minY + 60),
+                  withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 64, weight: .bold),
+                                   .foregroundColor: NSColor.white])
+    }
+}
+
+func runScene(dir: String, seconds: Double) {
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    for f in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] { try? fm.removeItem(atPath: dir + "/" + f) }
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    guard let screen = NSScreen.main else { fail("no screen") }
+    let win = SinkWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    win.level = .screenSaver
+    let view = SceneView(size: screen.frame.size)
+    win.contentView = view
+    win.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    fm.createFile(atPath: dir + "/ready", contents: nil)
+
+    var cycle = 0
+    // Poll for the next go-N; run its motion at 60 Hz, then hold.
+    Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { poll in
+        if fm.fileExists(atPath: dir + "/quit") { app.terminate(nil) }
+        let next = cycle + 1
+        guard let go = fm.contents(atPath: dir + "/go-\(next)") else { return }
+        cycle = next
+        poll.fireDate = .distantFuture
+        let move = Double(String(decoding: go, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 4
+        let b = view.bounds, s = SceneView.spriteSize
+        let cx = (b.width - s.width) / 2, cy = (b.height - s.height) / 2
+        let n = Double(next)
+        let start = Date()
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { tick in
+            let t = min(Date().timeIntervalSince(start), move)
+            let old = view.spriteRect
+            view.sprite = CGPoint(x: cx + cx * 0.9 * sin(2 * .pi * (0.13 + 0.02 * n) * t + n),
+                                  y: cy + cy * 0.9 * sin(2 * .pi * (0.21 + 0.03 * n) * t + 2 * n))
+            view.frameNumber += 1
+            view.setNeedsDisplay(old.union(view.spriteRect).insetBy(dx: -1, dy: -1))
+            guard t >= move else { return }
+            tick.invalidate()
+            view.displayIfNeeded()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                let held = String(format: "%.3f %d %d %d\n", Date().timeIntervalSince1970,
+                                  Int(view.sprite.x), Int(view.sprite.y), view.frameNumber)
+                fm.createFile(atPath: dir + "/held-\(next)", contents: Data(held.utf8))
+                poll.fireDate = Date()
+            }
+        }
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { app.terminate(nil) }
     app.run()

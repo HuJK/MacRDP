@@ -14,6 +14,9 @@
 #   ./scripts/win-client.sh put <local> <dir>   # upload into macrdp-test\<dir>
 #   ./scripts/win-client.sh paste <dir> [secs]  # paste into <dir> in Explorer (scripts/win/explorer-paste.ps1)
 #   ./scripts/win-client.sh vcam                # start the test webcam (scripts/win/vcam.ps1)
+#   ./scripts/win-client.sh sample <secs> [ms]  # sample what mstsc shows until done or sample-stop
+#                                               # (scripts/win/sampler.ps1 -> runs/converge/samples.gz)
+#   ./scripts/win-client.sh sample-stop         # end a running sample early
 #   ./scripts/win-client.sh audio-default [render|capture <name>]  # list audio devices, or make
 #                                               # one the default (scripts/win/audio-default.ps1)
 #   ./scripts/win-client.sh build <file.cs>     # compile a C# tool there (csc, C# 5)
@@ -122,6 +125,8 @@ case "$sub" in
               ps "New-Item -ItemType Directory -Force \"$PSDIR\\$2\" | Out-Null"
               scp -q -r -o BatchMode=yes "$1" "$WIN:$RDIR/$2/" ;;
   vcam)       desktop vcam.ps1; ps "Get-Content \"$PSDIR\\vcam.txt\"" ;;
+  sample)     run_json sampler.ps1 "{\"seconds\": ${1:?seconds}, \"interval\": ${2:-200}}" $(( ${1} + 60 )) ;;
+  sample-stop) ps "New-Item -ItemType Directory -Force \"$PSDIR\\runs\\converge\" | Out-Null; New-Item -ItemType File -Force \"$PSDIR\\runs\\converge\\stop\" | Out-Null" ;;
   audio-default) if [[ $# -ge 2 ]]; then run_json audio-default.ps1 "{\"flow\": \"$1\", \"name\": \"$2\"}"
               else run_json audio-default.ps1 '{}'; fi ;;
   build)      [[ -n "${1:-}" ]] || die "usage: $0 build <file.cs>"; cmd_build "$1" ;;
