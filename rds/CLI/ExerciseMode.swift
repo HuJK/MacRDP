@@ -133,7 +133,7 @@ enum ExerciseMode {
             pcm.append(UInt8(truncatingIfNeeded: s & 0xFF))
             pcm.append(UInt8(truncatingIfNeeded: (s >> 8) & 0xFF))
         }
-        pipeline.feedPCM(pcm)
+        pipeline.feedPCM(pcm, sampleRate: sr, channels: 2)
         Thread.sleep(forTimeInterval: 1.5)
         pipeline.stop()
         print("Played 1s test tone")

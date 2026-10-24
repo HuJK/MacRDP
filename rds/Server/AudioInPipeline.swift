@@ -22,6 +22,9 @@ final class AudioInPipeline: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private var playbackFormat: AVAudioFormat?
+    /// Converts a client mic that negotiated anything but 48 kHz stereo;
+    /// rebuilt if the negotiated format changes.
+    private var converter: (rate: Int, channels: Int, resampler: PCMResampler)?
 
     /// Optional observer of the decoded mic PCM (Int16LE interleaved), used to
     /// drive the menu-bar live spectrum. Set/cleared and invoked on the same
@@ -77,11 +80,25 @@ final class AudioInPipeline: @unchecked Sendable {
         engine.reset()
     }
 
-    /// Called by the FreeRDP bridge for each PCM frame received over AUDIN.
-    /// pcm is Int16LE interleaved stereo at 48 kHz (or whatever we
-    /// negotiated — Phase 5 narrows this once AUDIN format-negotiation
-    /// is in place).
-    func feedPCM(_ pcm: Data) {
+    /// Called by the FreeRDP bridge for each PCM frame received over AUDIN:
+    /// Int16LE interleaved in the format the client picked from the ones the
+    /// bridge offers (48 or 44.1 kHz, 16 kHz, stereo or mono). Everything
+    /// past this point (playback, the spectrum tap) gets 48 kHz stereo.
+    func feedPCM(_ input: Data, sampleRate: Int, channels: Int) {
+        var pcm = input
+        if sampleRate != 48_000 || channels != 2 {
+            if converter?.rate != sampleRate || converter?.channels != channels {
+                guard let rs = try? PCMResampler(from: Double(sampleRate), to: 48_000,
+                                                 channels: AVAudioChannelCount(channels),
+                                                 outChannels: 2) else {
+                    LogTo.audioIn.error("no converter for AUDIN \(sampleRate) Hz/\(channels) ch; dropping")
+                    return
+                }
+                converter = (sampleRate, channels, rs)
+                LogTo.audioIn.notice("AUDIN \(sampleRate) Hz/\(channels) ch → converting to 48 kHz stereo")
+            }
+            pcm = converter!.resampler.process(input)
+        }
         if let pcmTap, !pcm.isEmpty { pcmTap(pcm) }
         guard let fmt = playbackFormat, !pcm.isEmpty else { return }
         let bytesPerFrame = Int(fmt.streamDescription.pointee.mBytesPerFrame)

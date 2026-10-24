@@ -9,6 +9,9 @@
 //  until the drift detector drops audio — so we never send it 48 kHz PCM
 //  or AAC. Opus is unaffected and stays at 48 kHz.
 //
+//  Also used the other way, for AUDIN: a client mic's negotiated format
+//  (rate, mono/stereo) → the 48 kHz stereo the mic playback expects.
+//
 //  AVAudioConverter keeps its filter state between calls, so feeding SCK's
 //  chunks one at a time yields one continuous stream; each call returns
 //  whatever output is ready, which can be a frame or two off chunk × ratio.
@@ -24,22 +27,28 @@ final class PCMResampler: @unchecked Sendable {
     private let inputFormat: AVAudioFormat
     private let outputFormat: AVAudioFormat
     private let bytesPerFrame: Int
+    private let outBytesPerFrame: Int
     private let ratio: Double
 
+    /// `outChannels` defaults to `channels`; mono → stereo copies the one
+    /// channel to both.
     init(from inRate: Double, to outRate: Double,
-         channels: AVAudioChannelCount = 2) throws {
+         channels: AVAudioChannelCount = 2, outChannels: AVAudioChannelCount? = nil) throws {
+        let outCh = outChannels ?? channels
         guard let inFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: inRate,
                                            channels: channels, interleaved: true),
               let outFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: outRate,
-                                            channels: channels, interleaved: true),
+                                            channels: outCh, interleaved: true),
               let conv = AVAudioConverter(from: inFormat, to: outFormat) else {
             throw NSError(domain: "MacRDP.resampler", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter \(Int(inRate)) → \(Int(outRate)) Hz init failed"])
+                          userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter \(Int(inRate)) Hz/\(channels) ch → \(Int(outRate)) Hz/\(outCh) ch init failed"])
         }
+        if channels == 1 && outCh == 2 { conv.channelMap = [0, 0] }
         self.converter = conv
         self.inputFormat = inFormat
         self.outputFormat = outFormat
         self.bytesPerFrame = Int(inFormat.streamDescription.pointee.mBytesPerFrame)
+        self.outBytesPerFrame = Int(outFormat.streamDescription.pointee.mBytesPerFrame)
         self.ratio = outRate / inRate
     }
 
@@ -76,6 +85,6 @@ final class PCMResampler: @unchecked Sendable {
             return Data()
         }
         guard let out = outBuf.int16ChannelData?[0] else { return Data() }
-        return Data(bytes: out, count: Int(outBuf.frameLength) * bytesPerFrame)
+        return Data(bytes: out, count: Int(outBuf.frameLength) * outBytesPerFrame)
     }
 }

@@ -365,7 +365,7 @@ final class RDPSession {
         }
         sinks.onAudioInFrame = { [weak self] pcm, sr, ch in
             Task { @MainActor [weak self] in
-                self?.audioIn?.feedPCM(pcm)
+                self?.audioIn?.feedPCM(pcm, sampleRate: sr, channels: ch)
             }
         }
         sinks.onDispLayout = { [weak self] monitors in
