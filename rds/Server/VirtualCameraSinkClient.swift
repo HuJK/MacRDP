@@ -151,6 +151,8 @@ final class VirtualCameraSink {
     private var formatDescription: CMFormatDescription?
     private var discoveryTimer: DispatchSourceTimer?
     private var misses = 0
+    private var sentFrames = 0, droppedFrames = 0
+    private var statsSince: CFAbsoluteTime = 0
     private var started = false
 
     /// Called on the main queue when the first app starts, or the last one
@@ -218,12 +220,24 @@ final class VirtualCameraSink {
     /// 32BGRA). Dropped silently if the sink isn't connected yet or is full.
     func send(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime? = nil) {
         queue.async { [self] in
-            guard let simpleQueue, let formatDescription else { return }
+            guard let simpleQueue else { return }
 
             // Drop rather than block when the extension hasn't drained yet.
             if CMSimpleQueueGetCount(simpleQueue) >= CMSimpleQueueGetCapacity(simpleQueue) {
+                noteFrame(sent: false)
                 return
             }
+            // Described from the buffer itself: a bare 1280x720 BGRA
+            // description doesn't match buffers carrying colour attachments
+            // (decoded frames do), and the sample buffer is then refused
+            // (kCMSampleBufferError_InvalidMediaFormat).
+            if formatDescription.map({ !CMVideoFormatDescriptionMatchesImageBuffer($0, imageBuffer: pixelBuffer) }) ?? true {
+                formatDescription = nil
+                CMVideoFormatDescriptionCreateForImageBuffer(
+                    allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+                    formatDescriptionOut: &formatDescription)
+            }
+            guard let formatDescription else { return }
 
             let pts = presentationTime ?? CMClockGetTime(CMClockGetHostTimeClock())
             var timing = CMSampleTimingInfo(
@@ -241,8 +255,21 @@ final class VirtualCameraSink {
             let ref = Unmanaged.passRetained(sampleBuffer).toOpaque()
             if CMSimpleQueueEnqueue(simpleQueue, element: ref) != noErr {
                 Unmanaged<CMSampleBuffer>.fromOpaque(ref).release()
+                noteFrame(sent: false)
+            } else {
+                noteFrame(sent: true)
             }
         }
+    }
+
+    /// Frames into the sink vs dropped (queue full), logged every 5 s.
+    private func noteFrame(sent: Bool) {
+        if sent { sentFrames += 1 } else { droppedFrames += 1 }
+        let now = CFAbsoluteTimeGetCurrent()
+        if statsSince == 0 { statsSince = now }
+        guard now - statsSince >= 5 else { return }
+        log.info("virtual camera \(self.name, privacy: .public): \(self.sentFrames) frames to the sink in \(String(format: "%.0f", now - self.statsSince)) s, \(self.droppedFrames) dropped (queue full)")
+        sentFrames = 0; droppedFrames = 0; statsSince = now
     }
 
     // MARK: Discovery
@@ -278,11 +305,6 @@ final class VirtualCameraSink {
             log.error("CMIODeviceStartStream failed")
             return
         }
-
-        CMVideoFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault, codecType: VirtualCameraFormat.pixelFormat,
-            width: Int32(VirtualCameraFormat.width), height: Int32(VirtualCameraFormat.height),
-            extensions: nil, formatDescriptionOut: &formatDescription)
 
         deviceID = device
         sinkStreamID = sink

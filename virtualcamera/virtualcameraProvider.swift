@@ -222,9 +222,10 @@ class virtualcameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
             guard let self else { return }
             self._streamSink.stream.consumeSampleBuffer(from: client) { sbuf, seq, _, _, err in
                 guard let sbuf else {
-                    if let err { logger.debug("sink consume err \(err.localizedDescription)") }
+                    if let err { self.noteSink(error: err) }
                     return
                 }
+                self.noteSink(forwarded: self._streamingSourceCounter > 0)
                 let now = CMClockGetTime(CMClockGetHostTimeClock())
                 let output = CMIOExtensionScheduledOutput(
                     sequenceNumber: seq,
@@ -238,6 +239,28 @@ class virtualcameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
             }
         }
         _sinkTimer!.resume()
+    }
+
+    /// Sink traffic, logged every 5 s: frames taken from the host and
+    /// forwarded to readers, and consume errors. Diagnostics only.
+    private let _sinkStatsLock = NSLock()
+    private var _sinkConsumed = 0, _sinkForwarded = 0, _sinkErrors = 0
+    private var _sinkLastError = ""
+    private var _sinkStatsSince: CFAbsoluteTime = 0
+
+    private func noteSink(forwarded: Bool? = nil, error: Error? = nil) {
+        _sinkStatsLock.lock()
+        defer { _sinkStatsLock.unlock() }
+        if let forwarded {
+            _sinkConsumed += 1
+            if forwarded { _sinkForwarded += 1 }
+        }
+        if let error { _sinkErrors += 1; _sinkLastError = error.localizedDescription }
+        let now = CFAbsoluteTimeGetCurrent()
+        if _sinkStatsSince == 0 { _sinkStatsSince = now }
+        guard now - _sinkStatsSince >= 5 else { return }
+        logger.info("\(self.device.localizedName, privacy: .public): \(self._sinkConsumed) frames from the sink, \(self._sinkForwarded) forwarded, \(self._sinkErrors) consume errors\(self._sinkErrors > 0 ? " (last: \(self._sinkLastError))" : "", privacy: .public)")
+        _sinkConsumed = 0; _sinkForwarded = 0; _sinkErrors = 0; _sinkStatsSince = now
     }
 
     func stopStreamingSink() {
