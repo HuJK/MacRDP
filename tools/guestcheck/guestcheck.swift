@@ -15,11 +15,16 @@
 //                                        # (`tart exec` children may not, and get EDEADLK)
 //   guestcheck sck-record <secs> <out>   # system audio via ScreenCaptureKit, as MacRDP gets it:
 //                                        # 48 kHz stereo float32 interleaved, raw
+//   guestcheck input-record <device> <secs> <out>  # an input device (e.g. "BlackHole 2ch",
+//                                        # where MacRDP plays the client's mic), same raw
+//                                        # layout; prints the device's sample rate
 //   guestcheck sink <secs> <log>         # full-screen test pattern that logs input (JSON lines):
 //                                        # typed text, clicks, scrolls; cursor regions for
 //                                        # pointer-shape checks (see SinkView)
 
 import AppKit
+import AVFoundation
+import CoreAudio
 import ScreenCaptureKit
 
 func fail(_ msg: String) -> Never {
@@ -164,6 +169,52 @@ case "sck-record":
     try await stream.stopCapture()
     try fh.close()
     print("\(sink.frames) frames in \(String(format: "%.2f", Date().timeIntervalSince(start))) s")
+
+case "input-record":
+    guard args.count == 4, let secs = Double(args[2]) else {
+        fail("usage: guestcheck input-record <device-name> <secs> <out>")
+    }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size)
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids)
+    let device = ids.first { id in
+        var nameAddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+                                                  mScope: kAudioObjectPropertyScopeGlobal,
+                                                  mElement: kAudioObjectPropertyElementMain)
+        var name: Unmanaged<CFString>?
+        var n = UInt32(MemoryLayout<CFString>.size)
+        guard AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &n, &name) == noErr,
+              let s = name?.takeRetainedValue() as String? else { return false }
+        return s == args[1]
+    }
+    guard var device else { fail("no audio device named \(args[1])") }
+    let engine = AVAudioEngine()
+    guard let unit = engine.inputNode.audioUnit,
+          AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                               &device, UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr else {
+        fail("cannot select \(args[1]) as the input")
+    }
+    let fmt = engine.inputNode.outputFormat(forBus: 0)
+    guard FileManager.default.createFile(atPath: args[3], contents: nil),
+          let fh = FileHandle(forWritingAtPath: args[3]) else { fail("cannot write \(args[3])") }
+    var frames = 0
+    engine.inputNode.installTap(onBus: 0, bufferSize: 4800, format: fmt) { buf, _ in
+        guard let ch = buf.floatChannelData else { return }
+        let n = Int(buf.frameLength), right = buf.format.channelCount > 1 ? 1 : 0
+        var out = [Float](repeating: 0, count: n * 2)
+        for i in 0..<n { out[2 * i] = ch[0][i]; out[2 * i + 1] = ch[right][i] }
+        out.withUnsafeBytes { fh.write(Data($0)) }
+        frames += n
+    }
+    try engine.start()
+    try await Task.sleep(nanoseconds: UInt64(secs * 1e9))
+    engine.stop()
+    try fh.close()
+    print("\(frames) frames at \(Int(fmt.sampleRate)) Hz")
 
 case "sink":
     guard args.count == 3, let secs = Double(args[1]) else { fail("usage: guestcheck sink <secs> <log>") }

@@ -12,7 +12,9 @@
 #   ./scripts/win-client.sh input '<json>'      # mouse/keys into mstsc (scripts/win/input.ps1)
 #   ./scripts/win-client.sh clip '<json>'       # read/write the clipboard (scripts/win/clip.ps1)
 #   ./scripts/win-client.sh put <local> <dir>   # upload into macrdp-test\<dir>
-#   ./scripts/win-client.sh paste <dir> [secs]  # Explorer + Ctrl+V into <dir> (scripts/win/explorer-paste.ps1)
+#   ./scripts/win-client.sh paste <dir> [secs]  # paste into <dir> in Explorer (scripts/win/explorer-paste.ps1)
+#   ./scripts/win-client.sh audio-default [render|capture <name>]  # list audio devices, or make
+#                                               # one the default (scripts/win/audio-default.ps1)
 #   ./scripts/win-client.sh build <file.cs>     # compile a C# tool there (csc, C# 5)
 #   ./scripts/win-client.sh fetch <remote> <local>  # copy from the client's macrdp-test dir
 #   ./scripts/win-client.sh ps <powershell...>  # run PowerShell over SSH
@@ -64,7 +66,6 @@ run_json() { # <script.ps1> <json> [timeout]
 
 windows() { desktop windows.ps1 && ps "Get-Content \"$PSDIR\\windows.txt\""; }
 
-press() { run_json press.ps1 "$1" | grep -q '^pressed'; }
 
 connected() { windows | grep -qF -- "$1 - Remote Desktop Connection"; }
 
@@ -87,8 +88,10 @@ cmd_connect() {
   desktop connect.ps1
   for i in $(seq 1 20); do
     sleep 2
-    # mstsc warns about every unsigned .rdp file before connecting.
-    press '{"process": "mstsc", "button": "Connect"}' && echo "pressed Connect"
+    # Redirecting the microphone makes mstsc ask whether to trust the host
+    # (once: the answer ticks "don't ask me again").
+    desktop trust-prompt.ps1
+    ps "Get-Content \"$PSDIR\\trust-prompt.txt\"" | grep -q '^answered' && echo "answered the trust prompt"
     connected "$host" && { echo "mstsc connected to $host"; return; }
   done
   die "mstsc did not connect to $host"
@@ -117,6 +120,8 @@ case "$sub" in
   put)        [[ $# -eq 2 ]] || die "usage: $0 put <local> <dir>"
               ps "New-Item -ItemType Directory -Force \"$PSDIR\\$2\" | Out-Null"
               scp -q -r -o BatchMode=yes "$1" "$WIN:$RDIR/$2/" ;;
+  audio-default) if [[ $# -ge 2 ]]; then run_json audio-default.ps1 "{\"flow\": \"$1\", \"name\": \"$2\"}"
+              else run_json audio-default.ps1 '{}'; fi ;;
   build)      [[ -n "${1:-}" ]] || die "usage: $0 build <file.cs>"; cmd_build "$1" ;;
   fetch)      [[ $# -eq 2 ]] || die "usage: $0 fetch <remote> <local>"; get "$1" "$2" ;;
   ps)         ps "$@" ;;

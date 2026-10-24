@@ -14,8 +14,12 @@
 #   resize    dynamic resolution: DISP layouts from FreeRDP's client in the
 #             VM (brew install freerdp), then mstsc window sizes (known to
 #             fail: mstsc sends MacRDP no layouts, reported as XFAIL)
-#   text image files   clipboard, both directions (files mac->win: XFAIL, mstsc
-#             pastes nothing; files win->mac needs MacRDP's File Provider on)
+#   text image files   clipboard, both directions (files mac->win: XFAIL on the
+#             LTSC test client, whose mstsc pastes no server files at all;
+#             files win->mac needs MacRDP's File Provider on)
+#   mic       client microphone: tone bursts played into VB-Cable on Windows
+#             reach the Mac's BlackHole at the right pitch and spacing
+#             (needs BlackHole in the VM: brew install --cask blackhole-2ch)
 #   nla       nthash login policy over NLA: right password in, wrong one out
 #             (restarts MacRDP with a temporary config, then restores it)
 #
@@ -34,7 +38,7 @@ VMSH="$REPO_ROOT/scripts/tart-vm.sh"
 WINSH="$REPO_ROOT/scripts/win-client.sh"
 WINDIR='$env:USERPROFILE\macrdp-test'
 CHECKS=("$@"); [[ ${#CHECKS[@]} -gt 0 ]] ||
-  CHECKS=(display keyboard unicode mouse wheel cursor resize text image files nla)
+  CHECKS=(display keyboard unicode mouse wheel cursor resize text image files mic nla)
 OUT="${OUT:-${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/runs/basics-$(date +%Y%m%d-%H%M%S)}"
 IMGCMP="${MACRDP_VM_ROOT:-/Volumes/DATA/tart}/build/bin/imgcmp"
 mkdir -p "$OUT"
@@ -140,9 +144,11 @@ check_files() {
   got="$(win paste 'C:\\Users\\hujkconsole\\macrdp-test\\clipdst' 180 |
     tr -d '\r\357\273\277' | sed 's|\\|/|g' | sort)"
   [[ "$got" == "$want" ]] && ok=1 || ok=0
-  # Known: mstsc fetches FileGroupDescriptorW but its clipboard object
+  # Known to fail on this test client only: its mstsc (Windows 11 LTSC,
+  # 10.0.26100.8875) fetches FileGroupDescriptorW, then its clipboard object
   # rejects FileContents for every lindex (DV_E_FORMATETC), so Explorer
-  # pastes nothing and never asks for the bytes.
+  # pastes nothing. It does the same against xrdp; Mac->Windows file paste
+  # works from a regular Windows client (checked by hand, 2026-10-25).
   known "files mac->win" $ok "$(echo "$got" | grep -c '|') files"
   [[ $ok == 1 ]] || diff <(echo "$want") <(echo "$got") | sed 's/^/      /'
 }
@@ -354,6 +360,40 @@ check_resize() {
   stop_sink; win disconnect >/dev/null; win connect >/dev/null
 }
 
+# MARK: - Check: microphone
+
+check_mic() {
+  # Windows plays LoopbackOnsets' bursts (1 kHz every 2 s) into VB-Cable's
+  # "CABLE Input"; its "CABLE Output", made the default recording device,
+  # is the mic mstsc redirects (connect.ps1 asks for audiocapturemode). A
+  # fresh session picks the device up. MacRDP plays the mic into BlackHole,
+  # recorded here the way a Mac app would.
+  local res n bad
+  win audio-default capture "CABLE Output" >/dev/null
+  win ps "if (-not (Test-Path \"$WINDIR\\tools\\LoopbackOnsets.exe\")) { exit 1 }" ||
+    win build "$REPO_ROOT/tools/latency/LoopbackOnsets.cs" >/dev/null
+  win disconnect >/dev/null && win connect >/dev/null
+  sleep 3
+  "$VMSH" exec /usr/local/bin/guestcheck input-record "BlackHole 2ch" 20 /tmp/mic.raw >"$OUT/mic-record.txt" 2>&1 &
+  local rec=$!
+  sleep 2
+  win ps "& \"$WINDIR\\tools\\LoopbackOnsets.exe\" --self-play 15 \"$WINDIR\\runs\\mic\"" >/dev/null
+  wait $rec
+  vm cat /tmp/mic.raw >"$OUT/mic.raw"
+  res="$(python3 -I "$REPO_ROOT/tools/latency/burst-pitch.py" "$OUT/mic.raw" 48000 1000)"
+  echo "$res" >"$OUT/mic-bursts.txt"
+  # "burst at  4.380 s   1000.0 Hz  +96000 samples": the pitch within 5 Hz,
+  # the spacing (after the first) within 1 ms of 2 s. Not the last burst:
+  # stopping the player can cut it short.
+  n="$(grep -c '^burst at' <<<"$res")"
+  bad="$(grep '^burst at' <<<"$res" | sed '$d' |
+    awk '{ if ($5 < 995 || $5 > 1005) b++
+           if (NF >= 7) { d = substr($7, 2) + 0; if (d < 95952 || d > 96048) b++ } }
+         END { print b + 0 }')"
+  ok=0; [[ $n -ge 6 && $bad == 0 ]] && ok=1
+  result "mic win->mac" $ok "$n bursts, $bad off; $(head -1 "$OUT/mic-record.txt")"
+}
+
 # MARK: - Check: NLA with the nthash policy
 
 check_nla() {
@@ -364,10 +404,11 @@ check_nla() {
   "$VMSH" start >/dev/null
   win disconnect >/dev/null
 
-  local ok=0 proto
+  local ok=0 proto t0
+  t0=$(date +%s)
   RDP_PASSWORD="$pw" win connect >/dev/null 2>&1 && sleep 3 &&
-    "$VMSH" logs 20 | grep -q "Peer activated" && ok=1
-  proto="$("$VMSH" wlog 400 | sed -n 's/.*Server Security: \(.*\)/\1/p' | tail -1)"
+    "$VMSH" logs $(( $(date +%s) - t0 + 5 )) | grep -q "Peer activated" && ok=1
+  proto="$("$VMSH" wlog 5000 | sed -n 's/.*Server Security: \(.*\)/\1/p' | tail -1)"
   result "nla right password" $ok "server security: ${proto:-?}"
 
   win disconnect >/dev/null
