@@ -71,6 +71,8 @@ Carthage/Build/
 # install outputs are generated and must not be committed.
 ThirdParty/FreeRDP-build/
 ThirdParty/FreeRDP-install/
+# scripts/build-audio-driver.sh output (driver built from ThirdParty/BlackHole).
+ThirdParty/MacRDPAudio-build/
 
 # ─────────────── Local reference material (not shipped) ────────────
 # Source mirrors of other projects + third-party commercial DMG.

@@ -2,3 +2,6 @@
 	path = ThirdParty/FreeRDP
 	url = https://github.com/HuJK/FreeRDP.git
 	branch = macrdp-fork
+[submodule "ThirdParty/BlackHole"]
+	path = ThirdParty/BlackHole
+	url = https://github.com/ExistentialAudio/BlackHole.git

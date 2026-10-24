@@ -4,11 +4,10 @@
 //
 //  Decoded mic PCM frames (from AUDIN, supplied by the FreeRDP bridge)
 //  are queued through an AVAudioEngine playback chain whose output
-//  device is the user-configured one (typically a loopback driver like
-//  BlackHole, so Mac apps can pick up "MacRDP Mic" as an input).
-//
-//  Phase 5b alternative: ship a system extension that exposes the
-//  virtual mic natively. Out of scope for v1.
+//  device is, in order: the configured one; MacRDP's own driver
+//  (scripts/build-audio-driver.sh), whose hidden "MacRDP Microphone Feed"
+//  output comes back out of its "MacRDP Microphone" input for Mac apps;
+//  or another loopback driver such as BlackHole.
 //
 
 import Foundation
@@ -44,6 +43,8 @@ final class AudioInPipeline: @unchecked Sendable {
 
         // Route policy:
         //  - Use config.audioIn.outputDeviceUID if explicitly set.
+        //  - Otherwise MacRDP's own driver, if installed: its hidden feed
+        //    device, which Mac apps hear as "MacRDP Microphone".
         //  - Otherwise auto-detect a known loopback driver (BlackHole)
         //    so Mac apps can pick it as their microphone source.
         //  - Otherwise fall back to default output (audible — diagnostic only).
@@ -51,11 +52,14 @@ final class AudioInPipeline: @unchecked Sendable {
         if !wantedUID.isEmpty {
             try applyOutputDevice(uid: wantedUID)
             LogTo.audioIn.info("AUDIN → output device UID=\(wantedUID)")
+        } else if Self.findDevice(byUID: Self.macRDPFeedUID) != nil {
+            try applyOutputDevice(uid: Self.macRDPFeedUID)
+            LogTo.audioIn.notice("AUDIN routed to MacRDP's virtual microphone (\"MacRDP Microphone\")")
         } else if let bh = Self.findLoopbackDevice() {
             try applyOutputDevice(uid: bh.uid)
             LogTo.audioIn.notice("AUDIN auto-routed to loopback device: \(bh.name) (UID=\(bh.uid))")
         } else {
-            LogTo.audioIn.notice("AUDIN: no loopback device (BlackHole/Loopback) detected; mic audio will play on default output. Install BlackHole to route into Mac apps as a virtual mic.")
+            LogTo.audioIn.notice("AUDIN: no virtual microphone (MacRDP's audio driver, BlackHole, Loopback) found; mic audio will play on default output. Install MacRDP's audio driver to route it into Mac apps.")
         }
 
         // Standard 48 kHz / Int16 / stereo for now; later we negotiate.
@@ -119,6 +123,10 @@ final class AudioInPipeline: @unchecked Sendable {
     }
 
     // MARK: - Output-device routing
+
+    /// UID of the hidden output device of MacRDP's driver (BlackHole's
+    /// "<kDriver_Name>_2_UID", see scripts/build-audio-driver.sh).
+    static let macRDPFeedUID = "MacRDP_2_UID"
 
     private func applyOutputDevice(uid: String) throws {
         guard let deviceID = Self.findDevice(byUID: uid) else {
@@ -185,6 +193,22 @@ final class AudioInPipeline: @unchecked Sendable {
     }
 
     private static func findDevice(byUID uid: String) -> AudioDeviceID? {
+        // Translation finds hidden devices too (MacRDP's feed device), which
+        // kAudioHardwarePropertyDevices leaves out.
+        var translate = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cfUID = uid as CFString
+        var translated = AudioDeviceID(kAudioObjectUnknown)
+        var translatedSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        if AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &translate,
+                                      UInt32(MemoryLayout<CFString>.size), &cfUID,
+                                      &translatedSize, &translated) == noErr,
+           translated != kAudioObjectUnknown {
+            return translated
+        }
+
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
