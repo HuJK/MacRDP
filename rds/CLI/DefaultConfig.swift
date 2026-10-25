@@ -67,6 +67,7 @@ enum DefaultConfig {
             burstSeconds: 1),
         maxFrameDelayCount: 0,
         sckQueueDepth: 5,
+        compositorNudgeMs: 33,
         maxOutstandingFrames: 2,
         avc420: Config.VideoConfig.AVC420Hint(
             qp: 22,

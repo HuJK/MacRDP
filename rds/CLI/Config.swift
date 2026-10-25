@@ -108,6 +108,10 @@ struct Config: Codable, Sendable {
         var maxFrameDelayCount: Int
         /// ScreenCaptureKit's internal sample-buffer queue.
         var sckQueueDepth: Int
+        /// Force a window-server composite this often (ms) so SCK hands over
+        /// a lone change instead of holding it until the next one; 0 = off.
+        /// See CompositorNudge.
+        var compositorNudgeMs: Int
         /// Bound in-flight GFX frames (sent but not yet RDPGFX_FRAME_ACK'd).
         var maxOutstandingFrames: Int
 

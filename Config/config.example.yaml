@@ -49,6 +49,7 @@ video:
     burstSeconds: 1
   maxFrameDelayCount: 0
   sckQueueDepth: 5
+  compositorNudgeMs: 33           # force a composite this often so SCK can't hold a lone change; 0 = off
   maxOutstandingFrames: 2
 
   # AVC420 quant hints sent in metablocks for client QoE reporting.

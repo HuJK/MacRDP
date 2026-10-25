@@ -55,6 +55,10 @@ final class DisplayPipeline {
     /// and the client keeps an older picture for good. So the newest one is
     /// resubmitted as soon as the backlog allows.
     private var lastSample: CMSampleBuffer?
+    private var nudge: CompositorNudge?
+    /// The nudge window's pixel(s) in capture space. SCK reports them dirty
+    /// on every forced composite though the window is excluded.
+    private var nudgeRect: CGRect?
     private var repaintPending = false
     private var repaintPolling = false
     /// Set by the SuppressOutput handler when the client minimizes / hides
@@ -194,7 +198,19 @@ final class DisplayPipeline {
             cfg.excludesCurrentProcessAudio = true
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // See CompositorNudge: SCK may hold a lone change until the next
+        // composite. The nudge window itself stays out of the picture.
+        var excluded: [SCWindow] = []
+        if config.video.compositorNudgeMs > 0 {
+            let n = CompositorNudge(display: display.displayID, intervalMs: config.video.compositorNudgeMs)
+            nudge = n
+            if let w = await n.shareableWindow() { excluded = [w] }
+            else { LogTo.display.error("Compositor nudge window not in shareable content; it will show in the picture") }
+            nudgeRect = CGRect(x: 0, y: 0,
+                               width: (Double(pxW) / Double(max(1, display.width))).rounded(.up),
+                               height: (Double(pxH) / Double(max(1, display.height))).rounded(.up))
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
 
         // Stand up the H.264 encoder for the AVC420 path or the hybrid path.
         // Hybrid feeds BGRA (VT converts); AVC420 feeds NV12.
@@ -601,6 +617,9 @@ final class DisplayPipeline {
         encoder?.invalidate()
         encoder = nil
         output = nil
+        nudge?.stop()
+        nudge = nil
+        nudgeRect = nil
         lastSample = nil
         repaintPending = false
     }
@@ -658,6 +677,9 @@ final class DisplayPipeline {
         // (TimeBucketHistory), so a tile that stops being touched exits
         // H.264 naturally on the next .complete; no idle-driven repaint.
         if !isCompleteFrame(sample) { return }
+        // A composite the nudge forced: nothing changed but its own pixel.
+        if !repaint, let nr = nudgeRect, let dirty = Self.dirtyRects(from: sample), !dirty.isEmpty,
+           dirty.allSatisfy({ nr.contains($0) }) { return }
 
         guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
         lastSample = sample
