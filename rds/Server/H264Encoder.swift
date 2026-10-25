@@ -64,6 +64,7 @@ final class H264Encoder {
     private let outputQueue = DispatchQueue(label: "com.macrdp.h264.out",
                                             qos: .userInteractive)
     private let onEncoded: Output
+    private var loggedSPS = false   // output queue
     /// Called (on VideoToolbox's thread) when a submitted frame produced no
     /// output; set once, before encoding.
     var onDropped: (@Sendable () -> Void)?
@@ -246,11 +247,17 @@ final class H264Encoder {
         annexB.reserveCapacity(64 * 1024)
 
         // On IDR, prepend SPS+PPS as start-code-delimited NALs so a
-        // late-joining client can decode without waiting.
+        // late-joining client can decode without waiting. The SPS gets a
+        // no-reordering VUI if it lacks one (see H264SPS).
         if isIDR {
             for nal in extractParameterSets(formatDesc) {
+                let fixed = H264SPS.addingNoReorderVUI(nal)
+                if !loggedSPS, nal.first.map({ $0 & 0x1F == 7 }) == true {
+                    loggedSPS = true
+                    LogTo.encoder.info("H264 SPS \(nal.map { String(format: "%02x", $0) }.joined())\(fixed == nal ? "" : " -> " + fixed.map { String(format: "%02x", $0) }.joined())")
+                }
                 annexB.append(contentsOf: kStartCode)
-                annexB.append(nal)
+                annexB.append(fixed)
             }
         }
 
@@ -276,7 +283,11 @@ final class H264Encoder {
             offset += nalLenSize
             if nalLen <= 0 || offset + nalLen > totalLen { break }
             annexB.append(contentsOf: kStartCode)
-            annexB.append(UnsafeBufferPointer(start: bytes + offset, count: nalLen))
+            if bytes[offset] & 0x1F == 7 {
+                annexB.append(H264SPS.addingNoReorderVUI(Data(bytes: bytes + offset, count: nalLen)))
+            } else {
+                annexB.append(UnsafeBufferPointer(start: bytes + offset, count: nalLen))
+            }
             offset += nalLen
         }
 
