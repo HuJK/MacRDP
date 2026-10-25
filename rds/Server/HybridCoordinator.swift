@@ -46,6 +46,25 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     private var paintGrid: TileGrid
     private var keyframeRequested = false
 
+    // Progressive goes out only where the client lacks a tile's newest pixels
+    // (FreeRDP's progressive_compress encodes every tile it is given, so a
+    // full-surface region costs ~0.4-1.4 MB per 1080p frame and floods the
+    // client). `changedToken[i]`: the newest capture whose pixels tile i must
+    // get losslessly — it changed then, or H.264 painted it (lossy).
+    // `progressiveToken[i]`: the newest capture painted there by Progressive.
+    // route() keeps the static tiles with progressiveToken < changedToken; a
+    // send that never lands leaves them pending for the next route(). Both
+    // under `paintLock`, like lastPaintToken.
+    private var changedToken: [Int64] = []
+    private var progressiveToken: [Int64] = []
+
+    // Change detection: the last routed capture's pixels, compared row by
+    // row in route(). Dirty rects don't do: captures skipped under
+    // backpressure never reach route(), and their space is unclear when SCK
+    // scales. MainActor only.
+    private var reference: UnsafeMutableRawPointer?
+    private var refWidth = 0, refHeight = 0, refStride = 0
+
     /// Called on the send queue when the client may be left behind: the
     /// bridge refused a frame, or an AVC frame was dropped so its decoder is
     /// out of step until the next IDR. Either is only repaired by a later
@@ -61,6 +80,16 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         self.paintGrid = initialGrid
         self.lastPaintToken = [Int64](repeating: 0,
                                       count: max(0, initialGrid.tileCount))
+        resetProgressiveState(tileCount: initialGrid.tileCount)
+    }
+
+    deinit { reference?.deallocate() }
+
+    /// Every tile pending: the client surface is blank (new or re-created).
+    /// Caller holds `paintLock` (or is init).
+    private func resetProgressiveState(tileCount: Int) {
+        changedToken = [Int64](repeating: 1, count: max(0, tileCount))
+        progressiveToken = [Int64](repeating: 0, count: max(0, tileCount))
     }
 
     /// Resolution change hook — rebuild grid on both store and engine.
@@ -74,7 +103,16 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         paintLock.lock()
         paintGrid = g
         lastPaintToken = [Int64](repeating: 0, count: max(0, g.tileCount))
+        resetProgressiveState(tileCount: g.tileCount)
         keyframeRequested = true  // force IDR on the first frame at the new size
+        paintLock.unlock()
+    }
+
+    /// Paint every tile again on the next route() (the client may have
+    /// dropped its surface, e.g. while minimized).
+    func repaintAll() {
+        paintLock.lock()
+        for i in progressiveToken.indices { progressiveToken[i] = 0 }
         paintLock.unlock()
     }
 
@@ -112,12 +150,10 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
                                  captureToken: token)
         }
 
-        let (videoRects, staticRects) = coalesce(tiles: tiles, grid: grid)
-        // No surface-priming pass needed: the published map carries h264 or
-        // progressive for every tile (no `.skip`), so coalesce() already
-        // covers the full surface. Bridge-reject recovery still goes through
-        // forgetPaint → next route picks the same tile up via the
-        // always-present map entry.
+        let changed = changedTiles(pixel: pixel, width: width, height: height,
+                                   stride: stride, grid: grid)
+        let (videoRects, staticRects) = coalesce(
+            tiles: tilesToPaint(tiles, changed: changed, grid: grid, token: token), grid: grid)
 
         var masked: CVPixelBuffer?
         if cfg.mask.enable, !videoRects.isEmpty,
@@ -204,13 +240,14 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
                                      grid: payload.grid, token: payload.captureToken)
                 }
                 self.markPainted(rects: filteredStatic,
-                                 grid: payload.grid, token: payload.captureToken)
+                                 grid: payload.grid, token: payload.captureToken,
+                                 progressive: true)
             } else {
                 // Bridge rejected the write (backpressure / channel-not-ready /
-                // internal error). Nothing landed on the client surface, but
-                // the published map still has h264/progressive for every tile,
-                // so the next route() re-emits blit instructions for these
-                // same rects. Clear the paint tokens so
+                // internal error). Nothing landed on the client surface; the
+                // static tiles stay pending (progressiveToken didn't advance)
+                // and the video tiles are H.264 again, so the next route()
+                // re-emits these same rects. Clear the paint tokens so
                 // `filterRectsAgainstNewerPaints` doesn't drop that retry
                 // against an "older" capture token.
                 let rectsToForget = (avcDropped ? [] : filteredVideo) + filteredStatic
@@ -300,7 +337,8 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         return kept
     }
 
-    private func markPainted(rects: [Rect16], grid: TileGrid, token: Int64) {
+    private func markPainted(rects: [Rect16], grid: TileGrid, token: Int64,
+                             progressive: Bool = false) {
         if rects.isEmpty { return }
         paintLock.lock(); defer { paintLock.unlock() }
         guard paintGrid == grid, lastPaintToken.count == grid.tileCount else { return }
@@ -316,9 +354,65 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
                 for col in c0...c1 {
                     let i = row * cols + col
                     if lastPaintToken[i] < token { lastPaintToken[i] = token }
+                    if progressive, progressiveToken[i] < token { progressiveToken[i] = token }
                 }
             }
         }
+    }
+
+    // MARK: - What to paint
+
+    /// Tiles whose pixels differ from the last routed capture (all of them
+    /// when there is none at this size), and the reference updated to this
+    /// capture. `pixel` is locked by the caller.
+    private func changedTiles(pixel: CVPixelBuffer, width: Int, height: Int,
+                              stride: Int, grid: TileGrid) -> [Bool] {
+        var changed = [Bool](repeating: false, count: max(0, grid.tileCount))
+        guard let src = CVPixelBufferGetBaseAddress(pixel), grid.cols > 0, grid.rows > 0 else {
+            return [Bool](repeating: true, count: changed.count)
+        }
+        if reference == nil || refWidth != width || refHeight != height || refStride != stride {
+            reference?.deallocate()
+            reference = UnsafeMutableRawPointer.allocate(byteCount: stride * height, alignment: 64)
+            refWidth = width; refHeight = height; refStride = stride
+            reference!.copyMemory(from: src, byteCount: stride * height)
+            return [Bool](repeating: true, count: changed.count)
+        }
+        let ref = reference!
+        let ts = grid.tileSize, cols = grid.cols
+        let rowBytes = min(width, cols * ts) * 4
+        for y in 0..<min(height, grid.rows * ts) {
+            let a = src + y * stride, b = ref + y * stride
+            if memcmp(a, b, rowBytes) == 0 { continue }
+            let base = (y / ts) * cols
+            for col in 0..<cols where !changed[base + col] {
+                let x = col * ts * 4
+                if memcmp(a + x, b + x, min(ts * 4, rowBytes - x)) != 0 { changed[base + col] = true }
+            }
+            b.copyMemory(from: a, byteCount: rowBytes)
+        }
+        return changed
+    }
+
+    /// The tile map trimmed to what this capture must paint: every H.264
+    /// tile, and the Progressive tiles the client doesn't have losslessly at
+    /// their newest pixels. Unpainted tiles get a byte matching neither codec,
+    /// so coalesce() skips them.
+    private func tilesToPaint(_ tiles: [UInt8], changed: [Bool], grid: TileGrid,
+                              token: Int64) -> [UInt8] {
+        paintLock.lock(); defer { paintLock.unlock() }
+        guard paintGrid == grid, changedToken.count == tiles.count,
+              changed.count == tiles.count else { return tiles }
+        var out = tiles
+        for i in out.indices {
+            if changed[i] { changedToken[i] = token }
+            if out[i] == TileCodec.h264.rawValue {
+                changedToken[i] = token   // painted lossy: Progressive must follow once still
+            } else if progressiveToken[i] >= changedToken[i] {
+                out[i] = 0
+            }
+        }
+        return out
     }
 
     // MARK: - Masking

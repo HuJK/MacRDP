@@ -73,7 +73,12 @@ final class DisplayPipeline {
     private var reconnectInProgress = false
 
     func pauseCapture()  { paused = true;  nextForceKeyframe = true }
-    func resumeCapture() { paused = false; nextForceKeyframe = true }
+    func resumeCapture() {
+        paused = false
+        nextForceKeyframe = true
+        hybridSink?.repaintAll()
+        requestRepaint()
+    }
 
     let onEncodedFrame: EncodedFrameHandler?
     let onRawFrame: RawFrameHandler?

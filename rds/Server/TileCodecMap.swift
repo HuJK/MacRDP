@@ -177,6 +177,9 @@ protocol HybridFrameSink: AnyObject, Sendable {
     /// AVC frame) and only a later frame would fix it. Set once by
     /// DisplayPipeline, before frames flow.
     var onRepaintNeeded: (@Sendable () -> Void)? { get set }
+    /// Paint every tile again from the next routed capture on, not only the
+    /// ones that changed (the client may have dropped its surface).
+    func repaintAll()
 }
 
 /// Merge same-codec tiles into rectangles. Greedy per-row run-merge followed

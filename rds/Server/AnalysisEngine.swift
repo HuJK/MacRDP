@@ -44,11 +44,11 @@ final class AnalysisEngine: @unchecked Sendable {
     // The engine doesn't decide which codec a tile should use — the
     // classifier's Schmitt does. And it carries no per-tile bookkeeping
     // either: every analysis publishes one codec per tile (no `.skip`
-    // sentinel), so the published map always covers the full surface and
-    // route() always emits a blit instruction for every tile. That removes
-    // the whole class of "client surface stuck on stale pixels because we
-    // forgot to publish for a few ticks" bugs that the old
-    // active/wasActive/lastPublishedDesired logic existed to paper over.
+    // sentinel), so the published map always covers the full surface. Which
+    // tiles a frame actually paints is HybridCoordinator's call (every video
+    // tile, plus the static tiles the client lacks), tracked per capture
+    // token there — not here, where a few unpublished ticks used to leave
+    // the client surface stuck on stale pixels.
     private var grid: TileGrid
     private var submitCount: Int = 0
 
