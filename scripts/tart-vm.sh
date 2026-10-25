@@ -50,6 +50,12 @@ BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/DerivedData/Build/Products/Debug/MacRDP.app"
 GUEST_CONFIG='$HOME/Library/Application Support/MacRDP/vm.yaml'
 GUEST_LOGS='$HOME/Library/Logs/MacRDP'
+# Guest shell snippet that quits MacRDP. A wedged one ignores SIGTERM, and
+# `open` then leaves it running instead of the new build: kill it after 5 s.
+STOP_MACRDP='if /usr/bin/pkill -x MacRDP; then
+  for i in $(seq 1 10); do /usr/bin/pgrep -x MacRDP >/dev/null || break; sleep 0.5; done
+  /usr/bin/pkill -9 -x MacRDP && echo "warning: MacRDP ignored SIGTERM, killed it" >&2
+fi; true'
 
 die() { echo "error: $*" >&2; exit 1; }
 gexec() { "$TART" exec "$@"; }
@@ -154,7 +160,7 @@ cmd_deploy() {
   fi
   [[ -d "$APP" ]] || die "no build at $APP"
   echo "==> installing into $VM"
-  gexec "$VM" /usr/bin/pkill -x MacRDP || true
+  gexec "$VM" sh -c "$STOP_MACRDP"
   COPYFILE_DISABLE=1 tar -C "$(dirname "$APP")" -cf - MacRDP.app \
     | gexec -i "$VM" sh -c 'sudo rm -rf /Applications/MacRDP.app && sudo tar -C /Applications -xf - && sudo chown -R admin:staff /Applications/MacRDP.app'
   gexec -i "$VM" sh -c "mkdir -p \"\$(dirname \"$GUEST_CONFIG\")\" && cat > \"$GUEST_CONFIG\"" \
@@ -163,7 +169,7 @@ cmd_deploy() {
 
 cmd_start() {
   gexec -i "$VM" sh -s <<EOF
-/usr/bin/pkill -x MacRDP && sleep 1
+$STOP_MACRDP
 mkdir -p "$GUEST_LOGS"
 /usr/bin/open -a /Applications/MacRDP.app \
   --stdout "$GUEST_LOGS/stdout.log" --stderr "$GUEST_LOGS/stderr.log" \
@@ -275,7 +281,7 @@ case "$sub" in
   up)         cmd_up ;;
   deploy)     cmd_deploy "$@" ;;
   start)      cmd_start ;;
-  stop)       gexec "$VM" /usr/bin/pkill -x MacRDP ;;
+  stop)       gexec "$VM" sh -c "$STOP_MACRDP" ;;
   logs)       cmd_logs "$@" ;;
   wlog)       cmd_wlog "$@" ;;
   screenshot) cmd_screenshot "$@" ;;
