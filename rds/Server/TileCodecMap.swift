@@ -121,6 +121,11 @@ final class TileCodecMapStore: @unchecked Sendable {
 
 /// Result of routing one frame: which tiles go to which codec, plus an
 /// optional masked copy to feed VideoToolbox. Used on MainActor only.
+/// How long a video tile must stay still before the hybrid path repaints it
+/// with Progressive (its last H.264 picture is lossy), whatever the
+/// classifier still thinks of it.
+let hybridQuietRepaint: TimeInterval = 0.15
+
 struct HybridRouting {
     var videoRects: [Rect16]
     var staticRects: [Rect16]
@@ -134,6 +139,9 @@ struct HybridRouting {
     /// some of this frame's intended video tiles — those tiles get filtered
     /// out of the AVC blit so the newer Progressive content isn't stomped.
     var captureToken: Int64
+    /// Whether any pixel differs from the last routed capture. A frame that
+    /// changed nothing (one the compositor nudge forced) needs no H.264.
+    var pixelsChanged: Bool
 }
 
 /// Per-frame payload threaded from the encode call back to the send path so

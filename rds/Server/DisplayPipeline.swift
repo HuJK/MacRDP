@@ -56,13 +56,14 @@ final class DisplayPipeline {
     /// resubmitted as soon as the backlog allows.
     private var lastSample: CMSampleBuffer?
     private var nudge: CompositorNudge?
-    /// The nudge window's pixel(s) in capture space. SCK reports them dirty
-    /// on every forced composite though the window is excluded.
-    private var nudgeRect: CGRect?
-    // Capture rate, logged every 10 s while frames come: new captures, and
-    // how many of them backpressure kept from the encoder.
+    /// Counts captures handled, so a delayed check can tell whether a newer
+    /// one came (see scheduleQuietRepaint).
+    private var captureGeneration = 0
+    // Capture rate, logged every 10 s while frames come: captures, how many
+    // backpressure kept from the encoder, and how many changed no pixel.
     private var statsCaptured = 0
     private var statsSkipped = 0
+    private var statsUnchanged = 0
     private var statsSince = ProcessInfo.processInfo.systemUptime
     private var repaintPending = false
     private var repaintPolling = false
@@ -212,16 +213,16 @@ final class DisplayPipeline {
         }
 
         // See CompositorNudge: SCK may hold a lone change until the next
-        // composite. The nudge window itself stays out of the picture.
+        // composite. The nudge window itself stays out of the picture. Only
+        // with the hybrid sink, whose pixel compare drops the frames the
+        // nudge forces (SCK calls them complete, dirty at the nudge's pixel
+        // and sometimes more); the other codecs would encode every one.
         var excluded: [SCWindow] = []
-        if config.video.compositorNudgeMs > 0 {
+        if config.video.compositorNudgeMs > 0, hybridSink != nil {
             let n = CompositorNudge(display: display.displayID, intervalMs: config.video.compositorNudgeMs)
             nudge = n
             if let w = await n.shareableWindow() { excluded = [w] }
             else { LogTo.display.error("Compositor nudge window not in shareable content; it will show in the picture") }
-            nudgeRect = CGRect(x: 0, y: 0,
-                               width: (Double(pxW) / Double(max(1, display.width))).rounded(.up),
-                               height: (Double(pxH) / Double(max(1, display.height))).rounded(.up))
         }
         let filter = SCContentFilter(display: display, excludingWindows: excluded)
 
@@ -632,7 +633,6 @@ final class DisplayPipeline {
         output = nil
         nudge?.stop()
         nudge = nil
-        nudgeRect = nil
         lastSample = nil
         repaintPending = false
     }
@@ -678,14 +678,27 @@ final class DisplayPipeline {
         }
     }
 
+    /// H.264 just went out. Once its tiles have been still for
+    /// hybridQuietRepaint the sink repaints them losslessly, but only from a
+    /// route(): if no newer capture comes by then, resubmit the newest one.
+    private func scheduleQuietRepaint() {
+        let generation = captureGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + hybridQuietRepaint + 0.05) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.captureGeneration == generation else { return }
+                self.requestRepaint()
+            }
+        }
+    }
+
     private func noteCapture(skipped: Bool) {
         statsCaptured += 1
         if skipped { statsSkipped += 1 }
         let now = ProcessInfo.processInfo.systemUptime
         guard now - statsSince >= 10 else { return }
-        let fps = Double(statsCaptured) / (now - statsSince)
-        LogTo.display.notice("Capture: \(self.statsCaptured) new frames (\(String(format: "%.1f", fps)) fps), \(self.statsSkipped) skipped for backpressure")
-        statsCaptured = 0; statsSkipped = 0; statsSince = now
+        let fps = Double(statsCaptured - statsUnchanged) / (now - statsSince)
+        LogTo.display.notice("Capture: \(self.statsCaptured) frames, \(self.statsCaptured - self.statsUnchanged) changed (\(String(format: "%.1f", fps)) fps), \(self.statsSkipped) skipped for backpressure")
+        statsCaptured = 0; statsSkipped = 0; statsUnchanged = 0; statsSince = now
     }
 
     private func handleSample(_ sample: CMSampleBuffer, repaint: Bool = false) {
@@ -700,13 +713,13 @@ final class DisplayPipeline {
         // (TimeBucketHistory), so a tile that stops being touched exits
         // H.264 naturally on the next .complete; no idle-driven repaint.
         if !isCompleteFrame(sample) { return }
-        // A composite the nudge forced: nothing changed but its own pixel.
-        if !repaint, let nr = nudgeRect, let dirty = Self.dirtyRects(from: sample), !dirty.isEmpty,
-           dirty.allSatisfy({ nr.contains($0) }) { return }
 
         guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
         lastSample = sample
-        if !repaint { noteCapture(skipped: paused || shouldDropCapture()) }
+        if !repaint {
+            captureGeneration &+= 1
+            noteCapture(skipped: paused || shouldDropCapture())
+        }
 
         // Client minimized / hid its window.
         if paused {
@@ -745,13 +758,20 @@ final class DisplayPipeline {
                                      dirtyRects: dirty)
             CVPixelBufferUnlockBaseAddress(pixel, .readOnly)
 
+            // No pixel changed (a composite the nudge forced, say): H.264
+            // would only resend the same picture. Static tiles still owed
+            // go out below; a repaint or a forced IDR always encodes.
+            let unchanged = !routing.pixelsChanged && !repaint && !force
+            if unchanged { statsUnchanged += 1 }
+            let sendVideo = !routing.videoRects.isEmpty && !unchanged
+
             let payload = HybridFramePayload(
                 captureToken: routing.captureToken,
-                videoRects: routing.videoRects, staticRects: routing.staticRects,
+                videoRects: sendVideo ? routing.videoRects : [], staticRects: routing.staticRects,
                 grid: routing.grid, pixel: pixel)
 
-            if routing.videoRects.isEmpty {
-                // Nothing photographic this frame — Progressive only.
+            if !sendVideo {
+                // Nothing photographic to send this frame — Progressive only.
                 sink.send(annexB: nil, isIDR: false, pts: pts, payload: payload)
                 return
             }
@@ -783,6 +803,7 @@ final class DisplayPipeline {
             } catch {
                 LogTo.encoder.error("hybrid encode failed: \(String(describing: error))")
             }
+            scheduleQuietRepaint()
             return
         }
 

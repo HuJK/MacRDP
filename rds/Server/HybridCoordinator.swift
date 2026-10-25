@@ -57,6 +57,10 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     // under `paintLock`, like lastPaintToken.
     private var changedToken: [Int64] = []
     private var progressiveToken: [Int64] = []
+    // When each tile's pixels last changed (system uptime). A video tile
+    // still for hybridQuietRepaint gets its lossless Progressive repaint
+    // then, not when the classifier lets go of it (seconds later).
+    private var lastChange: [TimeInterval] = []
 
     // Change detection: the last routed capture's pixels, compared row by
     // row in route(). Dirty rects don't do: captures skipped under
@@ -90,6 +94,7 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     private func resetProgressiveState(tileCount: Int) {
         changedToken = [Int64](repeating: 1, count: max(0, tileCount))
         progressiveToken = [Int64](repeating: 0, count: max(0, tileCount))
+        lastChange = [TimeInterval](repeating: 0, count: max(0, tileCount))
     }
 
     /// Resolution change hook — rebuild grid on both store and engine.
@@ -130,7 +135,16 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
 
     func route(pixel: CVPixelBuffer, width: Int, height: Int, stride: Int,
                dirtyRects: [CGRect]?) -> HybridRouting {
-        engine.submit(frame: pixel, grid: store.currentGrid, dirtyRects: dirtyRects)
+        let (grid, tiles) = store.latest()
+        let sameSize = grid.width == width && grid.height == height
+        let changed = sameSize
+            ? changedTiles(pixel: pixel, width: width, height: height, stride: stride, grid: grid)
+            : nil
+        // The classifier sees only dirty rects over pixels that changed: SCK
+        // also reports regions that didn't, such as the compositor nudge's
+        // pixel (excluded from capture) on every composite it forces.
+        let realDirty = changed.flatMap { c in dirtyRects.map { $0.filter { touchesChanged($0, c, grid) } } }
+        engine.submit(frame: pixel, grid: store.currentGrid, dirtyRects: realDirty ?? dirtyRects)
 
         // Stamp the capture order BEFORE we publish the routing. `route()` is
         // called from MainActor in capture order, so this counter is the
@@ -139,19 +153,16 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         let token = nextCaptureToken
         nextCaptureToken &+= 1
 
-        let (grid, tiles) = store.latest()
         // Resize raced ahead of the published map: fall back to a single
         // full-frame Progressive region — always correct, never blank.
-        guard grid.width == width, grid.height == height else {
+        guard sameSize, let changed else {
             let full = Rect16(left: 0, top: 0,
                               right: UInt16(clamping: width), bottom: UInt16(clamping: height))
             return HybridRouting(videoRects: [], staticRects: [full],
                                  grid: grid, maskedBuffer: nil,
-                                 captureToken: token)
+                                 captureToken: token, pixelsChanged: true)
         }
 
-        let changed = changedTiles(pixel: pixel, width: width, height: height,
-                                   stride: stride, grid: grid)
         let (videoRects, staticRects) = coalesce(
             tiles: tilesToPaint(tiles, changed: changed, grid: grid, token: token), grid: grid)
 
@@ -171,7 +182,7 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         }
         return HybridRouting(videoRects: videoRects, staticRects: staticRects,
                              grid: grid, maskedBuffer: masked,
-                             captureToken: token)
+                             captureToken: token, pixelsChanged: changed.contains(true))
     }
 
     func send(annexB: Data?, isIDR: Bool, pts: CMTime, payload: HybridFramePayload) {
@@ -394,22 +405,39 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
         return changed
     }
 
-    /// The tile map trimmed to what this capture must paint: every H.264
-    /// tile, and the Progressive tiles the client doesn't have losslessly at
-    /// their newest pixels. Unpainted tiles get a byte matching neither codec,
-    /// so coalesce() skips them.
+    /// Whether `rect` (surface pixels) overlaps a tile marked in `changed`.
+    private func touchesChanged(_ rect: CGRect, _ changed: [Bool], _ grid: TileGrid) -> Bool {
+        let r = rect.intersection(CGRect(x: 0, y: 0, width: grid.width, height: grid.height))
+        guard !r.isNull, !r.isEmpty else { return false }
+        let ts = Double(grid.tileSize)
+        let c0 = Int(r.minX / ts), c1 = min(grid.cols - 1, Int((r.maxX - 1) / ts))
+        let r0 = Int(r.minY / ts), r1 = min(grid.rows - 1, Int((r.maxY - 1) / ts))
+        guard c0 <= c1, r0 <= r1 else { return false }
+        for row in r0...r1 { for col in c0...c1 where changed[row * grid.cols + col] { return true } }
+        return false
+    }
+
+    /// The tile map trimmed to what this capture must paint: the H.264 tiles
+    /// still changing, and the tiles the client doesn't have losslessly at
+    /// their newest pixels: Progressive ones, and H.264 ones that have been
+    /// still for hybridQuietRepaint (their last H.264 picture is lossy).
+    /// Unpainted tiles get a byte matching neither codec, so coalesce()
+    /// skips them.
     private func tilesToPaint(_ tiles: [UInt8], changed: [Bool], grid: TileGrid,
                               token: Int64) -> [UInt8] {
         paintLock.lock(); defer { paintLock.unlock() }
         guard paintGrid == grid, changedToken.count == tiles.count,
               changed.count == tiles.count else { return tiles }
+        let now = ProcessInfo.processInfo.systemUptime
         var out = tiles
         for i in out.indices {
-            if changed[i] { changedToken[i] = token }
-            if out[i] == TileCodec.h264.rawValue {
+            if changed[i] { changedToken[i] = token; lastChange[i] = now }
+            if out[i] == TileCodec.h264.rawValue, now - lastChange[i] < hybridQuietRepaint {
                 changedToken[i] = token   // painted lossy: Progressive must follow once still
             } else if progressiveToken[i] >= changedToken[i] {
                 out[i] = 0
+            } else {
+                out[i] = TileCodec.progressive.rawValue
             }
         }
         return out
