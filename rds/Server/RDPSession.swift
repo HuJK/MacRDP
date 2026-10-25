@@ -766,6 +766,8 @@ final class RDPSession {
                     let sent = bridge.sendH264(data, surfaceID: 0, isIDR: isIDR, pts: pts)
                     if sent {
                         frameCounter.tick(bytes: data.count, isIDR: isIDR)
+                    } else {
+                        Task { @MainActor [weak self] in self?.displayPipeline?.encodedFrameLost() }
                     }
                 },
                 onAudioFrame: audioHandler,

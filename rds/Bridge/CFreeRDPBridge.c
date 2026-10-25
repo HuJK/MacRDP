@@ -2291,13 +2291,11 @@ int32_t macrdp_session_send_h264_frame(macrdp_session_t s,
     if (!s || !s->gfx || !s->gfx_caps_confirmed || !annexb || bytes == 0)
         return MACRDP_E_NOT_IMPLEMENTED;
 
-    /* Flow control: if we have too many in-flight frames (encoded and
-     * sent but not yet acknowledged by the client), drop this one and
-     * tell the caller to mark the next one as an IDR so the client can
-     * resync. */
-    if (atomic_load(&s->outstanding_frames) >= s->max_outstanding_frames) {
-        return MACRDP_E_FRAME_DROPPED;
-    }
+    /* No outstanding-frames check here: backpressure is decided before
+     * encoding (DisplayPipeline's shouldDropCapture). A frame that got
+     * through the encoder goes out even if the window filled meanwhile;
+     * refusing it would leave the client's decoder a frame behind and cost
+     * an IDR, which under load made a fifth of all frames keyframes. */
 
     /* Lazy surface creation on first frame. */
     if (!s->surface_created) {
@@ -2505,9 +2503,7 @@ int32_t macrdp_session_send_hybrid_frame(
     const BOOL wantProg = (bgra != NULL && width > 0 && height > 0 && num_static_rects > 0);
     if (!haveAvc && !wantProg) return MACRDP_OK;   /* nothing to do */
 
-    if (atomic_load(&s->outstanding_frames) >= s->max_outstanding_frames) {
-        return MACRDP_E_FRAME_DROPPED;
-    }
+    /* Backpressure is decided before encoding; see send_h264_frame. */
 
     /* Lazy surface (+ progressive context) creation on first frame. */
     if (!s->surface_created) {

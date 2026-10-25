@@ -77,6 +77,14 @@ final class DisplayPipeline {
     private var reconnectInProgress = false
 
     func pauseCapture()  { paused = true;  nextForceKeyframe = true }
+
+    /// An encoded frame never reached the client (the bridge refused it):
+    /// the client's decoder is a frame behind, so resync with an IDR of the
+    /// newest capture.
+    func encodedFrameLost() {
+        nextForceKeyframe = true
+        requestRepaint()
+    }
     func resumeCapture() {
         paused = false
         nextForceKeyframe = true
@@ -691,11 +699,12 @@ final class DisplayPipeline {
         }
 
         // Backpressure: skip the encode pass entirely if we have too
-        // many in-flight frames. When we resume, force an IDR so the
-        // client can decode without needing the frames we just dropped,
-        // and send this capture again then if nothing newer comes.
+        // many in-flight frames, and send this capture again once the
+        // backlog clears if nothing newer comes. No IDR: the encoder never
+        // saw this frame, so its references are still the client's. (Forcing
+        // one made every frame after a skip a keyframe under load: bigger,
+        // slower to decode, slower acks, more skips.)
         if shouldDropCapture() {
-            nextForceKeyframe = true
             requestRepaint()
             return
         }
