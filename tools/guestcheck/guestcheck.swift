@@ -29,6 +29,10 @@
 //                                        # layout; prints the device's sample rate
 //   guestcheck scene <dir> <secs>        # full-screen picture moved, then held still, on cue
 //                                        # (files in <dir>, see SceneView): for picture convergence
+//   guestcheck flash <secs> [animate]    # grey screen whose centre square flips black/white on
+//                                        # every mouse-down, for click-to-photon latency; animate
+//                                        # jitters the square every frame (H.264 tiles)
+//   guestcheck video <file> <secs>       # play a movie full screen, looped (encoder load)
 //   guestcheck sink <secs> <log>         # full-screen test pattern that logs input (JSON lines):
 //                                        # typed text, clicks, scrolls; cursor regions for
 //                                        # pointer-shape checks (see SinkView)
@@ -386,6 +390,15 @@ case "scene":
     guard args.count == 3, let secs = Double(args[2]) else { fail("usage: guestcheck scene <dir> <secs>") }
     runScene(dir: args[1], seconds: secs)
 
+case "video":
+    guard args.count == 3, let secs = Double(args[2]) else { fail("usage: guestcheck video <file> <secs>") }
+    runVideo(path: args[1], seconds: secs)
+
+case "flash":
+    guard (2...3).contains(args.count), let secs = Double(args[1]),
+          args.count == 2 || args[2] == "animate" else { fail("usage: guestcheck flash <secs> [animate]") }
+    runFlash(seconds: secs, animate: args.count == 3)
+
 default:
     fail("unknown command \(cmd)")
 }
@@ -650,3 +663,81 @@ func runScene(dir: String, seconds: Double) {
     DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { app.terminate(nil) }
     app.run()
 }
+
+// MARK: - flash
+
+/// Click-to-photon target (tools/latency/click-latency.sh): mid-grey, with a
+/// 400x400 square in the centre that flips between near-black and near-white
+/// on every mouse-down, drawn at once. With `animate` the square's level
+/// jitters by a few steps every frame, so the hybrid encoder sends its tiles
+/// as H.264 instead of Progressive.
+final class FlashView: NSView {
+    var lit = false
+    var jitter: CGFloat = 0
+    static let side: CGFloat = 400
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        lit.toggle()
+        display()
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(white: 0.5, alpha: 1).setFill()
+        bounds.fill()
+        NSColor(white: (lit ? 0.85 : 0.12) + jitter, alpha: 1).setFill()
+        NSRect(x: bounds.midX - Self.side / 2, y: bounds.midY - Self.side / 2,
+               width: Self.side, height: Self.side).fill()
+    }
+}
+
+func runFlash(seconds: Double, animate: Bool) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    guard let screen = NSScreen.main else { fail("no screen") }
+    let win = SinkWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    win.level = .screenSaver
+    let view = FlashView(frame: NSRect(origin: .zero, size: screen.frame.size))
+    win.contentView = view
+    win.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    if animate {
+        var step = 0
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { _ in
+            step += 1
+            view.jitter = CGFloat(step % 4) * 0.02
+            view.setNeedsDisplay(view.bounds)
+        }
+    }
+    print("ready"); fflush(stdout)
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { app.terminate(nil) }
+    app.run()
+}
+
+// MARK: - video
+
+/// A movie full screen, looped: the encoder's heavy case (every tile changes
+/// every frame).
+func runVideo(path: String, seconds: Double) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    guard let screen = NSScreen.main else { fail("no screen") }
+    let win = SinkWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    win.level = .screenSaver
+    let view = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+    view.wantsLayer = true
+    let item = AVPlayerItem(url: URL(fileURLWithPath: path))
+    let player = AVQueuePlayer()
+    let looper = AVPlayerLooper(player: player, templateItem: item)
+    let layer = AVPlayerLayer(player: player)
+    layer.frame = view.bounds
+    layer.videoGravity = .resizeAspectFill
+    view.layer?.addSublayer(layer)
+    win.contentView = view
+    win.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    player.play()
+    print("playing"); fflush(stdout)
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { _ = looper; app.terminate(nil) }
+    app.run()
+}
+
