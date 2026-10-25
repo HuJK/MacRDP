@@ -590,4 +590,9 @@ const char *macrdp_bridge_freerdp_version(void);
 }
 #endif
 
+/* This header is also the app's Swift bridging header. */
+#if defined(__OBJC__)
+#include "ObjCTry.h"
+#endif
+
 #endif /* CFREERDP_BRIDGE_H */

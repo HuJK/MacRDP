@@ -73,9 +73,25 @@ final class AudioInPipeline: @unchecked Sendable {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: fmt)
 
-        try engine.start()
-        player.play()
+        try startPlayback()
         LogTo.audioIn.info("Audio in playback ready")
+    }
+
+    /// -[AVAudioPlayerNode play] raises an Objective-C exception ("player did
+    /// not see an IO cycle") when the engine stopped under it, as it does when
+    /// it reconfigures right after start for a just-switched output device.
+    /// Uncaught, that left the session half-activated and the server
+    /// accepting no one. Restart the engine and try once more.
+    private func startPlayback() throws {
+        var reason = ""
+        for attempt in 1...2 {
+            if !engine.isRunning { try engine.start() }
+            guard let e = macrdp_catch_objc({ player.play() }) else { return }
+            reason = e.reason ?? e.name.rawValue
+            LogTo.audioIn.error("AUDIN player didn't start (attempt \(attempt)): \(reason)")
+            engine.stop()
+        }
+        throw MacRDPError.audioStartFailed(reason)
     }
 
     func stop() {

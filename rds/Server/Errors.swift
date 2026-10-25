@@ -14,6 +14,7 @@ enum MacRDPError: Error, CustomStringConvertible {
     case capturePermissionDenied
     case accessibilityPermissionDenied
     case audioPermissionDenied
+    case audioStartFailed(String)
     case encoderInitFailed(osStatus: Int32)
     case bridgeFailed(rc: Int32)
     case freerdpUnavailable
@@ -37,6 +38,8 @@ enum MacRDPError: Error, CustomStringConvertible {
             return "Accessibility permission is required to inject input. Grant it in System Settings → Privacy & Security → Accessibility, then restart."
         case .audioPermissionDenied:
             return "System Audio Recording permission is required. Grant it in System Settings → Privacy & Security → Microphone (System Audio), then restart."
+        case .audioStartFailed(let r):
+            return "Audio playback failed to start: \(r)"
         case .encoderInitFailed(let s):
             return "VideoToolbox encoder init failed (OSStatus=\(s))"
         case .bridgeFailed(let rc):
