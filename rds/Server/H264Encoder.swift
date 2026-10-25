@@ -64,6 +64,9 @@ final class H264Encoder {
     private let outputQueue = DispatchQueue(label: "com.macrdp.h264.out",
                                             qos: .userInteractive)
     private let onEncoded: Output
+    /// Called (on VideoToolbox's thread) when a submitted frame produced no
+    /// output; set once, before encoding.
+    var onDropped: (@Sendable () -> Void)?
 
     init(settings: Settings, onEncoded: @escaping Output) throws {
         self.settings = settings
@@ -218,7 +221,10 @@ final class H264Encoder {
             frameProperties: frameProps,
             infoFlagsOut: nil
         ) { [weak self] status, _, sample in
-            guard status == noErr, let sample else { return }
+            guard status == noErr, let sample else {
+                self?.onDropped?()   // the frame (and its userData) never comes out
+                return
+            }
             self?.outputQueue.async {
                 self?.handleEncoded(sample, userData: userData)
             }

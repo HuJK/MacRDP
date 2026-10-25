@@ -173,6 +173,10 @@ protocol HybridFrameSink: AnyObject, Sendable {
     /// DPB one frame behind ours — the next encoded frame must be IDR to
     /// resync). Read on MainActor by DisplayPipeline before each encode.
     func popPendingKeyframe() -> Bool
+    /// Called when the client may be left behind (a refused frame, a dropped
+    /// AVC frame) and only a later frame would fix it. Set once by
+    /// DisplayPipeline, before frames flow.
+    var onRepaintNeeded: (@Sendable () -> Void)? { get set }
 }
 
 /// Merge same-codec tiles into rectangles. Greedy per-row run-merge followed

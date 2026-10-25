@@ -46,6 +46,13 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
     private var paintGrid: TileGrid
     private var keyframeRequested = false
 
+    /// Called on the send queue when the client may be left behind: the
+    /// bridge refused a frame, or an AVC frame was dropped so its decoder is
+    /// out of step until the next IDR. Either is only repaired by a later
+    /// frame, which a still picture never produces. Set once, before frames
+    /// flow (DisplayPipeline.requestRepaint resubmits the newest capture).
+    var onRepaintNeeded: (@Sendable () -> Void)?
+
     init(config: Config, bridge: BridgePeer, initialGrid: TileGrid) {
         self.cfg = config.video.tile
         self.bridge = bridge
@@ -159,6 +166,7 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
                 self.paintLock.lock()
                 self.keyframeRequested = true
                 self.paintLock.unlock()
+                self.onRepaintNeeded?()
             }
 
             // Nothing survived the filter on either side → no-op (the wire
@@ -201,12 +209,22 @@ final class HybridCoordinator: HybridFrameSink, @unchecked Sendable {
                 // Bridge rejected the write (backpressure / channel-not-ready /
                 // internal error). Nothing landed on the client surface, but
                 // the published map still has h264/progressive for every tile,
-                // so the next route() will re-emit blit instructions for these
-                // same rects automatically. We just need to clear the paint
-                // tokens here so `filterRectsAgainstNewerPaints` doesn't drop
-                // the retry against an "older" capture token.
+                // so the next route() re-emits blit instructions for these
+                // same rects. Clear the paint tokens so
+                // `filterRectsAgainstNewerPaints` doesn't drop that retry
+                // against an "older" capture token.
                 let rectsToForget = (avcDropped ? [] : filteredVideo) + filteredStatic
                 self.forgetPaint(rects: rectsToForget, grid: payload.grid)
+                // The client decoder never got this AVC frame while ours did:
+                // resync with an IDR, as when a NAL is dropped above.
+                if willSendAVC {
+                    self.paintLock.lock()
+                    self.keyframeRequested = true
+                    self.paintLock.unlock()
+                }
+                // If the picture is now still there is no next route():
+                // have the pipeline resubmit its newest capture.
+                self.onRepaintNeeded?()
             }
         }
     }

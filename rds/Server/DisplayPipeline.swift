@@ -48,6 +48,15 @@ final class DisplayPipeline {
     private var currentWidth: Int = 0
     private var currentHeight: Int = 0
     private var nextForceKeyframe = true
+    /// The newest complete capture, and whether the client may lack it.
+    /// Captures are skipped (too many unacked frames), refused by the bridge
+    /// or dropped by the encoder on the assumption that a later capture
+    /// replaces them, but once the picture goes still no later capture comes
+    /// and the client keeps an older picture for good. So the newest one is
+    /// resubmitted as soon as the backlog allows.
+    private var lastSample: CMSampleBuffer?
+    private var repaintPending = false
+    private var repaintPolling = false
     /// Set by the SuppressOutput handler when the client minimizes / hides
     /// its window. While paused we still receive SCK frames but drop them
     /// in `handleSample`, and don't send anything on the GFX channel.
@@ -209,6 +218,7 @@ final class DisplayPipeline {
         } else {
             self.encoder = nil
         }
+        wireRepaint()
 
         let audioHandler = onAudioFrame
         let audioStats = AudioStats()
@@ -395,6 +405,7 @@ final class DisplayPipeline {
         } else {
             self.encoder = nil
         }
+        wireRepaint()
         self.currentWidth = pxW
         self.currentHeight = pxH
         self.nextForceKeyframe = true
@@ -585,9 +596,52 @@ final class DisplayPipeline {
         encoder?.invalidate()
         encoder = nil
         output = nil
+        lastSample = nil
+        repaintPending = false
     }
 
-    private func handleSample(_ sample: CMSampleBuffer) {
+    // MARK: - Repaint
+
+    /// Frames lost downstream (bridge refusal, encoder drop, an AVC frame
+    /// the client never decoded) ask for the newest capture to be sent
+    /// again; a pending IDR request makes that resend a keyframe.
+    private func wireRepaint() {
+        let again: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor [weak self] in self?.requestRepaint() }
+        }
+        encoder?.onDropped = again
+        hybridSink?.onRepaintNeeded = again
+    }
+
+    /// Resubmit the newest capture once the backlog clears, unless a newer
+    /// one gets through first.
+    func requestRepaint() {
+        repaintPending = true
+        guard !repaintPolling else { return }
+        repaintPolling = true
+        pollRepaint()
+    }
+
+    private func pollRepaint() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20)) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard self.repaintPending, let sample = self.lastSample else {
+                    self.repaintPolling = false
+                    return
+                }
+                if self.paused || self.shouldDropCapture() {
+                    self.pollRepaint()
+                    return
+                }
+                self.repaintPolling = false
+                LogTo.display.info("Resending the newest capture: it never got to the client")
+                self.handleSample(sample, repaint: true)
+            }
+        }
+    }
+
+    private func handleSample(_ sample: CMSampleBuffer, repaint: Bool = false) {
         guard CMSampleBufferIsValid(sample) else { return }
 
         // SCK delivers at the configured fps even when nothing changed.
@@ -601,6 +655,7 @@ final class DisplayPipeline {
         if !isCompleteFrame(sample) { return }
 
         guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
+        lastSample = sample
 
         // Client minimized / hid its window.
         if paused {
@@ -610,11 +665,14 @@ final class DisplayPipeline {
 
         // Backpressure: skip the encode pass entirely if we have too
         // many in-flight frames. When we resume, force an IDR so the
-        // client can decode without needing the frames we just dropped.
+        // client can decode without needing the frames we just dropped,
+        // and send this capture again then if nothing newer comes.
         if shouldDropCapture() {
             nextForceKeyframe = true
+            requestRepaint()
             return
         }
+        repaintPending = false   // this capture supersedes any pending repaint
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         let force = nextForceKeyframe
@@ -625,7 +683,8 @@ final class DisplayPipeline {
         // Progressive-only frame (no video tiles) or encode the (masked)
         // frame; the encoder output callback composes both codecs.
         if let sink = hybridSink {
-            let dirty = Self.dirtyRects(from: sample)
+            // A repaint resends a capture already analysed: nothing changed.
+            let dirty = repaint ? [] : Self.dirtyRects(from: sample)
             CVPixelBufferLockBaseAddress(pixel, .readOnly)
             let w = CVPixelBufferGetWidth(pixel)
             let h = CVPixelBufferGetHeight(pixel)
