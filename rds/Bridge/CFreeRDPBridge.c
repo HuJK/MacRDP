@@ -141,6 +141,8 @@ struct macrdp_session {
     _Atomic uint64_t       frame_sent_ms[64];     /* by frameId % 64 */
     _Atomic bool           frame_has_avc[64];     /* by frameId % 64 */
     _Atomic uint32_t       gfx_avc_frames_sent;
+    _Atomic uint64_t       gfx_bytes_sent;        /* codec payload */
+    _Atomic uint32_t       gfx_idr_sent;
     _Atomic uint32_t       gfx_avc_acks;
     _Atomic uint32_t       gfx_frames_sent;
     _Atomic uint32_t       gfx_acks;
@@ -161,7 +163,7 @@ struct macrdp_session {
     os_unfair_lock         frame_note_lock;
     _Atomic uint64_t       last_real_ack_ms;
     _Atomic uint32_t       last_acked_frame;
-    _Atomic bool           gfx_silence_dumped;
+    _Atomic uint32_t       gfx_flush_streak;      /* watchdog flushes since an ack */
     /* Diagnostics: per-session state-change tracker for DRDYNVC and
      * an iteration heartbeat counter. */
     int                    drdynvc_last_joined;
@@ -379,10 +381,18 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *ctx,
     return rc;
 }
 
-static void note_frame_sent(struct macrdp_session *s, UINT32 frameId, bool avc) {
+static void note_frame_sent(struct macrdp_session *s, UINT32 frameId, bool avc,
+                            bool idr, size_t bytes) {
+    /* Counts the frame as outstanding. The ack watchdog times the oldest
+     * unacked frame, so restart its clock when none was outstanding: after
+     * an idle spell last_ack_ms is old, and the frame got flushed before
+     * it could be acked. */
+    if (atomic_fetch_add(&s->outstanding_frames, 1) == 0) atomic_store(&s->last_ack_ms, now_ms());
     atomic_store(&s->frame_sent_ms[frameId % 64], now_ms());
     atomic_store(&s->frame_has_avc[frameId % 64], avc);
     atomic_fetch_add(&s->gfx_frames_sent, 1);
+    atomic_fetch_add(&s->gfx_bytes_sent, bytes);
+    if (idr) atomic_fetch_add(&s->gfx_idr_sent, 1);
     if (avc) atomic_fetch_add(&s->gfx_avc_frames_sent, 1);
 }
 
@@ -398,9 +408,9 @@ static void note_frame_content(struct macrdp_session *s, UINT32 frameId,
     os_unfair_lock_unlock(&s->frame_note_lock);
 }
 
-static void dump_frame_notes(struct macrdp_session *s, uint64_t silentMs) {
-    os_log(bridge_log(), "GFX acks silent for %llu ms; last acked frame %u, recent frames:",
-           (unsigned long long)silentMs, atomic_load(&s->last_acked_frame));
+static void dump_frame_notes(struct macrdp_session *s) {
+    os_log(bridge_log(), "GFX frames unacked through 4 watchdog flushes; last acked frame %u, recent frames:",
+           atomic_load(&s->last_acked_frame));
     os_unfair_lock_lock(&s->frame_note_lock);
     uint64_t now = now_ms();
     for (uint32_t i = 0; i < 16; i++) {
@@ -427,7 +437,7 @@ static UINT gfx_frame_ack(RdpgfxServerContext *ctx,
     if (atomic_load(&s->frame_has_avc[ack->frameId % 64])) atomic_fetch_add(&s->gfx_avc_acks, 1);
     atomic_store(&s->last_real_ack_ms, now_ms());
     atomic_store(&s->last_acked_frame, ack->frameId);
-    atomic_store(&s->gfx_silence_dumped, false);
+    atomic_store(&s->gfx_flush_streak, 0);
     int64_t qd = (int64_t)ack->queueDepth;
     if (atomic_exchange(&s->gfx_queue_depth, qd) != qd) {
         os_log_debug(bridge_log(), "GFX frame ack: queueDepth=0x%llX (frame %u, %u decoded)",
@@ -2098,9 +2108,8 @@ int32_t macrdp_session_run(macrdp_session_t s)
                            "frame-ack watchdog: %llums silent, flushing %d frames",
                            (unsigned long long)since, prev);
                     atomic_store(&s->last_ack_ms, now_ms());
-                    uint64_t silent = now_ms() - atomic_load(&s->last_real_ack_ms);
-                    if (silent >= 2000 && !atomic_exchange(&s->gfx_silence_dumped, true))
-                        dump_frame_notes(s, silent);
+                    if (atomic_fetch_add(&s->gfx_flush_streak, 1) + 1 == 4)
+                        dump_frame_notes(s);
                 }
             }
         }
@@ -2113,9 +2122,12 @@ int32_t macrdp_session_run(macrdp_session_t s)
             uint32_t wd = atomic_exchange(&s->gfx_watchdog_flushes, 0);
             uint32_t avcSent = atomic_exchange(&s->gfx_avc_frames_sent, 0);
             uint32_t avcAcks = atomic_exchange(&s->gfx_avc_acks, 0);
+            uint64_t bytes = atomic_exchange(&s->gfx_bytes_sent, 0);
+            uint32_t idrs = atomic_exchange(&s->gfx_idr_sent, 0);
+            double secs = (double)(now_ms() - s->gfx_stats_since_ms) / 1000.0;
             if (sentN) {
-                os_log(bridge_log(), "GFX frames: %u sent (%u with AVC), %u acked (%u with AVC; avg %llu ms, max %u ms), %u watchdog flushes, queueDepth 0x%llX, last ack %llu ms ago",
-                       sentN, avcSent, acks, avcAcks, acks ? (unsigned long long)(sum / acks) : 0ull, mx, wd,
+                os_log(bridge_log(), "GFX frames: %u sent (%u with AVC, %u IDR, %.1f fps, %.2f Mbit/s), %u acked (%u with AVC; avg %llu ms, max %u ms), %u watchdog flushes, queueDepth 0x%llX, last ack %llu ms ago",
+                       sentN, avcSent, idrs, sentN / secs, (double)bytes * 8 / secs / 1e6, acks, avcAcks, acks ? (unsigned long long)(sum / acks) : 0ull, mx, wd,
                        (unsigned long long)atomic_load(&s->gfx_queue_depth),
                        (unsigned long long)(now_ms() - atomic_load(&s->last_real_ack_ms)));
             }
@@ -2287,7 +2299,6 @@ int32_t macrdp_session_send_h264_frame(macrdp_session_t s,
                                        int64_t pts_us)
 {
 #if MACRDP_HAVE_FREERDP
-    (void)is_idr;
     if (!s || !s->gfx || !s->gfx_caps_confirmed || !annexb || bytes == 0)
         return MACRDP_E_NOT_IMPLEMENTED;
 
@@ -2351,8 +2362,7 @@ int32_t macrdp_session_send_h264_frame(macrdp_session_t s,
 
     UINT rc = s->gfx->SurfaceFrameCommand(s->gfx, &cmd, &start, &end);
     if (rc == CHANNEL_RC_OK) {
-        atomic_fetch_add(&s->outstanding_frames, 1);
-        note_frame_sent(s, frameId, true);
+        note_frame_sent(s, frameId, true, is_idr != 0, bytes);
         return MACRDP_OK;
     }
     return MACRDP_E_INTERNAL;
@@ -2466,8 +2476,7 @@ int32_t macrdp_session_send_progressive_frame(macrdp_session_t s,
 
     UINT res = s->gfx->SurfaceFrameCommand(s->gfx, &cmd, &start, &end);
     if (res == CHANNEL_RC_OK) {
-        atomic_fetch_add(&s->outstanding_frames, 1);
-        note_frame_sent(s, frameId, false);
+        note_frame_sent(s, frameId, false, false, outLen);
         return MACRDP_OK;
     }
     return MACRDP_E_INTERNAL;
@@ -2623,8 +2632,7 @@ int32_t macrdp_session_send_hybrid_frame(
     free(quants);
 
     if (rc == CHANNEL_RC_OK) {
-        atomic_fetch_add(&s->outstanding_frames, 1);
-        note_frame_sent(s, frameId, emitAvc);
+        note_frame_sent(s, frameId, emitAvc, emitAvc && is_idr, (emitAvc ? annexb_bytes : 0) + progLen);
         note_frame_content(s, frameId, emitAvc ? annexb_bytes : 0, emitAvc ? num_video_rects : 0,
                            is_idr, progLen, emitProg ? num_static_rects : 0);
         return MACRDP_OK;

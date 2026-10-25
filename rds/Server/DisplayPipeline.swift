@@ -59,6 +59,11 @@ final class DisplayPipeline {
     /// The nudge window's pixel(s) in capture space. SCK reports them dirty
     /// on every forced composite though the window is excluded.
     private var nudgeRect: CGRect?
+    // Capture rate, logged every 10 s while frames come: new captures, and
+    // how many of them backpressure kept from the encoder.
+    private var statsCaptured = 0
+    private var statsSkipped = 0
+    private var statsSince = ProcessInfo.processInfo.systemUptime
     private var repaintPending = false
     private var repaintPolling = false
     /// Set by the SuppressOutput handler when the client minimizes / hides
@@ -673,6 +678,16 @@ final class DisplayPipeline {
         }
     }
 
+    private func noteCapture(skipped: Bool) {
+        statsCaptured += 1
+        if skipped { statsSkipped += 1 }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - statsSince >= 10 else { return }
+        let fps = Double(statsCaptured) / (now - statsSince)
+        LogTo.display.notice("Capture: \(self.statsCaptured) new frames (\(String(format: "%.1f", fps)) fps), \(self.statsSkipped) skipped for backpressure")
+        statsCaptured = 0; statsSkipped = 0; statsSince = now
+    }
+
     private func handleSample(_ sample: CMSampleBuffer, repaint: Bool = false) {
         guard CMSampleBufferIsValid(sample) else { return }
 
@@ -691,6 +706,7 @@ final class DisplayPipeline {
 
         guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
         lastSample = sample
+        if !repaint { noteCapture(skipped: paused || shouldDropCapture()) }
 
         // Client minimized / hid its window.
         if paused {
